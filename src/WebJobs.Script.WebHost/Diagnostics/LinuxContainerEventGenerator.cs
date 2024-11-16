@@ -19,6 +19,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         private string _stampName;
         private string _tenantId;
         private bool _disposed;
+        private int _pid;
 
         public LinuxContainerEventGenerator(IEnvironment environment, IOptions<ConsoleLoggingOptions> consoleLoggingOptions)
         {
@@ -38,6 +39,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
             _environment = environment;
             _containerName = _environment.GetEnvironmentVariable(EnvironmentSettingNames.ContainerName)?.ToUpperInvariant();
+            _pid = System.Diagnostics.Process.GetCurrentProcess().Id;
         }
 
         public LinuxContainerEventGenerator(IEnvironment environment, Action<string> writeEvent)
@@ -107,7 +109,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             {
                 details = details.Length > MaxDetailsLength ? details.Substring(0, MaxDetailsLength) : details;
 
-                _writeEvent($"{ScriptConstants.LinuxLogEventStreamName} {(int)ToEventLevel(level)},{subscriptionId},{appName},{functionName},{eventName},{source},{NormalizeString(details)},{NormalizeString(summary)},{hostVersion},{formattedEventTimeStamp},{exceptionType},{NormalizeString(exceptionMessage)},{functionInvocationId},{hostInstanceId},{activityId},{_containerName},{StampName},{TenantId},{runtimeSiteName},{slotName}");
+                _writeEvent($"{ScriptConstants.LinuxLogEventStreamName} {(int)ToEventLevel(level)},{subscriptionId},{appName},{functionName},{eventName},{source},{NormalizeString(details)},{NormalizeString(summary)},{hostVersion},{formattedEventTimeStamp},{exceptionType},{NormalizeString(exceptionMessage)},{functionInvocationId},{hostInstanceId},{activityId},{_containerName},{StampName},{TenantId},{runtimeSiteName},{slotName},{_pid}");
             }
         }
 
@@ -115,7 +117,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         {
             string hostVersion = ScriptHost.Version;
 
-            _writeEvent($"{ScriptConstants.LinuxMetricEventStreamName} {subscriptionId},{appName},{functionName},{eventName},{average},{minimum},{maximum},{count},{hostVersion},{eventTimestamp.ToString(EventTimestampFormat)},{NormalizeString(data)},{_containerName},{StampName},{TenantId},{runtimeSiteName},{slotName}");
+            _writeEvent($"{ScriptConstants.LinuxMetricEventStreamName} {subscriptionId},{appName},{functionName},{eventName},{average},{minimum},{maximum},{count},{hostVersion},{eventTimestamp.ToString(EventTimestampFormat)},{NormalizeString(data)},{_containerName},{StampName},{TenantId},{runtimeSiteName},{slotName},{_pid}");
         }
 
         public override void LogFunctionDetailsEvent(string siteName, string functionName, string inputBindings, string outputBindings, string scriptType, bool isDisabled)
