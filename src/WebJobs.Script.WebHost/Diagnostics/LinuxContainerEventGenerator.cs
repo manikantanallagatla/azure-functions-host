@@ -15,11 +15,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         private readonly Action<string> _writeEvent;
         private readonly BufferedConsoleWriter _consoleWriter;
         private readonly IEnvironment _environment;
+        private readonly int _pid;
         private string _containerName;
         private string _stampName;
         private string _tenantId;
         private bool _disposed;
-        private int _pid;
 
         public LinuxContainerEventGenerator(IEnvironment environment, IOptions<ConsoleLoggingOptions> consoleLoggingOptions)
         {
@@ -39,7 +39,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
             _environment = environment;
             _containerName = _environment.GetEnvironmentVariable(EnvironmentSettingNames.ContainerName)?.ToUpperInvariant();
-            _pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+            _pid = Environment.ProcessId;
         }
 
         public LinuxContainerEventGenerator(IEnvironment environment, Action<string> writeEvent)
