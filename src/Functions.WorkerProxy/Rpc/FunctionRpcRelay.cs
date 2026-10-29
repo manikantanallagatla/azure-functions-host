@@ -109,11 +109,11 @@ internal sealed partial class FunctionRpcRelay(
     /// <summary>
     /// Accepts only the initialized, live stream pair that produced the supplied handshake ID.
     /// </summary>
-    internal bool AcceptLink(string initializationId, SplitPodIdentity runtime)
+    internal bool AcceptLink(string initializationId)
     {
         lock (_syncLock)
         {
-            return !_stopping && _currentSession?.AcceptLink(initializationId, runtime) == true;
+            return !_stopping && _currentSession?.AcceptLink(initializationId) == true;
         }
     }
 
@@ -149,7 +149,7 @@ internal sealed partial class FunctionRpcRelay(
                 ClearCurrentSessionLocked();
             }
 
-            if (_currentSession is null && _stateManager.State.AcceptedRuntime is not null)
+            if (_currentSession is null && _stateManager.State.HasAcceptedLink)
             {
                 throw new FunctionRpcRelayAttachmentException(side, FunctionRpcRelayAttachmentFailure.PreviousSessionTearingDown,
                     "An accepted attachment cannot be replaced in this WorkerProxy.");

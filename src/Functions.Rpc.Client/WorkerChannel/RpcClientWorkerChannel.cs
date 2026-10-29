@@ -81,6 +81,9 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
 
     internal string LinkInitializationId => WorkerInitializationRequestId;
 
+    internal bool RequiresLinkAcceptance =>
+        string.Equals(GetWorkerCapabilityState("WorkerLinkAcceptance"), bool.TrueString, StringComparison.OrdinalIgnoreCase);
+
     internal Task<Exception> FunctionLoadFailure => _functionLoadFailure.Task;
 
     internal bool IsTerminated => Completion.IsCompleted || FunctionLoadFailure.IsCompleted;

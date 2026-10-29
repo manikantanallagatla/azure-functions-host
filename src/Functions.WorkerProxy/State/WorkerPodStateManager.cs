@@ -45,13 +45,16 @@ internal sealed class WorkerPodStateManager
         ArgumentException.ThrowIfNullOrWhiteSpace(podName);
 
         _timeProvider = timeProvider;
-        _startupTimestamp = options.Value.EnableLinkLifecycle ? _timeProvider.GetTimestamp() : 0;
+        LinkLifecycleEnabled = options.Value.EnableLinkLifecycle;
+        _startupTimestamp = LinkLifecycleEnabled ? _timeProvider.GetTimestamp() : 0;
         _state = WorkerPodState.CreateUnassigned(podName, _timeProvider.GetUtcNow());
         if (options.Value.EnableLinkLifecycle)
         {
             _neverLinkedTimeout = options.Value.NeverLinkedTimeout;
         }
     }
+
+    internal bool LinkLifecycleEnabled { get; }
 
     /// <summary>
     /// Gets the current immutable state without incrementing its revision.
@@ -202,30 +205,28 @@ internal sealed class WorkerPodStateManager
     }
 
     /// <summary>
-    /// Commits accepted attachment history without changing serving readiness.
+    /// Records completed Link acceptance locally without changing published identity or serving readiness.
     /// </summary>
-    public bool AcceptLink(long sessionId, SplitPodIdentity runtime)
+    public bool AcceptLink(long sessionId)
     {
         lock (_stateLock)
         {
             ExpireNeverLinkedLocked();
             if (_state.SessionId != sessionId || !_state.IsWorkerReady ||
-                _state.AssignmentState == WorkerAssignmentState.Failed ||
-                (_state.FunctionAppName is { } appName &&
-                 !string.Equals(appName, runtime.App.FunctionAppName, StringComparison.Ordinal)))
+                _state.AssignmentState == WorkerAssignmentState.Failed)
             {
                 return false;
             }
 
-            if (_state.AcceptedRuntime is not null)
+            if (_state.HasAcceptedLink)
             {
-                return _state.AcceptedRuntime == runtime;
+                return true;
             }
 
             UpdateStateAndNotifyWaitersLocked(_state with
             {
                 Revision = checked(_state.Revision + 1),
-                AcceptedRuntime = runtime
+                HasAcceptedLink = true
             });
             _linkAccepted.TrySetResult();
             return true;
@@ -282,12 +283,6 @@ internal sealed class WorkerPodStateManager
             if (_state.RemovalRequested)
             {
                 return WorkerAssignmentResult.RemovalRequested;
-            }
-
-            if (_state.AcceptedRuntime is { } runtime &&
-                !string.Equals(runtime.App.FunctionAppName, assignment.FunctionAppName, StringComparison.Ordinal))
-            {
-                return WorkerAssignmentResult.AssignmentConflict;
             }
 
             // Replay/conflict takes precedence over current readiness, including after the assigned stream terminates.
@@ -348,7 +343,7 @@ internal sealed class WorkerPodStateManager
             lock (_stateLock)
             {
                 ExpireNeverLinkedLocked();
-                if (_state.AcceptedRuntime is not null || _state.RemovalRequested)
+                if (_state.HasAcceptedLink || _state.RemovalRequested)
                 {
                     return;
                 }
@@ -373,7 +368,7 @@ internal sealed class WorkerPodStateManager
     private void ExpireNeverLinkedLocked()
     {
         // Check the deadline at admission too: a delayed timer callback must not admit a late Link.
-        if (_neverLinkedTimeout > TimeSpan.Zero && _state.AcceptedRuntime is null && !_state.RemovalRequested &&
+        if (_neverLinkedTimeout > TimeSpan.Zero && !_state.HasAcceptedLink && !_state.RemovalRequested &&
             _timeProvider.GetElapsedTime(_startupTimestamp) >= _neverLinkedTimeout)
         {
             UpdateStateAndNotifyWaitersLocked(_state with

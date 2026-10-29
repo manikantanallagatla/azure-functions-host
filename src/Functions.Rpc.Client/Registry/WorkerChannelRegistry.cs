@@ -35,7 +35,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
     private readonly ILogger<WorkerChannelRegistry> _logger;
     private readonly Dictionary<string, WorkerSlot> _linkAttempts = new(StringComparer.Ordinal);
     private readonly TimeSpan _linkTimeout;
-    private readonly WorkerLinkAcceptance _acceptance;
+    private readonly IRpcClientFactory _clients;
     private readonly HashSet<Task> _monitorTasks = [];
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Dictionary<string, WorkerSlot> _slots = new(StringComparer.Ordinal);
@@ -60,10 +60,10 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
         IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger,
-        WorkerLinkAcceptance acceptance)
+        IRpcClientFactory clients)
         : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout)
     {
-        _acceptance = acceptance ?? throw new ArgumentNullException(nameof(acceptance));
+        _clients = clients ?? throw new ArgumentNullException(nameof(clients));
     }
 
     internal WorkerChannelRegistry(
@@ -187,9 +187,14 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                 }
 
                 operationSource.Token.ThrowIfCancellationRequested();
-                if (_acceptance is not null)
+                if (candidate.RequiresLinkAcceptance)
                 {
-                    await _acceptance.AcceptAsync(grpcEndpoint, candidate.LinkInitializationId, operationSource.Token);
+                    IRpcClientFactory clients = _clients
+                        ?? throw new InvalidOperationException("The worker requires Link acceptance but no RPC client factory is registered.");
+                    await clients.AcceptLinkAsync(grpcEndpoint, new()
+                    {
+                        InitializationId = candidate.LinkInitializationId
+                    }, operationSource.Token);
                 }
 
                 RegisterInitializedChannel(workerId, slot, candidate, operationSource.Token);

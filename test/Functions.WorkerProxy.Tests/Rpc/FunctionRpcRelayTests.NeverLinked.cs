@@ -113,10 +113,18 @@ public partial class FunctionRpcRelayTests
 
         clock.Advance(TimeSpan.FromHours(1));
         Assert.Equal(linked, await ReadSplitManagementStateAsync(management, timeout.Token));
-        Assert.Equal(SplitWorkerLinkState.Linked, linked.Link.State);
+        Assert.Equal(SplitWorkerLinkState.Unlinked, linked.Link.State);
+        Assert.Null(linked.Link.Runtime);
         Assert.Equal(SplitWorkerStatus.Starting, linked.Status);
         using var state = await ReadManagementStateAsync(management, null, timeout.Token);
         Assert.Equal("None", state.RootElement.GetProperty("workerPodState").GetProperty("podStatus").GetString());
+        await worker.CompleteRequestAsync(timeout.Token);
+        await runtime.WaitForTerminationAsync(timeout.Token);
+        await worker.WaitForTerminationAsync(timeout.Token);
+        SplitWorkerOriginState disconnected = await ReadSplitManagementStateAsync(management, timeout.Token);
+        clock.Advance(TimeSpan.FromHours(1));
+        Assert.Equal(disconnected, await ReadSplitManagementStateAsync(management, timeout.Token));
+        Assert.Equal(SplitWorkerStatus.Starting, disconnected.Status);
     }
 
     [Fact]
@@ -147,7 +155,8 @@ public partial class FunctionRpcRelayTests
         await Task.WhenAll(TryAcceptAsync(), Task.Run(() => clock.Advance(TimeSpan.FromMinutes(5)), timeout.Token));
         SplitWorkerOriginState after = await ReadSplitManagementStateAsync(management, timeout.Token);
         Assert.Equal(before.RevisionId + 1, after.RevisionId);
-        Assert.Equal(accepted ? SplitWorkerLinkState.Linked : SplitWorkerLinkState.Unlinked, after.Link.State);
+        Assert.Equal(SplitWorkerLinkState.Unlinked, after.Link.State);
+        Assert.Null(after.Link.Runtime);
         Assert.Equal(accepted ? SplitWorkerStatus.Starting : SplitWorkerStatus.RemovalRequested, after.Status);
     }
 

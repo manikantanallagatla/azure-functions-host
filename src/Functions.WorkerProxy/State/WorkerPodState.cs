@@ -21,7 +21,7 @@ internal sealed record WorkerPodState(
     bool? IsAlwaysReady,
     DateTimeOffset StartupTime)
 {
-    public SplitPodIdentity? AcceptedRuntime { get; init; }
+    public bool HasAcceptedLink { get; init; }
 
     public bool RemovalRequested { get; init; }
 
