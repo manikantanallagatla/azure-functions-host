@@ -11,12 +11,9 @@ The tool supplies no `host.json`. It sets the Host's existing read-only app-cont
 
 ### Link acceptance
 
-WorkerProxy advertises `WorkerLinkAcceptance=True` in its successful
-`WorkerInitResponse`, replacing any customer-worker value. Runtime then
-acknowledges that initialization on the same cached endpoint channel before publishing the
-initialized worker. No Runtime identity setting or startup-time pairing is required.
-The capability distinguishes WorkerProxy from ordinary non-BYOC workers; there is no
-BYOC lifecycle enable switch or older-version compatibility mode.
+Runtime always acknowledges successful initialization on the same cached WorkerProxy
+endpoint channel before publishing the initialized worker. There is no capability
+negotiation, lifecycle enable switch, Runtime identity setting or startup-time pairing.
 Runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103 must protect both
 `WorkerLink/Accept` and `FunctionRpc/EventStream`; this change does not implement it.
 

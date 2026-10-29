@@ -25,7 +25,7 @@ public partial class FunctionRpcRelayTests
         Marshallers.Create(static value => value.ToByteArray(), static bytes => AcceptLinkResponse.Parser.ParseFrom(bytes)));
 
     [Fact]
-    public async Task LinkAcceptance_InitializedMetadataAttachment_NegotiatesWithoutPublishingIdentity()
+    public async Task LinkAcceptance_InitializedMetadataAttachment_RecordsAcceptanceWithoutPublishingIdentity()
     {
         await using WorkerProxyWebApplicationFactory factory = CreateFactory();
         using CancellationTokenSource timeout = new(TestTimeout);
@@ -34,8 +34,7 @@ public partial class FunctionRpcRelayTests
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         AcceptLinkRequest request = CreateLinkRequest("metadata-init");
 
-        StreamingMessage initialized = await InitializeLinkAsync(worker, runtime, request.InitializationId, timeout.Token);
-        Assert.Equal(bool.TrueString, initialized.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"]);
+        await InitializeLinkAsync(worker, runtime, request.InitializationId, timeout.Token);
 
         SplitWorkerOriginState before = await ReadSplitManagementStateAsync(management, timeout.Token);
         Assert.Equal(SplitWorkerLinkState.Unlinked, before.Link.State);
@@ -157,7 +156,7 @@ public partial class FunctionRpcRelayTests
         InitializationId = initializationId
     };
 
-    private static async Task<StreamingMessage> InitializeLinkAsync(RelayClient worker, RelayClient runtime, string initializationId, CancellationToken token)
+    private static async Task InitializeLinkAsync(RelayClient worker, RelayClient runtime, string initializationId, CancellationToken token)
     {
         await worker.WriteAsync(CreateStartStream(), token);
         await runtime.ReadAsync(token);
@@ -173,10 +172,9 @@ public partial class FunctionRpcRelayTests
             WorkerInitResponse = new()
             {
                 Result = new() { Status = StatusResult.Types.Status.Success },
-                Capabilities = { ["WorkerLinkAcceptance"] = "customer-value" }
             }
         }, token);
-        return await runtime.ReadAsync(token);
+        await runtime.ReadAsync(token);
     }
 
     private static async Task AcceptLinkAsync(WorkerProxyWebApplicationFactory factory, AcceptLinkRequest request,

@@ -51,30 +51,23 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
     public WorkerChannelRegistry(
         IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
         IRpcClientWorkerChannelFactory channelFactory,
-        ILogger<WorkerChannelRegistry> logger)
-        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout)
-    {
-    }
-
-    public WorkerChannelRegistry(
-        IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
-        IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger,
         IRpcClientFactory clients)
-        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout)
+        : this(duplexChannelFactory, channelFactory, logger, clients, DefaultLinkTimeout)
     {
-        _clients = clients ?? throw new ArgumentNullException(nameof(clients));
     }
 
     internal WorkerChannelRegistry(
         IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
         IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger,
+        IRpcClientFactory clients,
         TimeSpan linkTimeout)
     {
         _duplexChannelFactory = duplexChannelFactory ?? throw new ArgumentNullException(nameof(duplexChannelFactory));
         _channelFactory = channelFactory ?? throw new ArgumentNullException(nameof(channelFactory));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _clients = clients ?? throw new ArgumentNullException(nameof(clients));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(linkTimeout, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(linkTimeout.TotalMilliseconds, uint.MaxValue - 1);
         _linkTimeout = linkTimeout;
@@ -187,15 +180,10 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                 }
 
                 operationSource.Token.ThrowIfCancellationRequested();
-                if (candidate.RequiresLinkAcceptance)
+                await _clients.AcceptLinkAsync(grpcEndpoint, new()
                 {
-                    IRpcClientFactory clients = _clients
-                        ?? throw new InvalidOperationException("The worker requires Link acceptance but no RPC client factory is registered.");
-                    await clients.AcceptLinkAsync(grpcEndpoint, new()
-                    {
-                        InitializationId = candidate.LinkInitializationId
-                    }, operationSource.Token);
-                }
+                    InitializationId = candidate.LinkInitializationId
+                }, operationSource.Token);
 
                 RegisterInitializedChannel(workerId, slot, candidate, operationSource.Token);
 

@@ -185,7 +185,15 @@ internal sealed class RpcClientFactory : IRpcClientFactory
         }
 
         using var call = new WorkerLink.WorkerLinkClient(channel).AcceptAsync(request, cancellationToken: cancellationToken);
-        await call.ResponseAsync;
+        try
+        {
+            await call.ResponseAsync;
+        }
+        catch (Grpc.Core.RpcException exception) when (
+            exception.StatusCode == Grpc.Core.StatusCode.Cancelled && cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(exception.Message, exception, cancellationToken);
+        }
     }
 
     /// <inheritdoc />
