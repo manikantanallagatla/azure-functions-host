@@ -1293,6 +1293,7 @@ public sealed partial class WorkerChannelRegistryTests
         Task<IReadOnlyList<WorkerChannel>> firstSignal = registry.GetReadyChannelsAsync().AsTask();
         await LinkAsync(registry, first.Id);
         Assert.Same(first.Channel, Assert.Single(await firstSignal.WaitAsync(TestTimeout)));
+        await first.ReadRequestAsync(StreamingMessage.ContentOneofCase.FunctionLoadRequest);
 
         Assert.True(await registry.UnlinkAsync(first.Id));
         Task<IReadOnlyList<WorkerChannel>> replacementSignal = registry.GetReadyChannelsAsync().AsTask();
@@ -2052,6 +2053,8 @@ public sealed partial class WorkerChannelRegistryTests
                         Result = new() { Status = StatusResult.Types.Status.Success },
                     },
                 });
+                await Transport.Requests.Completion;
+                Transport.CompleteResponses();
             }
             catch (ChannelClosedException)
             {

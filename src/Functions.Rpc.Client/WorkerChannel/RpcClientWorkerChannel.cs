@@ -3,6 +3,7 @@
 
 using System;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script;
 using Microsoft.Azure.WebJobs.Script.AppCapabilities;
@@ -31,6 +32,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
 {
     private readonly TaskCompletionSource<Exception> _functionLoadFailure = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Lock _lifecycleLock = new();
+    private readonly ChannelWriter<StreamingMessage> _requestWriter;
     private readonly TaskCompletionSource _startCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private LifecycleState _lifecycleState;
 
@@ -67,6 +69,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
             appCapabilitiesStore,
             httpProxyService)
     {
+        _requestWriter = ownedChannel.Writer;
         Completion = ownedChannel.Reader.Completion;
     }
 
@@ -85,6 +88,8 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
 
     // Terminal signals can precede registry cleanup and the base channel's disposal state.
     internal bool IsReadyForInvocations => !IsTerminated && IsChannelReadyForInvocations();
+
+    internal void CompleteRequests() => _requestWriter.TryComplete();
 
     /// <summary>
     /// Starts inbound protocol processing and waits for the worker initialization handshake.

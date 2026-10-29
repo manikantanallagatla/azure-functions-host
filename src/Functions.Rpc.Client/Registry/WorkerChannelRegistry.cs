@@ -28,6 +28,7 @@ namespace Azure.Functions.Rpc.Client;
 internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
 {
     private static readonly TimeSpan DefaultLinkTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan UnlinkTimeout = TimeSpan.FromSeconds(10);
 
     private readonly IRpcClientWorkerChannelFactory _channelFactory;
     private readonly Lock _disposeLock = new();
@@ -260,7 +261,28 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                         return false;
                     }
 
-                    await channel.DisposeAsync();
+                    Exception failure = null;
+                    try
+                    {
+                        channel.CompleteRequests();
+                        // Wait for peer termination without treating its final gRPC status as an unlink failure.
+                        await Task.WhenAny(channel.Completion).WaitAsync(UnlinkTimeout, operationSource.Token);
+                        if (channel.Completion.IsFaulted)
+                        {
+                            Log.ChannelFailed(_logger, channel.Completion.Exception, workerId);
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        failure = exception;
+                    }
+
+                    failure = await channel.DisposeAndCaptureExceptionAsync(failure);
+                    if (failure is not null)
+                    {
+                        ExceptionDispatchInfo.Capture(failure).Throw();
+                    }
+
                     return true;
                 }
             }

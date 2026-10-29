@@ -51,7 +51,16 @@ deadline. Worker-side completion, canceled or faulted calls, and Proxy shutdown 
 activate this new removal path. Their terminal-loss/recovery policy remains deferred; this
 is only the explicit Runtime-completion slice of W2, not general network-loss detection or
 W3/W4 draining. Local linked history stays retained; full published Runtime identity is
-still deferred. No new timer, threshold, authentication implementation or forced exit is added.
+still deferred.
+
+Runtime's `IWorkerChannelRegistry.UnlinkAsync` withdraws the channel locally, completes its
+request stream, and waits up to ten seconds for peer termination before disposing it.
+This lets a healthy initialized WorkerProxy observe `PeerClosed` rather than cancellation.
+A timeout is reported to the caller, and caller cancellation still releases local resources.
+The worker ID remains terminal in either case. Peer transport failures are logged; unlink
+success means local removal, not proof of remote removal or physical deletion by Legion.
+Ordinary disposal and Runtime shutdown still abort calls without waiting for graceful close.
+No new endpoint, authentication implementation, forced exit, or network-loss policy is added.
 
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.
 

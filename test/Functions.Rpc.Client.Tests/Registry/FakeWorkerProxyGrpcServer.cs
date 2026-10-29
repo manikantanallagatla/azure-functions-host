@@ -104,13 +104,27 @@ internal sealed class FakeWorkerProxyGrpcServer : IAsyncDisposable
     {
         private readonly TaskCompletionSource _initializationStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _disconnected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _requestsCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource<WorkerInitResponse> _initializationResponse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<Status>? _closeResponse;
 
         internal string WorkerId { get; } = workerId;
 
         internal Task InitializationStarted => _initializationStarted.Task;
 
         internal Task Disconnected => _disconnected.Task;
+
+        internal Task RequestsCompleted => _requestsCompleted.Task;
+
+        internal void HoldCloseResponse() => _closeResponse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal void CompleteClose(Status status) => _closeResponse!.SetResult(status);
+
+        internal Task<Status> GetCloseResponseAsync(CancellationToken cancellationToken)
+        {
+            _requestsCompleted.TrySetResult();
+            return _closeResponse?.Task.WaitAsync(cancellationToken) ?? Task.FromResult(Status.DefaultSuccess);
+        }
 
         internal void CompleteInitialization(string? httpUri = null)
         {
@@ -179,6 +193,8 @@ internal sealed class FakeWorkerProxyGrpcServer : IAsyncDisposable
                         });
                     }
                 }
+
+                context.Status = await worker.GetCloseResponseAsync(context.CancellationToken);
             }
             catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
             {
