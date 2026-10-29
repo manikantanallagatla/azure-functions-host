@@ -21,7 +21,7 @@ public partial class FunctionRpcRelayTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task RuntimeClose_AcceptedAttachment_PublishesStickyRemovalAndClosesIntake(bool assigned)
+    public async Task RuntimeClose_InitializedAttachment_PublishesStickyRemovalAndClosesIntake(bool assigned)
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
@@ -29,8 +29,7 @@ public partial class FunctionRpcRelayTests
         using HttpClient management = factory.CreateWorkerProxyClient();
         await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
-        var request = CreateLinkRequest("accepted-runtime-close");
-        await InitializeLinkAsync(worker, runtime, request.InitializationId, timeout.Token);
+        await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
         if (assigned)
         {
             using HttpResponseMessage assignment = await PutManagementJsonAsync(
@@ -38,7 +37,6 @@ public partial class FunctionRpcRelayTests
             Assert.Equal(HttpStatusCode.Created, assignment.StatusCode);
         }
 
-        await AcceptLinkAsync(factory, request, timeout.Token);
         SplitWorkerOriginState accepted = await ReadSplitManagementStateAsync(management, timeout.Token);
         clock.Advance(TimeSpan.FromHours(1));
         Assert.Equal(accepted, await ReadSplitManagementStateAsync(management, timeout.Token));
@@ -59,9 +57,6 @@ public partial class FunctionRpcRelayTests
         using HttpResponseMessage lateAssignment = await PutManagementJsonAsync(
             management, "/admin/worker/assignment", ManagementAssignment, timeout.Token);
         await AssertManagementErrorAsync(lateAssignment, HttpStatusCode.Conflict, "RemovalRequested", timeout.Token);
-        GrpcRpcException lateAcceptance = await Assert.ThrowsAsync<GrpcRpcException>(
-            () => AcceptLinkAsync(factory, request, timeout.Token));
-        Assert.Equal(StatusCode.FailedPrecondition, lateAcceptance.StatusCode);
         await using RelayClient replacement = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         GrpcRpcException rejected = await replacement.WriteAndReadRejectionAsync(
             new StreamingMessage { WorkerInitRequest = new() { HostVersion = "replacement" } }, timeout.Token);
@@ -73,7 +68,7 @@ public partial class FunctionRpcRelayTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task RuntimeClose_BeforeAcceptance_AllowsRetryWithoutResettingNeverLinkedDeadline(bool initialized)
+    public async Task RuntimeClose_BeforeInitialization_AllowsRetryWithoutResettingNeverLinkedDeadline(bool failedInitialization)
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
@@ -85,9 +80,20 @@ public partial class FunctionRpcRelayTests
         await using (RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token))
         await using (RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token))
         {
-            if (initialized)
+            if (failedInitialization)
             {
-                await InitializeLinkAsync(worker, runtime, "not-accepted", timeout.Token);
+                await worker.WriteAsync(CreateStartStream(), timeout.Token);
+                await runtime.ReadAsync(timeout.Token);
+                await runtime.WriteAsync(new StreamingMessage
+                {
+                    WorkerInitRequest = new() { HostVersion = "test-host" }
+                }, timeout.Token);
+                await worker.ReadAsync(timeout.Token);
+                await worker.WriteAsync(new StreamingMessage
+                {
+                    WorkerInitResponse = new() { Result = new() { Status = StatusResult.Types.Status.Failure } }
+                }, timeout.Token);
+                await runtime.ReadAsync(timeout.Token);
             }
             else
             {
@@ -103,7 +109,7 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(SplitWorkerStatus.Starting, (await ReadSplitManagementStateAsync(management, timeout.Token)).Status);
         await using RelayClient replacementWorker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient replacementRuntime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
-        await InitializeLinkAsync(replacementWorker, replacementRuntime, "retry-init", timeout.Token);
+        await ExchangeAsync(replacementRuntime, replacementWorker, "retry-before-initialization", timeout.Token);
         clock.Advance(TimeSpan.FromMinutes(1));
         SplitWorkerOriginState expired = await ReadSplitManagementStateAsync(management, timeout.Token);
         Assert.Equal(SplitWorkerStatus.RemovalRequested, expired.Status);
@@ -122,9 +128,7 @@ public partial class FunctionRpcRelayTests
         using HttpClient management = factory.CreateWorkerProxyClient();
         await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
-        var request = CreateLinkRequest("excluded-close");
-        await InitializeLinkAsync(worker, runtime, request.InitializationId, timeout.Token);
-        await AcceptLinkAsync(factory, request, timeout.Token);
+        await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
         RelayClient closingPeer = runtimeSide ? runtime : worker;
         if (canceled)
         {
@@ -145,7 +149,7 @@ public partial class FunctionRpcRelayTests
     }
 
     [Fact]
-    public async Task RuntimeClose_RacingAcceptance_RemovesOnlyIfAcceptanceWon()
+    public async Task RuntimeClose_RacingInitialization_RemovesOnlyIfInitializationWon()
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
@@ -153,34 +157,38 @@ public partial class FunctionRpcRelayTests
         using HttpClient management = factory.CreateWorkerProxyClient();
         await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
-        var request = CreateLinkRequest("close-acceptance-race");
-        await InitializeLinkAsync(worker, runtime, request.InitializationId, timeout.Token);
+        await worker.WriteAsync(CreateStartStream(), timeout.Token);
+        await runtime.ReadAsync(timeout.Token);
+        await runtime.WriteAsync(new StreamingMessage { WorkerInitRequest = new() { HostVersion = "test-host" } }, timeout.Token);
+        await worker.ReadAsync(timeout.Token);
         SplitWorkerOriginState before = await ReadSplitManagementStateAsync(management, timeout.Token);
-        bool accepted = false;
-        async Task TryAcceptAsync()
+        async Task TryInitializeAsync()
         {
             try
             {
-                await AcceptLinkAsync(factory, request, timeout.Token);
-                accepted = true;
+                await worker.WriteAsync(new StreamingMessage
+                {
+                    WorkerInitResponse = new() { Result = new() { Status = StatusResult.Types.Status.Success } }
+                }, timeout.Token);
             }
-            catch (GrpcRpcException error) when (error.StatusCode == StatusCode.FailedPrecondition)
+            catch (GrpcRpcException error) when (error.StatusCode == StatusCode.Unavailable)
             {
             }
         }
 
-        await Task.WhenAll(TryAcceptAsync(), runtime.CompleteRequestAsync(timeout.Token));
+        await Task.WhenAll(TryInitializeAsync(), runtime.CompleteRequestAsync(timeout.Token));
         await runtime.WaitForTerminationAsync(timeout.Token);
         await worker.WaitForTerminationAsync(timeout.Token);
+        WorkerPodState state = factory.Services.GetRequiredService<WorkerPodStateManager>().State;
         SplitWorkerOriginState after = await ReadSplitManagementStateAsync(management, timeout.Token);
-        Assert.Equal(accepted ? SplitWorkerStatus.RemovalRequested : SplitWorkerStatus.Starting, after.Status);
-        Assert.Equal(before.RevisionId + (accepted ? 2 : 1), after.RevisionId);
+        Assert.Equal(state.HasAcceptedLink ? SplitWorkerStatus.RemovalRequested : SplitWorkerStatus.Starting, after.Status);
+        Assert.Equal(before.RevisionId + (state.HasAcceptedLink ? 2 : 1), after.RevisionId);
         Assert.Equal(before.StartupTime, after.StartupTime);
         Assert.Equal(before.Link, after.Link);
     }
 
     [Fact]
-    public async Task RuntimeClose_HttpOverride_ClosesAfterAcceptedRuntimeCompletion()
+    public async Task RuntimeClose_HttpOverride_ClosesAfterInitializedRuntimeCompletion()
     {
         int forwardedRequests = 0;
         await using var destination = await WorkerHttpForwardingTests.StartWorkerAsync(_ =>
@@ -196,9 +204,7 @@ public partial class FunctionRpcRelayTests
         using HttpClient management = factory.CreateWorkerProxyClient();
         await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
-        var request = CreateLinkRequest("http-runtime-close");
-        await InitializeLinkAsync(worker, runtime, request.InitializationId, timeout.Token);
-        await AcceptLinkAsync(factory, request, timeout.Token);
+        await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
 
         using HttpResponseMessage before = await http.GetAsync("/before-runtime-close", timeout.Token);
         Assert.Equal(HttpStatusCode.OK, before.StatusCode);

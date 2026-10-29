@@ -25,6 +25,7 @@ Publishing historical `link.runtime` requires authoritative full Runtime identit
 and is deliberately deferred: the existing public `link` projection remains unchanged
 (`Unlinked`, with no Runtime identity). This local history is only the W1 foundation,
 not completion of the full published Link lifecycle contract.
+
 WorkerProxy requests removal if initialization does not complete
 within `WorkerProxy:NeverLinkedTimeout` (default five minutes). The duration is frozen for the
 process. Assignment, initialization progress/failure, retries and configuration reload do not reset it.
@@ -39,17 +40,17 @@ There is no forced process exit or new drain behavior here.
 
 ### Explicit Runtime connection completion
 
-A Proxy with an accepted Link also requests sticky removal when Runtime explicitly
+A Proxy with successfully initialized linked history also requests sticky removal when Runtime explicitly
 completes its gRPC request stream. This uses the relay's
 existing runtime-side `PeerClosed` classification, not a new inference of Runtime death.
 Readiness withdrawal and removal publication share one state update. Existing removal
 handling closes new assignment, Link/stream and HTTP admission while management stays alive.
 
-A close before acceptance retains the existing retry behavior and original never-linked
+A close before successful initialization retains the existing retry behavior and original never-linked
 deadline. Worker-side completion, canceled or faulted calls, and Proxy shutdown do not
 activate this new removal path. Their terminal-loss/recovery policy remains deferred; this
 is only the explicit Runtime-completion slice of W2, not general network-loss detection or
-W3/W4 draining. Local accepted history stays retained; full published Runtime identity is
+W3/W4 draining. Local linked history stays retained; full published Runtime identity is
 still deferred. No new timer, threshold, authentication implementation or forced exit is added.
 
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.
