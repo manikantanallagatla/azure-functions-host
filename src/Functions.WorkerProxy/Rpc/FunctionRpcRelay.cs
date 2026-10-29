@@ -107,17 +107,6 @@ internal sealed partial class FunctionRpcRelay(
     }
 
     /// <summary>
-    /// Accepts only the initialized, live stream pair that produced the supplied handshake ID.
-    /// </summary>
-    internal bool AcceptLink(string initializationId)
-    {
-        lock (_syncLock)
-        {
-            return !_stopping && _currentSession?.AcceptLink(initializationId) == true;
-        }
-    }
-
-    /// <summary>
     /// Attaches one gRPC duplex stream to the current relay session.
     /// </summary>
     /// <param name="side">The role owned by the listener accepting the stream.</param>

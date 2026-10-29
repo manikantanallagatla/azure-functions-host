@@ -215,7 +215,7 @@ public partial class FunctionRpcRelayTests
     }
 
     [Fact]
-    public async Task Relay_ReplacementSessionAfterFailedAssignment_DoesNotReuseFunctionGroup()
+    public async Task Relay_ReplacementSessionAfterFailedAssignment_CannotCompleteInitialization()
     {
         await using WorkerProxyWebApplicationFactory factory = CreateFactory();
         WorkerPodStateManager manager = factory.Services.GetRequiredService<WorkerPodStateManager>();
@@ -227,11 +227,11 @@ public partial class FunctionRpcRelayTests
         await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await ExchangeAsync(runtime, worker, "replacement", timeout.Token);
         StreamingMessage response = CreateInitResponse("init", null);
-        StreamingMessage expected = response.Clone();
-
         await worker.WriteAsync(response, timeout.Token);
 
-        Assert.Equal(expected, await runtime.ReadAsync(timeout.Token));
+        Assert.Equal(StatusCode.Unavailable, await runtime.WaitForTerminationAsync(timeout.Token));
+        Assert.Equal(StatusCode.Unavailable, await worker.WaitForTerminationAsync(timeout.Token));
+        Assert.False(manager.State.HasAcceptedLink);
     }
 
     private static async Task<WorkerAssignment> FailAssignedSessionAsync(WorkerProxyWebApplicationFactory factory,
