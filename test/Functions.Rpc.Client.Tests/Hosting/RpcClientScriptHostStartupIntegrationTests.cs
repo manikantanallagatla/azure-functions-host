@@ -44,18 +44,17 @@ public class RpcClientScriptHostStartupIntegrationTests
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(30);
 
     [Theory]
-    [InlineData(null, null, false, StatusCode.OK)]
-    [InlineData("", null, false, StatusCode.OK)]
-    [InlineData("node", null, false, StatusCode.OK)]
-    [InlineData("python", "node", false, StatusCode.OK)]
-    [InlineData(null, null, true, StatusCode.OK)]
-    [InlineData(null, null, true, StatusCode.FailedPrecondition)]
-    [InlineData(null, null, true, StatusCode.Unimplemented)]
+    [InlineData(null, null, StatusCode.OK)]
+    [InlineData("", null, StatusCode.OK)]
+    [InlineData("node", null, StatusCode.OK)]
+    [InlineData("python", "node", StatusCode.OK)]
+    [InlineData(null, null, StatusCode.FailedPrecondition)]
+    [InlineData(null, null, StatusCode.Unimplemented)]
+    [InlineData(null, null, StatusCode.Cancelled)]
     public async Task FirstLink_WorkerLanguageControlsRuntimeIndexingAndInvocation(
-        string? configuredRuntime, string? profileRuntime, bool requireAcceptance, StatusCode acceptanceStatus)
+        string? configuredRuntime, string? profileRuntime, StatusCode acceptanceStatus)
     {
         await using TestWorker worker = await TestWorker.StartAsync("worker", "python");
-        worker.Service.RequireLinkAcceptance = requireAcceptance;
         worker.Acceptance.ResponseStatus = acceptanceStatus;
         var configureBuilder = new Mock<IConfigureBuilder<IServiceCollection>>();
         configureBuilder.Setup(builder => builder.Configure(It.IsAny<IServiceCollection>()))
@@ -77,11 +76,23 @@ public class RpcClientScriptHostStartupIntegrationTests
         RpcClientScriptHostStartupCoordinator coordinator = testHost.Host.Services.GetRequiredService<RpcClientScriptHostStartupCoordinator>();
         IScriptHostManager manager = testHost.Host.Services.GetRequiredService<IScriptHostManager>();
 
-        if (requireAcceptance && acceptanceStatus != StatusCode.OK)
+        if (acceptanceStatus != StatusCode.OK)
         {
-            Grpc.Core.RpcException error = await Assert.ThrowsAsync<Grpc.Core.RpcException>(
-                () => registry.LinkAsync("worker", worker.Endpoint, cancellationToken: timeout.Token));
-            Assert.Equal(acceptanceStatus, error.StatusCode);
+            Task<WorkerLinkResult> link = registry.LinkAsync("worker", worker.Endpoint, cancellationToken: timeout.Token);
+            if (acceptanceStatus == StatusCode.Cancelled)
+            {
+                await worker.Acceptance.Started.Task.WaitAsync(timeout.Token);
+                Assert.Empty(registry.GetInitializedChannels());
+                timeout.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => link);
+                Assert.True(link.IsCanceled);
+            }
+            else
+            {
+                Grpc.Core.RpcException error = await Assert.ThrowsAsync<Grpc.Core.RpcException>(() => link);
+                Assert.Equal(acceptanceStatus, error.StatusCode);
+            }
+
             Assert.Equal(1, worker.Acceptance.Calls);
             Assert.Empty(registry.GetInitializedChannels());
             Assert.Null(manager.Services);
@@ -91,7 +102,7 @@ public class RpcClientScriptHostStartupIntegrationTests
         }
 
         await registry.LinkAsync("worker", worker.Endpoint, cancellationToken: timeout.Token);
-        Assert.Equal(requireAcceptance ? 1 : 0, worker.Acceptance.Calls);
+        Assert.Equal(1, worker.Acceptance.Calls);
         await coordinator.ActivationTask!.WaitAsync(timeout.Token);
         await WaitForHostStateAsync(manager, ScriptHostState.Running, timeout.Token);
         await worker.Service.FunctionLoaded.Task.WaitAsync(timeout.Token);
@@ -427,7 +438,9 @@ public class RpcClientScriptHostStartupIntegrationTests
 
         public StatusCode ResponseStatus { get; set; }
 
-        public override Task<AcceptLinkResponse> Accept(AcceptLinkRequest request, ServerCallContext context)
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async Task<AcceptLinkResponse> Accept(AcceptLinkRequest request, ServerCallContext context)
         {
             Interlocked.Increment(ref _calls);
             if (string.IsNullOrWhiteSpace(request.InitializationId) ||
@@ -436,12 +449,18 @@ public class RpcClientScriptHostStartupIntegrationTests
                 throw new Grpc.Core.RpcException(new Status(StatusCode.InvalidArgument, "Incorrect initialization ID."));
             }
 
+            Started.TrySetResult();
+            if (ResponseStatus == StatusCode.Cancelled)
+            {
+                await Task.Delay(Timeout.Infinite, context.CancellationToken);
+            }
+
             if (ResponseStatus != StatusCode.OK)
             {
                 throw new Grpc.Core.RpcException(new Status(ResponseStatus, "Acceptance rejected."));
             }
 
-            return Task.FromResult(new AcceptLinkResponse());
+            return new AcceptLinkResponse();
         }
     }
 
@@ -450,8 +469,6 @@ public class RpcClientScriptHostStartupIntegrationTests
         private int _functionLoadRequests;
         private int _metadataRequests;
         private int _invocations;
-
-        public bool RequireLinkAcceptance { get; set; }
 
         public string? InitializationId { get; private set; }
 
@@ -480,11 +497,6 @@ public class RpcClientScriptHostStartupIntegrationTests
                         case StreamingMessage.ContentOneofCase.WorkerInitRequest:
                             InitializationId = request.RequestId;
                             response.WorkerInitResponse = new() { Result = Success() };
-                            if (RequireLinkAcceptance)
-                            {
-                                response.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
-                            }
-
                             break;
                         case StreamingMessage.ContentOneofCase.FunctionsMetadataRequest:
                             Interlocked.Increment(ref _metadataRequests);

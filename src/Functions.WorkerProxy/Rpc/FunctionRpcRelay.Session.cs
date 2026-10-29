@@ -27,7 +27,6 @@ internal sealed partial class FunctionRpcRelay
         WorkerPodStateManager stateManager)
     {
         private const string FunctionGroupNameCapability = "FunctionGroupName";
-        private const string LinkAcceptanceCapability = "WorkerLinkAcceptance";
         private readonly Lock _stateLock = new();
         private readonly Channel<StreamingMessage> _toRuntime = CreateChannel();
         private readonly Channel<StreamingMessage> _toWorker = CreateChannel();
@@ -302,8 +301,6 @@ internal sealed partial class FunctionRpcRelay
             {
                 Uri? destination = capabilityFinalizer.FinalizeCapabilities(finalized.WorkerInitResponse.Capabilities);
                 ApplyFunctionGroupCapability(finalized.WorkerInitResponse.Capabilities);
-                // This is a platform protocol capability, never a customer-worker claim.
-                finalized.WorkerInitResponse.Capabilities[LinkAcceptanceCapability] = bool.TrueString;
                 capabilities = finalized.WorkerInitResponse.Capabilities.ToFrozenDictionary(StringComparer.Ordinal);
                 lock (_stateLock)
                 {

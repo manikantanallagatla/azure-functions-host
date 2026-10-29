@@ -52,7 +52,6 @@ public partial class FunctionRpcRelayTests
         StreamingMessage response = CreateInitResponse("successful-init", null);
         response.WorkerInitResponse.Capabilities.Clear();
         StreamingMessage expected = response.Clone();
-        expected.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
         if (rewrite)
         {
             expected.WorkerInitResponse.Capabilities["custom-capability"] = "finalized";
@@ -182,7 +181,6 @@ public partial class FunctionRpcRelayTests
         }
 
         StreamingMessage expected = CreateInitResponse("init", null);
-        expected.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
         if (expectedAdvertisedGroup is not null)
         {
             expected.WorkerInitResponse.Capabilities[FunctionGroupNameCapability] = expectedAdvertisedGroup;
@@ -209,7 +207,6 @@ public partial class FunctionRpcRelayTests
         StreamingMessage repeated = CreateInitResponse("repeated-init", null);
         repeated.WorkerInitResponse.Capabilities[FunctionGroupNameCapability] = "changed-group";
         StreamingMessage expected = repeated.Clone();
-        expected.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
         expected.WorkerInitResponse.Capabilities[FunctionGroupNameCapability] = assignment.FunctionGroupName;
 
         await worker.WriteAsync(repeated, timeout.Token);
@@ -231,7 +228,6 @@ public partial class FunctionRpcRelayTests
         await ExchangeAsync(runtime, worker, "replacement", timeout.Token);
         StreamingMessage response = CreateInitResponse("init", null);
         StreamingMessage expected = response.Clone();
-        expected.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
 
         await worker.WriteAsync(response, timeout.Token);
 
