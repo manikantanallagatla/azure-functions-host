@@ -9,76 +9,12 @@ The tool supplies no `host.json`. It sets the Host's existing read-only app-cont
 - The repository's .NET SDK.
 - For container deployment only, a running Linux x64 Docker engine with Docker Compose.
 
-### Link completion
+## BYOC worker lifecycle cleanup
 
-WorkerProxy records local Link completion when the worker successfully initializes on
-the current live Runtime/worker stream pair. It uses the existing initialization exchange;
-there is no extra acknowledgement API, correlation field, capability negotiation or enable switch.
-This completion point does not prove Runtime registration or receipt of Link success by RCP.
-Runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103 must protect
-`FunctionRpc/EventStream`; this change does not implement it.
-
-Repeated successful initialization does not advance state. WorkerProxy retains local linked
-history after transport loss and cannot be retargeted after linking.
-Link completion does not promote serving readiness.
-Publishing historical `link.runtime` requires authoritative full Runtime identity delivery
-and is deliberately deferred: the existing public `link` projection remains unchanged
-(`Unlinked`, with no Runtime identity). This local history is only the W1 foundation,
-not completion of the full published Link lifecycle contract.
-
-WorkerProxy requests removal if initialization does not complete
-within `WorkerProxy:NeverLinkedTimeout` (default five minutes). The duration is frozen for the
-process. Assignment, initialization progress/failure, retries and configuration reload do not reset it.
-Process entry captures the UTC startup time and monotonic timestamp before constructing the
-Host or loading configuration. Construction consumes the original window; it does not start a
-new one when the state manager is resolved. If startup exhausts the window, the Proxy reports
-removal as soon as its management application becomes available. UTC clock changes do not
-alter the monotonic deadline.
-
-Successful initialization and expiry compete under one lifecycle lock. Expiry is sticky, withdraws readiness
-and HTTP forwarding (including an explicit `WorkerHttpEndpoint` override), and rejects late
-assignment and Link/stream admission. Management readiness
-and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.
-There is no forced process exit or new drain behavior here.
-
-The same fixed window covers lost worker-creation responses, failed parallel Runtime allocation,
-failed or rejected Link attempts, and workers abandoned before assignment. None of those paths
-needs a new timer or a Runtime response before expiry can request removal.
-JWT/TLS integration remains a separate dependency on Host PR #12103; local initialization
-coverage is not authenticated end-to-end W1 sign-off. A Proxy that never starts or cannot report
-still requires Legion startup/failure recovery, which this change does not implement.
-
-### Terminal connection cleanup
-
-A Proxy with an accepted assignment or successfully initialized linked history also requests sticky
-removal when Runtime or the customer worker explicitly completes its gRPC request stream, or the relay terminates the attachment
-through call cancellation or a stream-operation failure. This uses the existing `PeerClosed`, `Canceled`
-and `Faulted` classifications, not a new inference of process death. These terminal states already
-tear down the stream pair. An initialized attachment cannot be replaced in the same Proxy; an assigned
-session's termination already makes its assignment permanently failed, even before initialization.
-Removal therefore retires an otherwise unusable pod.
-Readiness withdrawal and removal publication share one state update. Existing removal
-handling closes new assignment, Link/stream and HTTP admission while management stays alive.
-
-An assigned Proxy therefore requests removal immediately when its relay terminates, without waiting
-for the never-linked deadline. A failed initialization response alone does not select removal while
-the relay remains live.
-Unassigned sessions without successful initialization retain their existing recovery rules and
-original never-linked deadline. Proxy shutdown does not independently select removal.
-The first terminal classification still wins, including when shutdown races with peer termination.
-Transient disruptions that do not terminate the relay session do not select removal. There is no
-new network-loss detector or timeout, customer-worker health classification, invocation draining or
-physical deletion.
-Local linked history stays retained; full published Runtime identity is still deferred.
-
-Runtime's `IWorkerChannelRegistry.UnlinkAsync` withdraws the channel locally, completes its
-request stream, and waits up to ten seconds for peer termination before disposing it.
-This lets a healthy initialized WorkerProxy observe `PeerClosed` rather than cancellation.
-A timeout is reported to the caller, and caller cancellation still releases local resources.
-The worker ID remains terminal in either case. Peer transport failures are logged; unlink
-success means local removal, not proof of remote removal or physical deletion by Legion.
-Ordinary disposal and Runtime shutdown still abort calls without waiting for graceful close.
-No new endpoint, authentication implementation, forced exit, or network-loss detector is added.
+The lifecycle cleanup behavior used by this tool is explained in the
+[BYOC worker lifecycle cleanup reviewer guide](byoc-worker-lifecycle-cleanup.md). The guide covers
+Link history, the fixed never-linked deadline, terminal relay cleanup, explicit Runtime unlink,
+admission closure, assumptions, limitations, and behavioral validation.
 
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.
 

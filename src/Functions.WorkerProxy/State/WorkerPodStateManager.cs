@@ -53,7 +53,7 @@ internal sealed class WorkerPodStateManager
     }
 
     /// <summary>
-    /// Gets the current immutable state without incrementing its revision.
+    /// Gets the current immutable state after applying the fixed never-linked deadline.
     /// </summary>
     public WorkerPodState State
     {

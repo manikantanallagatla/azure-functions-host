@@ -22,119 +22,198 @@ namespace Azure.Functions.WorkerProxy.Tests;
 
 public partial class FunctionRpcRelayTests
 {
-    [Theory]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    [InlineData(true, true)]
-    public async Task NeverLinked_DefaultDeadline_PublishesStickyRemovalAndClosesIntake(
-        bool explicitHttpDestination, bool workerStarted)
+    public enum NeverLinkedScenario
     {
-        int forwardedRequests = 0;
-        await using var destination = await WorkerHttpForwardingTests.StartWorkerAsync(_ =>
-        {
-            Interlocked.Increment(ref forwardedRequests);
-            return Task.CompletedTask;
-        });
-        LifecycleClock clock = new();
-        await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(
-            clock, httpEndpoint: explicitHttpDestination ? WorkerHttpForwardingTests.GetAddress(destination).AbsoluteUri : null);
-        using CancellationTokenSource timeout = new(TestTimeout);
-        using HttpClient management = factory.CreateWorkerProxyClient();
-        using HttpClient http = factory.CreateHttpForwardingClient();
-        await using RelayClient? abandonedWorker = workerStarted
-            ? CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token)
-            : null;
-        if (abandonedWorker is not null)
-        {
-            await abandonedWorker.WriteAsync(CreateStartStream(), timeout.Token);
-            await WaitForWorkerReadyAsync(factory.Services.GetRequiredService<WorkerPodStateManager>(), timeout.Token);
-            await AssertReadinessAsync(management, "/admin/worker/ready", HttpStatusCode.OK, timeout.Token);
-        }
-
-        using HttpResponseMessage beforeDeadline = await http.GetAsync("/before-deadline", timeout.Token);
-        Assert.Equal(explicitHttpDestination ? HttpStatusCode.OK : HttpStatusCode.ServiceUnavailable, beforeDeadline.StatusCode);
-        SplitWorkerOriginState initial = await ReadSplitManagementStateAsync(management, timeout.Token);
-        await clock.WaitForTimerAsync(TimeSpan.FromMinutes(5), timeout.Token);
-        clock.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
-        Assert.Equal(initial, await ReadSplitManagementStateAsync(management, timeout.Token));
-
-        Task<HttpResponseMessage> poll = PollSplitManagementStateAsync(management, initial, timeout.Token);
-        await WaitForManagementPollAsync(factory.Services.GetRequiredService<WorkerPodStateManager>(), timeout.Token);
-        clock.Advance(TimeSpan.FromMilliseconds(998.5));
-        clock.FireTimerEarly();
-        await clock.WaitForTimerAsync(TimeSpan.FromMilliseconds(2), timeout.Token);
-        clock.Advance(TimeSpan.FromMilliseconds(2));
-        using HttpResponseMessage changed = await poll;
-        SplitWorkerOriginState removed = await ReadSplitManagementStateAsync(changed, timeout.Token);
-        Assert.Equal(SplitWorkerStatus.RemovalRequested, removed.Status);
-        Assert.Equal(SplitWorkerLinkState.Unlinked, removed.Link.State);
-        Assert.Equal(initial.StartupTime, removed.StartupTime);
-        Assert.Equal(initial.RevisionId + 1, removed.RevisionId);
-        await AssertReadinessAsync(management, "/admin/instance/ready", HttpStatusCode.OK, timeout.Token);
-        await AssertReadinessAsync(management, "/admin/worker/ready", HttpStatusCode.ServiceUnavailable, timeout.Token);
-        using HttpResponseMessage afterDeadline = await http.GetAsync("/after-deadline", timeout.Token);
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, afterDeadline.StatusCode);
-        Assert.Equal(explicitHttpDestination ? 1 : 0, Volatile.Read(ref forwardedRequests));
-
-        using HttpResponseMessage assignment = await PutManagementJsonAsync(
-            management, "/admin/worker/assignment", ManagementAssignment, timeout.Token);
-        await AssertManagementErrorAsync(assignment, HttpStatusCode.Conflict, "RemovalRequested", timeout.Token);
-        await using RelayClient lateWorker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
-        Assert.Equal(StatusCode.Unavailable,
-            (await lateWorker.WriteAndReadRejectionAsync(CreateStartStream(), timeout.Token)).StatusCode);
-        await using RelayClient lateRuntime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
-        GrpcRpcException lateLink = await lateRuntime.WriteAndReadRejectionAsync(
-            new StreamingMessage { WorkerInitRequest = new() { HostVersion = "late-runtime" } }, timeout.Token);
-        Assert.Equal(StatusCode.Unavailable, lateLink.StatusCode);
-        clock.Advance(TimeSpan.FromHours(1));
-        Assert.Equal(removed, await ReadSplitManagementStateAsync(management, timeout.Token));
+        DeadlineAdmission,
+        ProcessStartAndClock,
+        RetryAndConfigurationReload,
+        AcceptedLinkStopsDeadline,
+        InitializationExpiryRace
     }
 
     [Theory]
-    [InlineData(0, 300, 0)]
-    [InlineData(30, 300, 0)]
-    [InlineData(300, 300, 0)]
-    [InlineData(301, 300, 0)]
-    [InlineData(30, 120, 0)]
-    [InlineData(120, 120, 0)]
-    [InlineData(30, 300, 1440)]
-    [InlineData(30, 300, -1440)]
-    public async Task NeverLinked_HostConstruction_ConsumesOriginalMonotonicDeadline(
-        int constructionSeconds, int durationSeconds, int utcAdjustmentMinutes)
+    [InlineData(NeverLinkedScenario.DeadlineAdmission)]
+    [InlineData(NeverLinkedScenario.ProcessStartAndClock)]
+    [InlineData(NeverLinkedScenario.RetryAndConfigurationReload)]
+    [InlineData(NeverLinkedScenario.AcceptedLinkStopsDeadline)]
+    [InlineData(NeverLinkedScenario.InitializationExpiryRace)]
+    public async Task NeverLinkedDeadline_UsesFixedProcessStartAndStickyAdmission(NeverLinkedScenario scenario)
     {
-        LifecycleClock clock = new();
-        DateTimeOffset processStartup = clock.Provider.GetUtcNow();
-        await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(
-            clock, duration: TimeSpan.FromSeconds(durationSeconds).ToString("c"));
-        clock.Advance(TimeSpan.FromSeconds(constructionSeconds));
-        clock.AdjustUtc(TimeSpan.FromMinutes(utcAdjustmentMinutes));
-        using CancellationTokenSource timeout = new(TestTimeout);
-        using HttpClient management = factory.CreateWorkerProxyClient();
-        SplitWorkerOriginState state = await ReadSplitManagementStateAsync(management, timeout.Token);
-        Assert.Equal(processStartup, state.StartupTime);
-
-        if (constructionSeconds < durationSeconds)
+        switch (scenario)
         {
-            Assert.Equal(SplitWorkerStatus.Starting, state.Status);
-            clock.Advance(TimeSpan.FromSeconds(durationSeconds - constructionSeconds) - TimeSpan.FromMilliseconds(1));
+            case NeverLinkedScenario.DeadlineAdmission:
+                await VerifyDeadlineAdmissionAsync();
+                break;
+            case NeverLinkedScenario.ProcessStartAndClock:
+                await VerifyProcessStartAndClockAsync();
+                break;
+            case NeverLinkedScenario.RetryAndConfigurationReload:
+                await VerifyRetriesAndConfigurationReloadAsync();
+                break;
+            case NeverLinkedScenario.AcceptedLinkStopsDeadline:
+                await VerifyAcceptedLinkStopsDeadlineAsync();
+                break;
+            case NeverLinkedScenario.InitializationExpiryRace:
+                await VerifyInitializationExpiryRaceAsync();
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scenario));
+        }
+    }
+
+    private static async Task VerifyDeadlineAdmissionAsync()
+    {
+        foreach ((bool explicitHttpDestination, bool workerStarted) in new[]
+        {
+            (false, false),
+            (true, false),
+            (false, true),
+            (true, true)
+        })
+        {
+            int forwardedRequests = 0;
+            await using var destination = await WorkerHttpForwardingTests.StartWorkerAsync(_ =>
+            {
+                Interlocked.Increment(ref forwardedRequests);
+                return Task.CompletedTask;
+            });
+            LifecycleClock clock = new();
+            string? httpEndpoint = explicitHttpDestination
+                ? WorkerHttpForwardingTests.GetAddress(destination).AbsoluteUri
+                : null;
+            await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(
+                clock,
+                httpEndpoint: httpEndpoint);
+            using CancellationTokenSource timeout = new(TestTimeout);
+            using HttpClient management = factory.CreateWorkerProxyClient();
+            using HttpClient http = factory.CreateHttpForwardingClient();
+            await using RelayClient? abandonedWorker = workerStarted
+                ? CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token)
+                : null;
+            if (abandonedWorker is not null)
+            {
+                await abandonedWorker.WriteAsync(CreateStartStream(), timeout.Token);
+                await WaitForWorkerReadyAsync(factory.Services.GetRequiredService<WorkerPodStateManager>(), timeout.Token);
+                await AssertReadinessAsync(management, "/admin/worker/ready", HttpStatusCode.OK, timeout.Token);
+            }
+
+            using HttpResponseMessage beforeDeadline = await http.GetAsync("/before-deadline", timeout.Token);
+            Assert.Equal(
+                explicitHttpDestination ? HttpStatusCode.OK : HttpStatusCode.ServiceUnavailable,
+                beforeDeadline.StatusCode);
+            SplitWorkerOriginState initial = await ReadSplitManagementStateAsync(management, timeout.Token);
+            await clock.WaitForTimerAsync(TimeSpan.FromMinutes(5), timeout.Token);
+            clock.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
+            Assert.Equal(initial, await ReadSplitManagementStateAsync(management, timeout.Token));
+
+            Task<HttpResponseMessage> poll = PollSplitManagementStateAsync(management, initial, timeout.Token);
+            await WaitForManagementPollAsync(factory.Services.GetRequiredService<WorkerPodStateManager>(), timeout.Token);
+            clock.Advance(TimeSpan.FromMilliseconds(998.5));
+            clock.FireTimerEarly();
+            await clock.WaitForTimerAsync(TimeSpan.FromMilliseconds(2), timeout.Token);
+            clock.Advance(TimeSpan.FromMilliseconds(2));
+            using HttpResponseMessage changed = await poll;
+            SplitWorkerOriginState removed = await ReadSplitManagementStateAsync(changed, timeout.Token);
+            Assert.Equal(SplitWorkerStatus.RemovalRequested, removed.Status);
+            Assert.Equal(SplitWorkerLinkState.Unlinked, removed.Link.State);
+            Assert.Equal(initial.StartupTime, removed.StartupTime);
+            Assert.Equal(initial.RevisionId + 1, removed.RevisionId);
+            await AssertReadinessAsync(management, "/admin/instance/ready", HttpStatusCode.OK, timeout.Token);
+            await AssertReadinessAsync(
+                management,
+                "/admin/worker/ready",
+                HttpStatusCode.ServiceUnavailable,
+                timeout.Token);
+            using HttpResponseMessage afterDeadline = await http.GetAsync("/after-deadline", timeout.Token);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, afterDeadline.StatusCode);
+            Assert.Equal(explicitHttpDestination ? 1 : 0, Volatile.Read(ref forwardedRequests));
+
+            using HttpResponseMessage assignment = await PutManagementJsonAsync(
+                management,
+                "/admin/worker/assignment",
+                ManagementAssignment,
+                timeout.Token);
+            await AssertManagementErrorAsync(
+                assignment,
+                HttpStatusCode.Conflict,
+                "RemovalRequested",
+                timeout.Token);
+            await using RelayClient lateWorker = CreateClient(
+                factory,
+                FunctionRpcRelaySide.Worker,
+                timeout.Token);
+            Assert.Equal(
+                StatusCode.Unavailable,
+                (await lateWorker.WriteAndReadRejectionAsync(CreateStartStream(), timeout.Token)).StatusCode);
+            await using RelayClient lateRuntime = CreateClient(
+                factory,
+                FunctionRpcRelaySide.Runtime,
+                timeout.Token);
+            GrpcRpcException lateLink = await lateRuntime.WriteAndReadRejectionAsync(
+                new StreamingMessage { WorkerInitRequest = new() { HostVersion = "late-runtime" } },
+                timeout.Token);
+            Assert.Equal(StatusCode.Unavailable, lateLink.StatusCode);
+            clock.Advance(TimeSpan.FromHours(1));
+            Assert.Equal(removed, await ReadSplitManagementStateAsync(management, timeout.Token));
+        }
+    }
+
+    private static async Task VerifyProcessStartAndClockAsync()
+    {
+        foreach ((int constructionSeconds, int durationSeconds, int utcAdjustmentMinutes) in new[]
+        {
+            (0, 300, 0),
+            (30, 300, 0),
+            (300, 300, 0),
+            (301, 300, 0),
+            (30, 120, 0),
+            (120, 120, 0),
+            (30, 300, 1440),
+            (30, 300, -1440)
+        })
+        {
+            LifecycleClock clock = new();
+            DateTimeOffset processStartup = clock.Provider.GetUtcNow();
+            await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(
+                clock,
+                duration: TimeSpan.FromSeconds(durationSeconds).ToString("c"));
+            clock.Advance(TimeSpan.FromSeconds(constructionSeconds));
+            clock.AdjustUtc(TimeSpan.FromMinutes(utcAdjustmentMinutes));
+            using CancellationTokenSource timeout = new(TestTimeout);
+            using HttpClient management = factory.CreateWorkerProxyClient();
+            SplitWorkerOriginState state = await ReadSplitManagementStateAsync(management, timeout.Token);
+            Assert.Equal(processStartup, state.StartupTime);
+
+            if (constructionSeconds < durationSeconds)
+            {
+                Assert.Equal(SplitWorkerStatus.Starting, state.Status);
+                clock.Advance(
+                    TimeSpan.FromSeconds(durationSeconds - constructionSeconds) -
+                    TimeSpan.FromMilliseconds(1));
+                Assert.Equal(state, await ReadSplitManagementStateAsync(management, timeout.Token));
+                clock.Advance(TimeSpan.FromMilliseconds(1));
+                state = await ReadSplitManagementStateAsync(management, timeout.Token);
+            }
+
+            Assert.Equal(SplitWorkerStatus.RemovalRequested, state.Status);
+            Assert.Equal(processStartup, state.StartupTime);
+            using HttpResponseMessage lateAssignment = await PutManagementJsonAsync(
+                management,
+                "/admin/worker/assignment",
+                ManagementAssignment,
+                timeout.Token);
+            await AssertManagementErrorAsync(
+                lateAssignment,
+                HttpStatusCode.Conflict,
+                "RemovalRequested",
+                timeout.Token);
+            await AssertReadinessAsync(management, "/admin/instance/ready", HttpStatusCode.OK, timeout.Token);
+            clock.Advance(TimeSpan.FromHours(1));
             Assert.Equal(state, await ReadSplitManagementStateAsync(management, timeout.Token));
-            clock.Advance(TimeSpan.FromMilliseconds(1));
-            state = await ReadSplitManagementStateAsync(management, timeout.Token);
         }
-
-        Assert.Equal(SplitWorkerStatus.RemovalRequested, state.Status);
-        Assert.Equal(processStartup, state.StartupTime);
-        using HttpResponseMessage lateAssignment = await PutManagementJsonAsync(
-            management, "/admin/worker/assignment", ManagementAssignment, timeout.Token);
-        await AssertManagementErrorAsync(lateAssignment, HttpStatusCode.Conflict, "RemovalRequested", timeout.Token);
-        await AssertReadinessAsync(management, "/admin/instance/ready", HttpStatusCode.OK, timeout.Token);
-        clock.Advance(TimeSpan.FromHours(1));
-        Assert.Equal(state, await ReadSplitManagementStateAsync(management, timeout.Token));
     }
 
-    [Fact]
-    public async Task NeverLinked_AssignmentInitRetriesAndConfigReload_DoNotResetSelectedDeadline()
+    private static async Task VerifyRetriesAndConfigurationReloadAsync()
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock, duration: "00:02:00");
@@ -155,10 +234,16 @@ public partial class FunctionRpcRelayTests
         }, timeout.Token);
         await runtime.ReadAsync(timeout.Token);
         using HttpResponseMessage assignment = await PutManagementJsonAsync(
-            management, "/admin/worker/assignment", ManagementAssignment, timeout.Token);
+            management,
+            "/admin/worker/assignment",
+            ManagementAssignment,
+            timeout.Token);
         Assert.Equal(HttpStatusCode.Created, assignment.StatusCode);
         using HttpResponseMessage replay = await PutManagementJsonAsync(
-            management, "/admin/worker/assignment", ManagementAssignment, timeout.Token);
+            management,
+            "/admin/worker/assignment",
+            ManagementAssignment,
+            timeout.Token);
         Assert.Equal(HttpStatusCode.NoContent, replay.StatusCode);
         await runtime.WriteAsync(initialization, timeout.Token);
         await worker.ReadAsync(timeout.Token);
@@ -167,13 +252,19 @@ public partial class FunctionRpcRelayTests
         ((IConfigurationRoot)configuration).Reload();
 
         clock.Advance(TimeSpan.FromSeconds(59));
-        Assert.Equal(SplitWorkerStatus.Starting, (await ReadSplitManagementStateAsync(management, timeout.Token)).Status);
+        Assert.Equal(
+            SplitWorkerStatus.Starting,
+            (await ReadSplitManagementStateAsync(management, timeout.Token)).Status);
         clock.Advance(TimeSpan.FromSeconds(1));
         SplitWorkerOriginState removed = await ReadSplitManagementStateAsync(management, timeout.Token);
         Assert.Equal(SplitWorkerStatus.RemovalRequested, removed.Status);
         Assert.Equal(SplitWorkerLinkState.Unlinked, removed.Link.State);
         Assert.Equal(initial.StartupTime, removed.StartupTime);
-        await AssertReadinessAsync(management, "/admin/worker/ready", HttpStatusCode.ServiceUnavailable, timeout.Token);
+        await AssertReadinessAsync(
+            management,
+            "/admin/worker/ready",
+            HttpStatusCode.ServiceUnavailable,
+            timeout.Token);
         await worker.WriteAsync(new StreamingMessage
         {
             WorkerInitResponse = new() { Result = new() { Status = StatusResult.Types.Status.Success } }
@@ -183,8 +274,7 @@ public partial class FunctionRpcRelayTests
         Assert.False(factory.Services.GetRequiredService<WorkerPodStateManager>().State.HasAcceptedLink);
     }
 
-    [Fact]
-    public async Task NeverLinked_InitializedMetadataAttachment_EndsEligibilityWithoutServingPromotion()
+    private static async Task VerifyAcceptedLinkStopsDeadlineAsync()
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
@@ -200,8 +290,13 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(SplitWorkerLinkState.Unlinked, linked.Link.State);
         Assert.Null(linked.Link.Runtime);
         Assert.Equal(SplitWorkerStatus.Starting, linked.Status);
-        using var state = await ReadManagementStateAsync(management, null, timeout.Token);
-        Assert.Equal("None", state.RootElement.GetProperty("workerPodState").GetProperty("podStatus").GetString());
+        using (var state = await ReadManagementStateAsync(management, null, timeout.Token))
+        {
+            Assert.Equal(
+                "None",
+                state.RootElement.GetProperty("workerPodState").GetProperty("podStatus").GetString());
+        }
+
         await worker.CompleteRequestAsync(timeout.Token);
         await runtime.WaitForTerminationAsync(timeout.Token);
         await worker.WaitForTerminationAsync(timeout.Token);
@@ -211,8 +306,7 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(SplitWorkerStatus.RemovalRequested, disconnected.Status);
     }
 
-    [Fact]
-    public async Task NeverLinked_InitializationRacingExpiry_HasExactlyOneWinner()
+    private static async Task VerifyInitializationExpiryRaceAsync()
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
@@ -222,10 +316,13 @@ public partial class FunctionRpcRelayTests
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         await worker.WriteAsync(CreateStartStream(), timeout.Token);
         await runtime.ReadAsync(timeout.Token);
-        await runtime.WriteAsync(new StreamingMessage { WorkerInitRequest = new() { HostVersion = "test-host" } }, timeout.Token);
+        await runtime.WriteAsync(
+            new StreamingMessage { WorkerInitRequest = new() { HostVersion = "test-host" } },
+            timeout.Token);
         await worker.ReadAsync(timeout.Token);
         SplitWorkerOriginState before = await ReadSplitManagementStateAsync(management, timeout.Token);
         bool initialized = false;
+
         async Task TryInitializeAsync()
         {
             try
@@ -244,17 +341,25 @@ public partial class FunctionRpcRelayTests
             }
         }
 
-        await Task.WhenAll(TryInitializeAsync(), Task.Run(() => clock.Advance(TimeSpan.FromMinutes(5)), timeout.Token));
+        await Task.WhenAll(
+            TryInitializeAsync(),
+            Task.Run(() => clock.Advance(TimeSpan.FromMinutes(5)), timeout.Token));
         SplitWorkerOriginState after = await ReadSplitManagementStateAsync(management, timeout.Token);
         Assert.Equal(before.RevisionId + (initialized ? 1 : 2), after.RevisionId);
         Assert.Equal(SplitWorkerLinkState.Unlinked, after.Link.State);
         Assert.Null(after.Link.Runtime);
-        Assert.Equal(initialized ? SplitWorkerStatus.Starting : SplitWorkerStatus.RemovalRequested, after.Status);
-        Assert.Equal(initialized, factory.Services.GetRequiredService<WorkerPodStateManager>().State.HasAcceptedLink);
+        Assert.Equal(
+            initialized ? SplitWorkerStatus.Starting : SplitWorkerStatus.RemovalRequested,
+            after.Status);
+        Assert.Equal(
+            initialized,
+            factory.Services.GetRequiredService<WorkerPodStateManager>().State.HasAcceptedLink);
     }
 
     private static WorkerProxyWebApplicationFactory CreateTimeoutFactory(
-        LifecycleClock clock, string? duration = null, string? httpEndpoint = null)
+        LifecycleClock clock,
+        string? duration = null,
+        string? httpEndpoint = null)
     {
         Dictionary<string, string?> configuration = [];
         if (duration is not null)
@@ -290,13 +395,18 @@ public partial class FunctionRpcRelayTests
             {
                 lock (_sync)
                 {
-                    return new DateTimeOffset(2026, 10, 28, 0, 0, 0, TimeSpan.Zero) + _elapsed + _utcAdjustment;
+                    return new DateTimeOffset(2026, 10, 28, 0, 0, 0, TimeSpan.Zero) +
+                        _elapsed +
+                        _utcAdjustment;
                 }
             });
             clock.Setup(value => value.GetTimestamp()).Returns(() => Elapsed.Ticks);
             clock.SetupGet(value => value.TimestampFrequency).Returns(TimeSpan.TicksPerSecond);
             clock.Setup(value => value.CreateTimer(
-                It.IsAny<TimerCallback>(), It.IsAny<object?>(), It.IsAny<TimeSpan>(), It.IsAny<TimeSpan>()))
+                    It.IsAny<TimerCallback>(),
+                    It.IsAny<object?>(),
+                    It.IsAny<TimeSpan>(),
+                    It.IsAny<TimeSpan>()))
                 .Returns((TimerCallback callback, object? state, TimeSpan due, TimeSpan _) =>
                 {
                     ScheduledTimer scheduled = new(callback, state);
@@ -306,7 +416,9 @@ public partial class FunctionRpcRelayTests
                         {
                             lock (_sync)
                             {
-                                scheduled.Due = delay == Timeout.InfiniteTimeSpan ? null : _elapsed + delay;
+                                scheduled.Due = delay == Timeout.InfiniteTimeSpan
+                                    ? null
+                                    : _elapsed + delay;
                                 return true;
                             }
                         });

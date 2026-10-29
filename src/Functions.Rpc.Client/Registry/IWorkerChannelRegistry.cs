@@ -52,16 +52,12 @@ public interface IWorkerChannelRegistry : IAsyncDisposable
     /// <summary>
     /// Removes a linked worker, completes its request stream, and disposes it after peer termination.
     /// </summary>
-    /// <remarks>
-    /// The channel is withdrawn locally before waiting up to ten seconds for peer termination.
-    /// A timeout or caller cancellation still disposes the channel; the accepted worker ID remains terminal.
-    /// Peer transport failures are logged and do not undo local removal.
-    /// This does not acknowledge remote pod deletion or drain in-flight invocations.
-    /// </remarks>
+    /// <remarks>Local withdrawal is immediate; every post-withdrawal outcome disposes the terminal channel.</remarks>
     /// <param name="workerId">The worker identifier.</param>
     /// <param name="cancellationToken">A token that cancels admission or waiting for peer termination.</param>
     /// <returns><see langword="true"/> when a channel was removed; otherwise, <see langword="false"/>.</returns>
     /// <exception cref="TimeoutException">The peer did not terminate within ten seconds. Local cleanup has completed.</exception>
+    /// <exception cref="OperationCanceledException">The caller canceled the operation.</exception>
     Task<bool> UnlinkAsync(string workerId, CancellationToken cancellationToken = default);
 
     /// <summary>

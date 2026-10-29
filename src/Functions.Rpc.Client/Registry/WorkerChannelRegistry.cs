@@ -233,6 +233,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             }
         }
 
+        bool channelDetached = false;
         try
         {
             using CancellationTokenSource operationSource =
@@ -261,6 +262,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                         return false;
                     }
 
+                    channelDetached = true;
                     Exception failure = null;
                     try
                     {
@@ -293,7 +295,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && _shutdownSource.IsCancellationRequested)
         {
-            return false;
+            return channelDetached;
         }
     }
 

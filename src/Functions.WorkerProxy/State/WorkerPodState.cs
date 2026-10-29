@@ -21,6 +21,7 @@ internal sealed record WorkerPodState(
     bool? IsAlwaysReady,
     DateTimeOffset StartupTime)
 {
+    // Local initialization history; authoritative Runtime Link identity remains unpublished.
     public bool HasAcceptedLink { get; init; }
 
     public bool RemovalRequested { get; init; }
