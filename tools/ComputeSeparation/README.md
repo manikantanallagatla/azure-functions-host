@@ -29,14 +29,24 @@ not completion of the full published Link lifecycle contract.
 WorkerProxy requests removal if initialization does not complete
 within `WorkerProxy:NeverLinkedTimeout` (default five minutes). The duration is frozen for the
 process. Assignment, initialization progress/failure, retries and configuration reload do not reset it.
-This intentionally uses the existing state-manager startup origin; earlier process-entry capture
-is deferred. Elapsed-time decisions use the monotonic clock.
+Process entry captures the UTC startup time and monotonic timestamp before constructing the
+Host or loading configuration. Construction consumes the original window; it does not start a
+new one when the state manager is resolved. If startup exhausts the window, the Proxy reports
+removal as soon as its management application becomes available. UTC clock changes do not
+alter the monotonic deadline.
 
 Successful initialization and expiry compete under one lifecycle lock. Expiry is sticky, withdraws readiness
 and HTTP forwarding (including an explicit `WorkerHttpEndpoint` override), and rejects late
 assignment and Link/stream admission. Management readiness
 and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.
 There is no forced process exit or new drain behavior here.
+
+The same fixed window covers lost worker-creation responses, failed parallel Runtime allocation,
+failed or rejected Link attempts, and workers abandoned before assignment. None of those paths
+needs a new timer or a Runtime response before expiry can request removal.
+JWT/TLS integration remains a separate dependency on Host PR #12103; local initialization
+coverage is not authenticated end-to-end W1 sign-off. A Proxy that never starts or cannot report
+still requires Legion startup/failure recovery, which this change does not implement.
 
 ### Terminal connection cleanup
 

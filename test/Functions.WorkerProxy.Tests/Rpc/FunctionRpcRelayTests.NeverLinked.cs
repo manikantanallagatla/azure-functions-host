@@ -23,9 +23,12 @@ namespace Azure.Functions.WorkerProxy.Tests;
 public partial class FunctionRpcRelayTests
 {
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task NeverLinked_DefaultDeadline_PublishesStickyRemovalAndClosesIntake(bool explicitHttpDestination)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task NeverLinked_DefaultDeadline_PublishesStickyRemovalAndClosesIntake(
+        bool explicitHttpDestination, bool workerStarted)
     {
         int forwardedRequests = 0;
         await using var destination = await WorkerHttpForwardingTests.StartWorkerAsync(_ =>
@@ -39,6 +42,16 @@ public partial class FunctionRpcRelayTests
         using CancellationTokenSource timeout = new(TestTimeout);
         using HttpClient management = factory.CreateWorkerProxyClient();
         using HttpClient http = factory.CreateHttpForwardingClient();
+        await using RelayClient? abandonedWorker = workerStarted
+            ? CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token)
+            : null;
+        if (abandonedWorker is not null)
+        {
+            await abandonedWorker.WriteAsync(CreateStartStream(), timeout.Token);
+            await WaitForWorkerReadyAsync(factory.Services.GetRequiredService<WorkerPodStateManager>(), timeout.Token);
+            await AssertReadinessAsync(management, "/admin/worker/ready", HttpStatusCode.OK, timeout.Token);
+        }
+
         using HttpResponseMessage beforeDeadline = await http.GetAsync("/before-deadline", timeout.Token);
         Assert.Equal(explicitHttpDestination ? HttpStatusCode.OK : HttpStatusCode.ServiceUnavailable, beforeDeadline.StatusCode);
         SplitWorkerOriginState initial = await ReadSplitManagementStateAsync(management, timeout.Token);
@@ -76,6 +89,48 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(StatusCode.Unavailable, lateLink.StatusCode);
         clock.Advance(TimeSpan.FromHours(1));
         Assert.Equal(removed, await ReadSplitManagementStateAsync(management, timeout.Token));
+    }
+
+    [Theory]
+    [InlineData(0, 300, 0)]
+    [InlineData(30, 300, 0)]
+    [InlineData(300, 300, 0)]
+    [InlineData(301, 300, 0)]
+    [InlineData(30, 120, 0)]
+    [InlineData(120, 120, 0)]
+    [InlineData(30, 300, 1440)]
+    [InlineData(30, 300, -1440)]
+    public async Task NeverLinked_HostConstruction_ConsumesOriginalMonotonicDeadline(
+        int constructionSeconds, int durationSeconds, int utcAdjustmentMinutes)
+    {
+        LifecycleClock clock = new();
+        DateTimeOffset processStartup = clock.Provider.GetUtcNow();
+        await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(
+            clock, duration: TimeSpan.FromSeconds(durationSeconds).ToString("c"));
+        clock.Advance(TimeSpan.FromSeconds(constructionSeconds));
+        clock.AdjustUtc(TimeSpan.FromMinutes(utcAdjustmentMinutes));
+        using CancellationTokenSource timeout = new(TestTimeout);
+        using HttpClient management = factory.CreateWorkerProxyClient();
+        SplitWorkerOriginState state = await ReadSplitManagementStateAsync(management, timeout.Token);
+        Assert.Equal(processStartup, state.StartupTime);
+
+        if (constructionSeconds < durationSeconds)
+        {
+            Assert.Equal(SplitWorkerStatus.Starting, state.Status);
+            clock.Advance(TimeSpan.FromSeconds(durationSeconds - constructionSeconds) - TimeSpan.FromMilliseconds(1));
+            Assert.Equal(state, await ReadSplitManagementStateAsync(management, timeout.Token));
+            clock.Advance(TimeSpan.FromMilliseconds(1));
+            state = await ReadSplitManagementStateAsync(management, timeout.Token);
+        }
+
+        Assert.Equal(SplitWorkerStatus.RemovalRequested, state.Status);
+        Assert.Equal(processStartup, state.StartupTime);
+        using HttpResponseMessage lateAssignment = await PutManagementJsonAsync(
+            management, "/admin/worker/assignment", ManagementAssignment, timeout.Token);
+        await AssertManagementErrorAsync(lateAssignment, HttpStatusCode.Conflict, "RemovalRequested", timeout.Token);
+        await AssertReadinessAsync(management, "/admin/instance/ready", HttpStatusCode.OK, timeout.Token);
+        clock.Advance(TimeSpan.FromHours(1));
+        Assert.Equal(state, await ReadSplitManagementStateAsync(management, timeout.Token));
     }
 
     [Fact]
@@ -212,7 +267,12 @@ public partial class FunctionRpcRelayTests
             configuration["WorkerProxy:WorkerHttpEndpoint"] = httpEndpoint;
         }
 
-        return new(configuration, services => services.Replace(ServiceDescriptor.Singleton(clock.Provider)));
+        WorkerProxyStartupTime startupTime = WorkerProxyStartupTime.Capture(clock.Provider);
+        return new(configuration, services =>
+        {
+            services.Replace(ServiceDescriptor.Singleton(clock.Provider));
+            services.Replace(ServiceDescriptor.Singleton(startupTime));
+        });
     }
 
     private sealed class LifecycleClock
@@ -221,12 +281,18 @@ public partial class FunctionRpcRelayTests
         private readonly List<ScheduledTimer> _timers = [];
         private readonly List<TimeSpan> _requestedDelays = [];
         private TimeSpan _elapsed;
+        private TimeSpan _utcAdjustment;
 
         public LifecycleClock()
         {
             Mock<TimeProvider> clock = new();
             clock.Setup(value => value.GetUtcNow()).Returns(() =>
-                new DateTimeOffset(2026, 10, 28, 0, 0, 0, TimeSpan.Zero) + Elapsed);
+            {
+                lock (_sync)
+                {
+                    return new DateTimeOffset(2026, 10, 28, 0, 0, 0, TimeSpan.Zero) + _elapsed + _utcAdjustment;
+                }
+            });
             clock.Setup(value => value.GetTimestamp()).Returns(() => Elapsed.Ticks);
             clock.SetupGet(value => value.TimestampFrequency).Returns(TimeSpan.TicksPerSecond);
             clock.Setup(value => value.CreateTimer(
@@ -295,6 +361,14 @@ public partial class FunctionRpcRelayTests
             foreach (ScheduledTimer timer in due)
             {
                 timer.Callback(timer.State);
+            }
+        }
+
+        public void AdjustUtc(TimeSpan amount)
+        {
+            lock (_sync)
+            {
+                _utcAdjustment += amount;
             }
         }
 

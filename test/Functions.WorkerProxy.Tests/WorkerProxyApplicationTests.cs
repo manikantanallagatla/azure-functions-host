@@ -43,6 +43,7 @@ public class WorkerProxyApplicationTests
         Assert.Same(manager, scope.ServiceProvider.GetRequiredService<WorkerPodStateManager>());
         Assert.Equal("configured-worker-pod", manager.State.PodName);
         Assert.Equal(0, manager.State.Revision);
+        Assert.Equal(factory.Services.GetRequiredService<WorkerProxyStartupTime>().UtcTime, manager.State.StartupTime);
     }
 
     [Fact]

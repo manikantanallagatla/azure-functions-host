@@ -619,8 +619,12 @@ public class ManagementApiHandlersTests
         Assert.Empty(clock.Timers);
     }
 
-    private static WorkerPodStateManager CreateManager(TimeProvider? timeProvider = null) =>
-        new(Options.Create(new WorkerProxyOptions { PodName = "pod" }), timeProvider ?? TimeProvider.System);
+    private static WorkerPodStateManager CreateManager(TimeProvider? timeProvider = null)
+    {
+        timeProvider ??= TimeProvider.System;
+
+        return new(Options.Create(new WorkerProxyOptions { PodName = "pod" }), timeProvider, WorkerProxyStartupTime.Capture(timeProvider));
+    }
 
     private static WorkerPodStateManager CreateReadyManager(TimeProvider? timeProvider = null)
     {
