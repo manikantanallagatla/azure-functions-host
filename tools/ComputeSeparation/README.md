@@ -40,7 +40,8 @@ This intentionally uses the existing state-manager startup origin; earlier proce
 is deferred. Elapsed-time decisions use the monotonic clock.
 
 Accepted Link and expiry compete under one lifecycle lock. Expiry is sticky, withdraws readiness
-and HTTP forwarding, and rejects late assignment and Link/stream admission. Management readiness
+and HTTP forwarding (including an explicit `WorkerHttpEndpoint` override), and rejects late
+assignment and Link/stream admission. Management readiness
 and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.
 There is no forced process exit, new drain behavior, or established-link failure policy here.
 
