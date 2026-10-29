@@ -681,7 +681,7 @@ public class ManagementApiHandlersTests
     {
         public PollClock()
         {
-            Mock<TimeProvider> provider = new();
+            Mock<TimeProvider> provider = new() { CallBase = true };
             provider.Setup(clock => clock.CreateTimer(
                 It.IsAny<TimerCallback>(), It.IsAny<object?>(), It.IsAny<TimeSpan>(), It.IsAny<TimeSpan>()))
                 .Returns((TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>

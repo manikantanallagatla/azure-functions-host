@@ -45,16 +45,10 @@ internal sealed class WorkerPodStateManager
         ArgumentException.ThrowIfNullOrWhiteSpace(podName);
 
         _timeProvider = timeProvider;
-        LinkLifecycleEnabled = options.Value.EnableLinkLifecycle;
-        _startupTimestamp = LinkLifecycleEnabled ? _timeProvider.GetTimestamp() : 0;
+        _startupTimestamp = _timeProvider.GetTimestamp();
         _state = WorkerPodState.CreateUnassigned(podName, _timeProvider.GetUtcNow());
-        if (options.Value.EnableLinkLifecycle)
-        {
-            _neverLinkedTimeout = options.Value.NeverLinkedTimeout;
-        }
+        _neverLinkedTimeout = options.Value.NeverLinkedTimeout;
     }
-
-    internal bool LinkLifecycleEnabled { get; }
 
     /// <summary>
     /// Gets the current immutable state without incrementing its revision.
@@ -331,11 +325,6 @@ internal sealed class WorkerPodStateManager
     /// </summary>
     public async Task WatchNeverLinkedAsync(CancellationToken cancellationToken)
     {
-        if (_neverLinkedTimeout <= TimeSpan.Zero)
-        {
-            return;
-        }
-
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -368,7 +357,7 @@ internal sealed class WorkerPodStateManager
     private void ExpireNeverLinkedLocked()
     {
         // Check the deadline at admission too: a delayed timer callback must not admit a late Link.
-        if (_neverLinkedTimeout > TimeSpan.Zero && !_state.HasAcceptedLink && !_state.RemovalRequested &&
+        if (!_state.HasAcceptedLink && !_state.RemovalRequested &&
             _timeProvider.GetElapsedTime(_startupTimestamp) >= _neverLinkedTimeout)
         {
             UpdateStateAndNotifyWaitersLocked(_state with

@@ -303,12 +303,7 @@ internal sealed partial class FunctionRpcRelay
                 Uri? destination = capabilityFinalizer.FinalizeCapabilities(finalized.WorkerInitResponse.Capabilities);
                 ApplyFunctionGroupCapability(finalized.WorkerInitResponse.Capabilities);
                 // This is a platform protocol capability, never a customer-worker claim.
-                finalized.WorkerInitResponse.Capabilities.Remove(LinkAcceptanceCapability);
-                if (stateManager.LinkLifecycleEnabled)
-                {
-                    finalized.WorkerInitResponse.Capabilities[LinkAcceptanceCapability] = bool.TrueString;
-                }
-
+                finalized.WorkerInitResponse.Capabilities[LinkAcceptanceCapability] = bool.TrueString;
                 capabilities = finalized.WorkerInitResponse.Capabilities.ToFrozenDictionary(StringComparer.Ordinal);
                 lock (_stateLock)
                 {
