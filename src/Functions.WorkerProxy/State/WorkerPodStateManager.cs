@@ -190,9 +190,9 @@ internal sealed class WorkerPodStateManager
     }
 
     /// <summary>
-    /// Records completed Link acceptance locally without changing published identity or serving readiness.
+    /// Records successful initialization locally without changing published identity or serving readiness.
     /// </summary>
-    public bool AcceptLink(long sessionId)
+    public bool OnWorkerInitialized(long sessionId)
     {
         lock (_stateLock)
         {

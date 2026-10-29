@@ -275,7 +275,7 @@ public sealed partial class WorkerChannelRegistryTests
         RpcClientWorkerChannelFactory channelFactory = CreateRealChannelFactory();
 
         return linkTimeout.HasValue
-            ? new(duplexFactory, channelFactory, NullLogger<WorkerChannelRegistry>.Instance, clientFactory, linkTimeout.Value)
-            : new(duplexFactory, channelFactory, NullLogger<WorkerChannelRegistry>.Instance, clientFactory);
+            ? new(duplexFactory, channelFactory, NullLogger<WorkerChannelRegistry>.Instance, linkTimeout.Value)
+            : new(duplexFactory, channelFactory, NullLogger<WorkerChannelRegistry>.Instance);
     }
 }

@@ -146,10 +146,10 @@ public partial class FunctionRpcRelayTests
             expected.WorkerInitResponse.Capabilities["FunctionGroupName"] = "test-group";
             await worker.WriteAsync(initialized, timeout.Token);
             Assert.Equal(expected, await runtime.ReadAsync(timeout.Token));
-            Assert.Equal(3, manager.State.Revision);
+            Assert.Equal(4, manager.State.Revision);
 
             Task<HttpResponseMessage> terminationPoll = management.GetAsync(
-                "/admin/worker/state?lastKnownRevision=3", timeout.Token);
+                "/admin/worker/state?lastKnownRevision=4", timeout.Token);
             await WaitForManagementPollAsync(manager, timeout.Token);
             await worker.CompleteRequestAsync(timeout.Token);
             Assert.Equal(StatusCode.Unavailable, await runtime.WaitForTerminationAsync(timeout.Token));
@@ -159,7 +159,7 @@ public partial class FunctionRpcRelayTests
                 Assert.Equal(HttpStatusCode.OK, changed.StatusCode);
                 Assert.True(changed.Headers.CacheControl?.NoStore);
                 using JsonDocument state = JsonDocument.Parse(await changed.Content.ReadAsStringAsync(timeout.Token));
-                Assert.Equal(4, state.RootElement.GetProperty("revisionId").GetInt64());
+                Assert.Equal(5, state.RootElement.GetProperty("revisionId").GetInt64());
                 JsonElement pod = state.RootElement.GetProperty("workerPodState");
                 Assert.Equal("None", pod.GetProperty("podStatus").GetString());
                 Assert.Equal(startupMode, pod.GetProperty("startupMode").GetString());
@@ -176,7 +176,7 @@ public partial class FunctionRpcRelayTests
                 management, "/admin/worker/assignment", conflictingBody, timeout.Token);
             await AssertManagementErrorAsync(terminalConflict, HttpStatusCode.Conflict, "AssignmentConflict", timeout.Token);
             using JsonDocument current = await ReadManagementStateAsync(management, 2, timeout.Token);
-            Assert.Equal(4, current.RootElement.GetProperty("revisionId").GetInt64());
+            Assert.Equal(5, current.RootElement.GetProperty("revisionId").GetInt64());
         }
         finally
         {

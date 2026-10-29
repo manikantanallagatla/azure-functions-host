@@ -88,7 +88,6 @@ internal static class WorkerProxyApplication
         app.UseEndpoints(static endpoints =>
         {
             endpoints.MapGrpcService<FunctionRpcRelayService>();
-            endpoints.MapGrpcService<WorkerLinkService>();
         });
     }
 

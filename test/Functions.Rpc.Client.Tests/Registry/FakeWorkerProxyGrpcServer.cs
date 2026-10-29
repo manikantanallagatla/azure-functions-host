@@ -16,7 +16,6 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
-using Microsoft.Azure.WebJobs.Script.Grpc.WorkerLink;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -50,12 +49,10 @@ internal sealed class FakeWorkerProxyGrpcServer : IAsyncDisposable
             options.Listen(IPAddress.Loopback, 0, listen => listen.Protocols = HttpProtocols.Http2));
         TestFunctionRpcService service = new();
         builder.Services.AddSingleton(service);
-        builder.Services.AddSingleton(new TestWorkerLinkService());
         builder.Services.AddGrpc();
 
         WebApplication application = builder.Build();
         application.MapGrpcService<TestFunctionRpcService>();
-        application.MapGrpcService<TestWorkerLinkService>();
         try
         {
             await application.StartAsync(cancellationToken);
@@ -143,12 +140,6 @@ internal sealed class FakeWorkerProxyGrpcServer : IAsyncDisposable
         }
 
         internal void MarkDisconnected() => _disconnected.TrySetResult();
-    }
-
-    private sealed class TestWorkerLinkService : WorkerLink.WorkerLinkBase
-    {
-        public override Task<AcceptLinkResponse> Accept(AcceptLinkRequest request, ServerCallContext context)
-            => Task.FromResult(new AcceptLinkResponse());
     }
 
     private sealed class TestFunctionRpcService : FunctionRpc.FunctionRpcBase
