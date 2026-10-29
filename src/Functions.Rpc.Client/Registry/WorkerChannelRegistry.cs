@@ -25,8 +25,10 @@ namespace Azure.Functions.Rpc.Client;
 /// context, and retains terminal identities. Initialized channels remain available for metadata bootstrap before a
 /// ScriptHost function set is known; only ready channels are available for invocation dispatch.
 /// </remarks>
-internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
+internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager
 {
+    private const int DefaultHttpWorkerConcurrency = 16;
+
     private static readonly TimeSpan DefaultLinkTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan UnlinkTimeout = TimeSpan.FromSeconds(10);
 
@@ -40,10 +42,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Dictionary<string, WorkerSlot> _slots = new(StringComparer.Ordinal);
     private readonly Lock _stateLock = new();
+    private readonly TimeProvider _timeProvider;
     private ChannelSetupContext _activeSetupContext;
     private Task _disposeTask;
     private bool _disposed;
     private TaskCompletionSource _initializedChannelAvailable = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _scaleInHttpCapacity;
+    private int _scaleInLinkedWorkerCount;
+    private DateTimeOffset _scaleInStateCreatedTime;
+    private TaskCompletionSource<long> _scaleInStateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _scaleInStateVersion;
 
     // Setup writers hold _stateLock; ready-channel readers observe this published signal without taking that lock.
     private TaskCompletionSource<IReadOnlyList<WorkerChannel>> _readyChannelsAvailable = CreateReadyChannelsSignal();
@@ -52,7 +60,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
         IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger)
-        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout)
+        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout, TimeProvider.System)
+    {
+    }
+
+    public WorkerChannelRegistry(
+        IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
+        IRpcClientWorkerChannelFactory channelFactory,
+        ILogger<WorkerChannelRegistry> logger,
+        TimeProvider timeProvider)
+        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout, timeProvider)
     {
     }
 
@@ -60,14 +77,41 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
         IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger,
-        TimeSpan linkTimeout)
+        TimeSpan linkTimeout,
+        TimeProvider timeProvider = null)
     {
         _duplexChannelFactory = duplexChannelFactory ?? throw new ArgumentNullException(nameof(duplexChannelFactory));
         _channelFactory = channelFactory ?? throw new ArgumentNullException(nameof(channelFactory));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _timeProvider = timeProvider ?? TimeProvider.System;
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(linkTimeout, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(linkTimeout.TotalMilliseconds, uint.MaxValue - 1);
         _linkTimeout = linkTimeout;
+        _scaleInStateCreatedTime = _timeProvider.GetUtcNow();
+    }
+
+    HttpWorkerScaleInState IHttpWorkerScaleInManager.Current
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                RefreshScaleInStateLocked();
+                return GetScaleInStateLocked();
+            }
+        }
+    }
+
+    long IHttpWorkerScaleInManager.Version
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                RefreshScaleInStateLocked();
+                return _scaleInStateVersion;
+            }
+        }
     }
 
     public Task<WorkerLinkResult> LinkAsync(
@@ -115,6 +159,108 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
 
     private static async Task<WorkerLinkResult> CompleteLinkAsync(Task<WorkerChannel> link, bool isNewLink)
         => new(await link.ConfigureAwait(false), isNewLink);
+
+    public Task<long> WaitForChangeAsync(long version, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            RefreshScaleInStateLocked();
+            if (_scaleInStateVersion != version)
+            {
+                return Task.FromResult(_scaleInStateVersion);
+            }
+
+            return _scaleInStateChanged.Task.WaitAsync(cancellationToken);
+        }
+    }
+
+    public HttpWorkerScaleInReservation TryReserveIdleWorker(TimeSpan minimumIdleDuration)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(minimumIdleDuration, TimeSpan.Zero);
+
+        lock (_stateLock)
+        {
+            if (_disposed)
+            {
+                return null;
+            }
+
+            foreach ((string workerId, WorkerSlot slot) in _slots)
+            {
+                if (slot.Channel is not { } channel ||
+                    slot.DrainTask is not null ||
+                    !channel.TryReserveIdleScaleIn(minimumIdleDuration, out Guid reservationId))
+                {
+                    continue;
+                }
+
+                SignalReadyChannelsLocked();
+                SignalScaleInStateChangedLocked();
+                return new(workerId, reservationId, GetScaleInStateLocked());
+            }
+
+            return null;
+        }
+    }
+
+    public bool TryCommitReservation(
+        HttpWorkerScaleInReservation reservation,
+        out Task<bool> drainCompletion)
+    {
+        ArgumentNullException.ThrowIfNull(reservation);
+
+        Task invocationDrainTask;
+        TaskCompletionSource<bool> completion;
+        WorkerSlot slot;
+        lock (_stateLock)
+        {
+            RefreshScaleInStateLocked();
+            if (_disposed ||
+                _scaleInStateVersion != reservation.ProjectedState.Version ||
+                _scaleInHttpCapacity != reservation.ProjectedState.HttpCapacity ||
+                _scaleInLinkedWorkerCount != reservation.ProjectedState.LinkedWorkerCount ||
+                !_slots.TryGetValue(reservation.WorkerId, out slot) ||
+                slot.Channel is not { } channel ||
+                slot.DrainTask is not null ||
+                channel.CommitScaleInReservation(reservation.ReservationId) is not { } committedInvocations)
+            {
+                drainCompletion = null;
+                return false;
+            }
+
+            invocationDrainTask = committedInvocations;
+            completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            drainCompletion = completion.Task;
+            slot.DrainTask = drainCompletion;
+            SignalReadyChannelsLocked();
+        }
+
+        _ = CompleteDrainAsync(reservation.WorkerId, slot, invocationDrainTask, completion);
+        return true;
+    }
+
+    public bool CancelReservation(HttpWorkerScaleInReservation reservation)
+    {
+        ArgumentNullException.ThrowIfNull(reservation);
+
+        lock (_stateLock)
+        {
+            if (_disposed ||
+                !_slots.TryGetValue(reservation.WorkerId, out WorkerSlot slot) ||
+                slot.Channel is not { } channel ||
+                !channel.CancelScaleInReservation(reservation.ReservationId))
+            {
+                return false;
+            }
+
+            SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
+            return true;
+        }
+    }
 
     private async Task LinkAndCompleteAsync(string workerId, Uri grpcEndpoint, WorkerSlot slot, TaskCompletionSource<WorkerChannel> linkCompletion,
         CancellationToken cancellationToken)
@@ -264,6 +410,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                     Exception failure = null;
                     try
                     {
+                        channel.FailCommittedInvocations(exception: null);
                         channel.CompleteRequests();
                         // Wait for peer termination without treating its final gRPC status as an unlink failure.
                         await Task.WhenAny(channel.Completion).WaitAsync(UnlinkTimeout, operationSource.Token);
@@ -295,6 +442,46 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         {
             return false;
         }
+    }
+
+    internal Task<bool> DrainAsync(string workerId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(workerId);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Task<bool> drainTask;
+        Task invocationDrainTask;
+        TaskCompletionSource<bool> drainCompletion;
+        WorkerSlot slot;
+        lock (_stateLock)
+        {
+            if (_disposed || !_linkAttempts.TryGetValue(workerId, out slot))
+            {
+                return Task.FromResult(false);
+            }
+
+            if (slot.DrainTask is not null)
+            {
+                return slot.DrainTask.WaitAsync(cancellationToken);
+            }
+
+            RpcClientWorkerChannel channel = slot.Channel;
+            if (channel is null)
+            {
+                return Task.FromResult(false);
+            }
+
+            drainCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            drainTask = drainCompletion.Task;
+            slot.DrainTask = drainTask;
+            invocationDrainTask = channel.BeginDrain();
+            SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
+        }
+
+        _ = CompleteDrainAsync(workerId, slot, invocationDrainTask, drainCompletion);
+
+        return drainTask.WaitAsync(cancellationToken);
     }
 
     public bool TryGetInitializedChannel(string workerId, out WorkerChannel channel)
@@ -356,6 +543,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                     continue;
                 }
 
+                slot.Channel.SetScaleInReady(false);
                 attemptedChannels++;
                 ConfigureSlotLocked(slot);
                 if (slot.SetupException is null)
@@ -461,6 +649,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             slots = [.. _slots];
             monitorTasks = [.. _monitorTasks];
             _initializedChannelAvailable.TrySetResult();
+            _scaleInStateChanged.TrySetException(new ObjectDisposedException(GetType().FullName));
 
             // Publish disposal for new readers and release callers awaiting the previous shared signal.
             ObjectDisposedException exception = new(GetType().FullName);
@@ -518,6 +707,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         {
             // Remove the detached channel from the published snapshot before channel disposal begins.
             SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
             if (!_slots.Values.Any(slot => slot.Channel is not null))
             {
                 _initializedChannelAvailable = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -593,6 +783,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
 
                 try
                 {
+                    removedChannel.FailCommittedInvocations(terminalException);
                     removedChannel.Shutdown(terminalException);
                 }
                 catch (Exception exception)
@@ -628,6 +819,36 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         }
     }
 
+    private async Task CompleteDrainAsync(
+        string workerId,
+        WorkerSlot slot,
+        Task invocationDrainTask,
+        TaskCompletionSource<bool> drainCompletion)
+    {
+        try
+        {
+            await invocationDrainTask.WaitAsync(_shutdownSource.Token);
+            bool unlinked = await UnlinkAsync(workerId, _shutdownSource.Token);
+            if (!unlinked)
+            {
+                lock (_stateLock)
+                {
+                    unlinked = slot.Terminal;
+                }
+            }
+
+            drainCompletion.TrySetResult(unlinked);
+        }
+        catch (OperationCanceledException) when (_shutdownSource.IsCancellationRequested)
+        {
+            drainCompletion.TrySetResult(false);
+        }
+        catch (Exception exception)
+        {
+            drainCompletion.TrySetException(exception);
+        }
+    }
+
     private void RegisterInitializedChannel(string workerId, WorkerSlot slot, RpcClientWorkerChannel channel, CancellationToken cancellationToken)
     {
         Task monitorTask;
@@ -646,6 +867,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             }
 
             slot.Channel = channel;
+            SignalScaleInStateChangedLocked();
             monitorTask = MonitorChannelCompletionAsync(workerId, slot, channel);
             _monitorTasks.Add(monitorTask);
 
@@ -693,12 +915,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         {
             channel.SetupFunctionInvocationBuffers(setupContext.Functions);
             channel.SendFunctionLoadRequests(setupContext.ManagedDependencyOptions, setupContext.FunctionTimeout);
+            channel.SetScaleInReady(true);
             SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
         }
         catch (Exception exception)
         {
+            channel.SetScaleInReady(false);
             slot.SetupException = exception;
             Log.ChannelSetupFailed(_logger, exception, channel.Id);
+            SignalScaleInStateChangedLocked();
         }
     }
 
@@ -759,6 +985,73 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
     private static TaskCompletionSource<IReadOnlyList<WorkerChannel>> CreateReadyChannelsSignal()
         => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private HttpWorkerScaleInState GetScaleInStateLocked()
+    {
+        return new(
+            _scaleInStateCreatedTime,
+            _scaleInHttpCapacity,
+            _scaleInLinkedWorkerCount,
+            _scaleInStateVersion);
+    }
+
+    private (long HttpCapacity, int LinkedWorkerCount) ComputeScaleInStateLocked()
+    {
+        long httpCapacity = 0;
+        int linkedWorkerCount = 0;
+        foreach (WorkerSlot slot in _slots.Values)
+        {
+            if (slot.Channel is not { } channel)
+            {
+                continue;
+            }
+
+            if (channel.IsTerminated)
+            {
+                continue;
+            }
+
+            linkedWorkerCount++;
+            if (channel.ContributesHttpCapacity)
+            {
+                httpCapacity += DefaultHttpWorkerConcurrency;
+            }
+        }
+
+        return (httpCapacity, linkedWorkerCount);
+    }
+
+    private void RefreshScaleInStateLocked()
+    {
+        (long httpCapacity, int linkedWorkerCount) = ComputeScaleInStateLocked();
+        if (_scaleInHttpCapacity == httpCapacity &&
+            _scaleInLinkedWorkerCount == linkedWorkerCount)
+        {
+            return;
+        }
+
+        _scaleInHttpCapacity = httpCapacity;
+        _scaleInLinkedWorkerCount = linkedWorkerCount;
+        AdvanceScaleInStateVersionLocked();
+    }
+
+    private void SignalScaleInStateChangedLocked()
+    {
+        (_scaleInHttpCapacity, _scaleInLinkedWorkerCount) = ComputeScaleInStateLocked();
+        AdvanceScaleInStateVersionLocked();
+    }
+
+    private void AdvanceScaleInStateVersionLocked()
+    {
+        DateTimeOffset createdTime = _timeProvider.GetUtcNow();
+        _scaleInStateCreatedTime = createdTime > _scaleInStateCreatedTime
+            ? createdTime
+            : _scaleInStateCreatedTime.AddTicks(1);
+        long version = ++_scaleInStateVersion;
+        TaskCompletionSource<long> changed = _scaleInStateChanged;
+        _scaleInStateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        changed.TrySetResult(version);
+    }
+
     private async Task<Exception> ShutdownSlotAsync(string workerId, WorkerSlot slot)
     {
         Exception disposalException = null;
@@ -772,6 +1065,11 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                 lock (_stateLock)
                 {
                     channel = DetachChannelLocked(slot, expectedChannel: null);
+                }
+
+                if (channel is not null)
+                {
+                    channel.FailCommittedInvocations(new ObjectDisposedException(channel.GetType().FullName));
                 }
 
                 disposalException = await channel.DisposeAndCaptureExceptionAsync(disposalException);
@@ -798,6 +1096,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
 
         // The initial link owns this gate before its slot is published.
         public SemaphoreSlim Gate { get; } = new(0, 1);
+
+        // The irreversible drain shared by repeated selection calls.
+        public Task<bool> DrainTask { get; set; }
 
         // The recorded gRPC endpoint distinguishes exact retries from conflicting requests.
         public Uri Endpoint { get; init; }
