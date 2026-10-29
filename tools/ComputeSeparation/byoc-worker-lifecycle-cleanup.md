@@ -153,6 +153,10 @@ selects sticky removal in one state revision. An unassigned session without acce
 original recovery behavior and original deadline. Proxy shutdown does not independently select
 removal; the first terminal classification still wins.
 
+**W2 scope boundary:** This PR handles terminal relay/session outcomes through the existing
+`PeerClosed`, `Canceled`, and `Faulted` classifications. The broader policy for distinguishing a
+transient connection disruption from terminal connection loss remains outside this PR.
+
 ```mermaid
 sequenceDiagram
     participant Peer as Runtime or worker peer
@@ -219,6 +223,10 @@ the same pod.
 **How it works:** Every admission path reads the same pod lifecycle state. Management readiness and
 state polling remain available so Legion can observe and act on removal.
 
+**W3 scope boundary:** This PR does not claim the full customer-process and mandatory-endpoint
+health-classification policy. It only acts on the explicit lifecycle and admission signals described
+in this guide.
+
 ## 6. Assumptions
 
 | Assumption | Reason |
@@ -240,9 +248,12 @@ state polling remain available so Legion can observe and act on removal.
 | Physical pod reclamation | Legion behavior is outside this repository change. |
 | Committed invocation settlement | Already-admitted requests may continue; this is not an atomic drain barrier. |
 | Runtime identity publication | Public `link.runtime` remains unset and `link` remains `Unlinked`. |
-| General network-loss detection | Only existing terminal relay classifications select cleanup. |
+| W2 transient-versus-terminal policy | Only existing terminal relay/session classifications select cleanup; broader connection-loss policy is deferred. |
+| W3 health-classification policy | Full customer-process and mandatory-endpoint health classification is deferred. |
 | WorkerProxy startup failure | A process that never starts or cannot report still needs Legion recovery. |
 | Remote unlink acknowledgement | Runtime success means local cleanup, not proof of remote deletion. |
+
+The W2 and W3 boundaries above are accepted review scope for this PR, not unresolved blockers.
 
 ## 8. Scenario mapping
 
