@@ -29,7 +29,16 @@ The acknowledgement is bound to the live stream pair's initialization request ID
 replay does not advance state; a different Runtime or a stale/failed handshake is rejected.
 WorkerProxy publishes historical `Linked` without promoting the worker to serving capacity.
 Once accepted, the Runtime identity survives transport loss and the Proxy cannot be retargeted.
-Never-linked timeout/removal is not implemented by this protocol change.
+With the same lifecycle opt-in enabled, WorkerProxy requests removal if no Link is accepted
+within `WorkerProxy:NeverLinkedTimeout` (default five minutes). The duration is frozen for the
+process. Assignment, initialization, retries and configuration reload do not reset it.
+This intentionally uses the existing state-manager startup origin; earlier process-entry capture
+is deferred. Elapsed-time decisions use the monotonic clock.
+
+Accepted Link and expiry compete under one lifecycle lock. Expiry is sticky, withdraws readiness
+and HTTP forwarding, and rejects late assignment and Link/stream admission. Management readiness
+and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.
+There is no forced process exit, new drain behavior, or established-link failure policy here.
 
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.
 

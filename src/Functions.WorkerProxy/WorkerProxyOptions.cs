@@ -1,6 +1,8 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
+
 namespace Azure.Functions.WorkerProxy;
 
 /// <summary>
@@ -27,6 +29,12 @@ internal sealed class WorkerProxyOptions
     /// Keep disabled until compatible Runtime identity and runtime-to-proxy authentication are deployed.
     /// </summary>
     public bool EnableLinkLifecycle { get; set; }
+
+    /// <summary>
+    /// Gets or sets the fixed never-linked lifetime, frozen when this process creates its state manager.
+    /// Applies only when <see cref="EnableLinkLifecycle"/> is enabled.
+    /// </summary>
+    public TimeSpan NeverLinkedTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
     /// Gets or sets the HTTP/1 management listener port.

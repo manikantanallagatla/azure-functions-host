@@ -25,6 +25,9 @@ internal sealed class WorkerPodStateManager
     private readonly Lock _stateLock = new();
     private readonly HashSet<TaskCompletionSource<WorkerPodState>> _waiters = [];
     private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _neverLinkedTimeout;
+    private readonly long _startupTimestamp;
+    private readonly TaskCompletionSource _linkAccepted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private WorkerPodState _state;
     private WorkerAssignment? _assignment;
     // High-water mark for accepted or terminated sessions, including sessions that never had a worker.
@@ -42,7 +45,12 @@ internal sealed class WorkerPodStateManager
         ArgumentException.ThrowIfNullOrWhiteSpace(podName);
 
         _timeProvider = timeProvider;
+        _startupTimestamp = options.Value.EnableLinkLifecycle ? _timeProvider.GetTimestamp() : 0;
         _state = WorkerPodState.CreateUnassigned(podName, _timeProvider.GetUtcNow());
+        if (options.Value.EnableLinkLifecycle)
+        {
+            _neverLinkedTimeout = options.Value.NeverLinkedTimeout;
+        }
     }
 
     /// <summary>
@@ -54,6 +62,7 @@ internal sealed class WorkerPodStateManager
         {
             lock (_stateLock)
             {
+                ExpireNeverLinkedLocked();
                 return _state;
             }
         }
@@ -88,6 +97,7 @@ internal sealed class WorkerPodStateManager
         TaskCompletionSource<WorkerPodState> waiter;
         lock (_stateLock)
         {
+            ExpireNeverLinkedLocked();
             ArgumentOutOfRangeException.ThrowIfGreaterThan(lastKnownRevision, _state.Revision);
             if (lastKnownRevision < _state.Revision)
             {
@@ -132,8 +142,9 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
+            ExpireNeverLinkedLocked();
             // Pre-assignment transport sessions may be replaced; an assigned pod's failure is terminal.
-            if (sessionId <= _lastSessionId || _state.AssignmentState == WorkerAssignmentState.Failed)
+            if (sessionId <= _lastSessionId || _state.AssignmentState == WorkerAssignmentState.Failed || _state.RemovalRequested)
             {
                 return false;
             }
@@ -169,7 +180,8 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
-            if (_state.SessionId != sessionId || !_state.IsWorkerAttached)
+            ExpireNeverLinkedLocked();
+            if (_state.SessionId != sessionId || !_state.IsWorkerAttached || _state.RemovalRequested)
             {
                 return false;
             }
@@ -196,6 +208,7 @@ internal sealed class WorkerPodStateManager
     {
         lock (_stateLock)
         {
+            ExpireNeverLinkedLocked();
             if (_state.SessionId != sessionId || !_state.IsWorkerReady ||
                 _state.AssignmentState == WorkerAssignmentState.Failed ||
                 (_state.FunctionAppName is { } appName &&
@@ -214,6 +227,7 @@ internal sealed class WorkerPodStateManager
                 Revision = checked(_state.Revision + 1),
                 AcceptedRuntime = runtime
             });
+            _linkAccepted.TrySetResult();
             return true;
         }
     }
@@ -264,6 +278,12 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
+            ExpireNeverLinkedLocked();
+            if (_state.RemovalRequested)
+            {
+                return WorkerAssignmentResult.RemovalRequested;
+            }
+
             if (_state.AcceptedRuntime is { } runtime &&
                 !string.Equals(runtime.App.FunctionAppName, assignment.FunctionAppName, StringComparison.Ordinal))
             {
@@ -308,6 +328,59 @@ internal sealed class WorkerPodStateManager
             _assignment = assignment;
             UpdateStateAndNotifyWaitersLocked(assigned);
             return WorkerAssignmentResult.Created;
+        }
+    }
+
+    /// <summary>
+    /// Waits for accepted Link, the fixed monotonic deadline, or application shutdown.
+    /// </summary>
+    public async Task WatchNeverLinkedAsync(CancellationToken cancellationToken)
+    {
+        if (_neverLinkedTimeout <= TimeSpan.Zero)
+        {
+            return;
+        }
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            TimeSpan remaining;
+            lock (_stateLock)
+            {
+                ExpireNeverLinkedLocked();
+                if (_state.AcceptedRuntime is not null || _state.RemovalRequested)
+                {
+                    return;
+                }
+
+                remaining = _neverLinkedTimeout - _timeProvider.GetElapsedTime(_startupTimestamp);
+            }
+
+            try
+            {
+                // WaitAsync timers use whole milliseconds. Round up, and recheck after an early wake.
+                TimeSpan delay = TimeSpan.FromMilliseconds(Math.Max(1, Math.Ceiling(remaining.TotalMilliseconds)));
+                await _linkAccepted.Task.WaitAsync(delay, _timeProvider, cancellationToken);
+                return;
+            }
+            catch (TimeoutException)
+            {
+                // Re-arm against the original deadline, never a new lifetime window.
+            }
+        }
+    }
+
+    private void ExpireNeverLinkedLocked()
+    {
+        // Check the deadline at admission too: a delayed timer callback must not admit a late Link.
+        if (_neverLinkedTimeout > TimeSpan.Zero && _state.AcceptedRuntime is null && !_state.RemovalRequested &&
+            _timeProvider.GetElapsedTime(_startupTimestamp) >= _neverLinkedTimeout)
+        {
+            UpdateStateAndNotifyWaitersLocked(_state with
+            {
+                Revision = checked(_state.Revision + 1),
+                RemovalRequested = true
+            });
         }
     }
 
