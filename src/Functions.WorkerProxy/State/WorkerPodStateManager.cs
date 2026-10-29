@@ -236,7 +236,12 @@ internal sealed class WorkerPodStateManager
     /// <summary>
     /// Withdraws readiness on relay termination or worker detachment. Old notifications have no effect.
     /// </summary>
-    public bool OnSessionTerminated(long sessionId)
+    public bool OnSessionTerminated(long sessionId) => OnSessionTerminated(sessionId, runtimeCompleted: false);
+
+    /// <summary>
+    /// Also requests removal when Runtime explicitly completes an accepted attachment.
+    /// </summary>
+    public bool OnSessionTerminated(long sessionId, bool runtimeCompleted)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sessionId);
 
@@ -263,6 +268,7 @@ internal sealed class WorkerPodStateManager
             {
                 Revision = checked(_state.Revision + 1),
                 IsWorkerAttached = false,
+                RemovalRequested = _state.RemovalRequested || (runtimeCompleted && _state.HasAcceptedLink),
                 // Preserve assignment identity so equivalent retries report failure and different assignments still conflict.
                 AssignmentState = _assignment is null ? WorkerAssignmentState.Unassigned : WorkerAssignmentState.Failed
             });
