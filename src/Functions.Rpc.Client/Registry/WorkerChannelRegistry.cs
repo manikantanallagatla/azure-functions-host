@@ -27,7 +27,7 @@ namespace Azure.Functions.Rpc.Client;
 /// </remarks>
 internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager
 {
-    private const int DefaultHttpWorkerConcurrency = 16;
+    private const int DefaultHttpWorkerCapacity = 16;
 
     private static readonly TimeSpan DefaultLinkTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan UnlinkTimeout = TimeSpan.FromSeconds(10);
@@ -975,7 +975,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             linkedWorkerCount++;
             if (channel.ContributesHttpCapacity)
             {
-                httpCapacity += DefaultHttpWorkerConcurrency;
+                httpCapacity += DefaultHttpWorkerCapacity;
             }
         }
 

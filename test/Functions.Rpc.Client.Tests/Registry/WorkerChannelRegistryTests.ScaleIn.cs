@@ -162,26 +162,61 @@ public sealed partial class WorkerChannelRegistryTests
     }
 
     [Fact]
-    public async Task TryCommitReservation_IdleWorker_UnlinksExactlyOnce()
+    public async Task TryCommitReservation_RevalidatesStateAndUnlinksIdleWorkerExactlyOnce()
     {
         ManualTimeProvider timeProvider = new();
-        (RegistryHarness harness, ChannelControl worker, _) = await CreateIdleHttpWorkerAsync(timeProvider);
+        (RegistryHarness harness, ChannelControl worker, FunctionMetadata function) =
+            await CreateIdleHttpWorkerAsync(timeProvider);
         await using WorkerChannelRegistry registry = harness.Registry;
         IHttpWorkerScaleInManager scaleInManager = registry;
-        HttpWorkerScaleInReservation reservation =
-            scaleInManager.TryReserveIdleWorker(HttpOnDemandWorkerScaleInService.IdleDuration);
-        Assert.NotNull(reservation);
+        ChannelControl otherWorker = new(
+            "other-worker",
+            functionGroupName: FunctionGroups.Http,
+            isAlwaysReady: false);
+        harness.Enqueue(otherWorker);
+        await LinkAsync(registry, otherWorker.Id);
+        await otherWorker.ReadRequestAsync(StreamingMessage.ContentOneofCase.FunctionLoadRequest);
+        await SendFunctionLoadResponseAsync(otherWorker, function.GetFunctionId());
+        timeProvider.Advance(HttpOnDemandWorkerScaleInService.IdleDuration);
 
-        Assert.True(scaleInManager.TryCommitReservation(reservation, out Task<bool> drainCompletion));
+        HttpWorkerScaleInReservation staleReservation =
+            scaleInManager.TryReserveIdleWorker(HttpOnDemandWorkerScaleInService.IdleDuration);
+        Assert.NotNull(staleReservation);
+        HttpWorkerScaleInReservation transientReservation =
+            scaleInManager.TryReserveIdleWorker(HttpOnDemandWorkerScaleInService.IdleDuration);
+        Assert.NotNull(transientReservation);
+        Assert.True(scaleInManager.CancelReservation(transientReservation));
+        Assert.Equal(staleReservation.ProjectedState.HttpCapacity, scaleInManager.Current.HttpCapacity);
+        Assert.Equal(staleReservation.ProjectedState.LinkedWorkerCount, scaleInManager.Current.LinkedWorkerCount);
+        Assert.NotEqual(staleReservation.ProjectedState.Version, scaleInManager.Current.Version);
+
+        Assert.False(scaleInManager.TryCommitReservation(staleReservation, out _));
+        Assert.True(scaleInManager.CancelReservation(staleReservation));
+        HttpWorkerScaleInReservation currentReservation =
+            scaleInManager.TryReserveIdleWorker(HttpOnDemandWorkerScaleInService.IdleDuration);
+        Assert.NotNull(currentReservation);
+        ChannelControl drainedWorker = string.Equals(
+            currentReservation.WorkerId,
+            worker.Id,
+            StringComparison.Ordinal)
+                ? worker
+                : otherWorker;
+        ChannelControl remainingWorker = ReferenceEquals(drainedWorker, worker)
+            ? otherWorker
+            : worker;
+
+        Assert.True(scaleInManager.TryCommitReservation(currentReservation, out Task<bool> drainCompletion));
         Assert.True(await drainCompletion.WaitAsync(TestTimeout));
 
-        Assert.False(scaleInManager.TryCommitReservation(reservation, out _));
-        Assert.Empty(registry.GetInitializedChannels());
-        Assert.Equal(0, scaleInManager.Current.LinkedWorkerCount);
-        Assert.Equal(1, worker.DisposeCount);
-        harness.ChannelFactory.Verify(
-            factory => factory.Create(worker.Id, worker.Transport),
-            Times.Once);
+        Assert.False(scaleInManager.TryCommitReservation(currentReservation, out _));
+        Assert.Same(
+            remainingWorker.Channel,
+            Assert.Single(registry.GetInitializedChannels()));
+        Assert.Equal(1, scaleInManager.Current.LinkedWorkerCount);
+        Assert.Equal(1, drainedWorker.DisposeCount);
+        Assert.Equal(0, remainingWorker.DisposeCount);
+        harness.ChannelFactory.Verify(factory => factory.Create(worker.Id, worker.Transport), Times.Once);
+        harness.ChannelFactory.Verify(factory => factory.Create(otherWorker.Id, otherWorker.Transport), Times.Once);
     }
 
     private static async Task<(RegistryHarness Harness, ChannelControl Worker, FunctionMetadata Function)>
@@ -197,14 +232,7 @@ public sealed partial class WorkerChannelRegistryTests
         await LinkAsync(harness.Registry, worker.Id);
         await harness.Registry.ActivateAsync([function], new ManagedDependencyOptions(), functionTimeout: null);
         await worker.ReadRequestAsync(StreamingMessage.ContentOneofCase.FunctionLoadRequest);
-        await worker.Transport.SendResponseAsync(new()
-        {
-            FunctionLoadResponse = new()
-            {
-                FunctionId = function.GetFunctionId(),
-                Result = new() { Status = StatusResult.Types.Status.Success },
-            },
-        });
+        await SendFunctionLoadResponseAsync(worker, function.GetFunctionId());
         timeProvider.Advance(HttpOnDemandWorkerScaleInService.IdleDuration);
 
         return (harness, worker, function);
@@ -266,6 +294,16 @@ public sealed partial class WorkerChannelRegistryTests
             InvocationResponse = new()
             {
                 InvocationId = invocationId,
+                Result = new() { Status = StatusResult.Types.Status.Success },
+            },
+        });
+
+    private static ValueTask SendFunctionLoadResponseAsync(ChannelControl worker, string functionId)
+        => worker.Transport.SendResponseAsync(new()
+        {
+            FunctionLoadResponse = new()
+            {
+                FunctionId = functionId,
                 Result = new() { Status = StatusResult.Types.Status.Success },
             },
         });

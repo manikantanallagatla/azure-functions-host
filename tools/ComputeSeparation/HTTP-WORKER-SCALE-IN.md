@@ -290,6 +290,6 @@ The PR adds four behavior-level test methods, with six executed cases:
 | `RunScaleInPassAsync_AppServerDoesNotApplyProjectedCapacity_RestoresInvocationAdmission` | 2 | Unsupported success and explicit rejection both cancel the reservation, republish current capacity, and allow a real invocation through the dispatcher. |
 | `TryReserveIdleWorker_InvocationCommittedFirst_CompletesWithoutInterruption` | 1 | An invocation committed before reservation remains protected, completes normally, and only then makes the worker reservable. |
 | `InvokeAsync_HttpDrainWaitsForResultAndForwarding` | 2 | Result-first and forwarding-first HTTP completion both keep the worker busy until both signals finish. |
-| `TryCommitReservation_IdleWorker_UnlinksExactlyOnce` | 1 | An empty committed drain completes the existing graceful unlink once and removes the worker from linked state. |
+| `TryCommitReservation_RevalidatesStateAndUnlinksIdleWorkerExactlyOnce` | 1 | A stale reservation cannot commit after the state version changes, even when capacity and linked-worker count return to the projected values; a fresh empty drain unlinks once. |
 
 These are in-memory behavioral tests through the hosted scale-in service, dispatcher, registry, real client worker channel, and protocol transport. They are not deployed Legion or AppServer end-to-end validation.
