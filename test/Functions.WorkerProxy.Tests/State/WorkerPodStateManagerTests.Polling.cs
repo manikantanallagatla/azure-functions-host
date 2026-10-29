@@ -328,7 +328,7 @@ public partial class WorkerPodStateManagerTests
     [Fact]
     public async Task Poll_TimerCreationFailureDoesNotLeakWaiter()
     {
-        Mock<TimeProvider> timeProvider = new();
+        Mock<TimeProvider> timeProvider = new() { CallBase = true };
         timeProvider.Setup(provider => provider.CreateTimer(
             It.IsAny<TimerCallback>(), It.IsAny<object?>(), It.IsAny<TimeSpan>(), It.IsAny<TimeSpan>()))
             .Throws(new InvalidOperationException("Timer unavailable."));
@@ -344,7 +344,7 @@ public partial class WorkerPodStateManagerTests
     {
         public PollClock()
         {
-            Mock<TimeProvider> provider = new();
+            Mock<TimeProvider> provider = new() { CallBase = true };
             provider.Setup(clock => clock.CreateTimer(
                 It.IsAny<TimerCallback>(), It.IsAny<object?>(), It.IsAny<TimeSpan>(), It.IsAny<TimeSpan>()))
                 .Returns((TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>

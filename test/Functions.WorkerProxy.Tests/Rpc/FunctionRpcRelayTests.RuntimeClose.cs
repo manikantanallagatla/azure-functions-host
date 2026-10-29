@@ -179,10 +179,8 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(before.Link, after.Link);
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task RuntimeClose_HttpOverride_ClosesAfterAcceptanceAndPreservesLegacyWhenDisabled(bool enabled)
+    [Fact]
+    public async Task RuntimeClose_HttpOverride_ClosesAfterAcceptedRuntimeCompletion()
     {
         int forwardedRequests = 0;
         await using var destination = await WorkerHttpForwardingTests.StartWorkerAsync(_ =>
@@ -192,7 +190,7 @@ public partial class FunctionRpcRelayTests
         });
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(
-            clock, enabled: enabled, httpEndpoint: WorkerHttpForwardingTests.GetAddress(destination).AbsoluteUri);
+            clock, httpEndpoint: WorkerHttpForwardingTests.GetAddress(destination).AbsoluteUri);
         using CancellationTokenSource timeout = new(TestTimeout);
         using HttpClient http = factory.CreateHttpForwardingClient();
         using HttpClient management = factory.CreateWorkerProxyClient();
@@ -200,10 +198,7 @@ public partial class FunctionRpcRelayTests
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         var request = CreateLinkRequest("http-runtime-close");
         await InitializeLinkAsync(worker, runtime, request.InitializationId, timeout.Token);
-        if (enabled)
-        {
-            await AcceptLinkAsync(factory, request, timeout.Token);
-        }
+        await AcceptLinkAsync(factory, request, timeout.Token);
 
         using HttpResponseMessage before = await http.GetAsync("/before-runtime-close", timeout.Token);
         Assert.Equal(HttpStatusCode.OK, before.StatusCode);
@@ -211,9 +206,9 @@ public partial class FunctionRpcRelayTests
         await runtime.WaitForTerminationAsync(timeout.Token);
         await worker.WaitForTerminationAsync(timeout.Token);
         using HttpResponseMessage after = await http.GetAsync("/after-runtime-close", timeout.Token);
-        Assert.Equal(enabled ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK, after.StatusCode);
-        Assert.Equal(enabled ? 1 : 2, Volatile.Read(ref forwardedRequests));
-        Assert.Equal(enabled ? SplitWorkerStatus.RemovalRequested : SplitWorkerStatus.Starting,
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, after.StatusCode);
+        Assert.Equal(1, Volatile.Read(ref forwardedRequests));
+        Assert.Equal(SplitWorkerStatus.RemovalRequested,
             (await ReadSplitManagementStateAsync(management, timeout.Token)).Status);
     }
 }

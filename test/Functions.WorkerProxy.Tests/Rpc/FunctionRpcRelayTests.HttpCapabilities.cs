@@ -61,6 +61,7 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(init, await worker.ReadAsync(timeout.Token));
         StreamingMessage response = CreateInitResponse("runtime-init", "http://localhost:1234/worker/");
         StreamingMessage expected = response.Clone();
+        expected.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
         expected.WorkerInitResponse.Capabilities["HttpUri"] = proxyEndpoint;
 
         await worker.WriteAsync(response, timeout.Token);
@@ -135,6 +136,7 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(start, await outbound.Reader.ReadAsync(timeout.Token));
         StreamingMessage first = CreateInitResponse("first-init", firstHttpUri);
         StreamingMessage expected = first.Clone();
+        expected.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
         if (firstHttpUri is not null)
         {
             expected.WorkerInitResponse.Capabilities["HttpUri"] = options.HttpProxyEndpoint;

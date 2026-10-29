@@ -9,20 +9,16 @@ The tool supplies no `host.json`. It sets the Host's existing read-only app-cont
 - The repository's .NET SDK.
 - For container deployment only, a running Linux x64 Docker engine with Docker Compose.
 
-### Staged Link lifecycle protocol
+### Link acceptance
 
-The new lifecycle protocol is **disabled by default** (`WorkerProxy:EnableLinkLifecycle=false`).
-Do not enable it until runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103
-is integrated and protects the `WorkerLink/Accept` RPC as well as `FunctionRpc/EventStream`.
-This change does not implement authentication.
-
-An enabled WorkerProxy advertises `WorkerLinkAcceptance=True` in its successful
-`WorkerInitResponse`, replacing any customer-worker value. A compatible Runtime then
+WorkerProxy advertises `WorkerLinkAcceptance=True` in its successful
+`WorkerInitResponse`, replacing any customer-worker value. Runtime then
 acknowledges that initialization on the same cached endpoint channel before publishing the
 initialized worker. No Runtime identity setting or startup-time pairing is required.
-Disabled or older Proxies retain the legacy path without an acknowledgement call.
-Deploy a compatible Runtime and authentication before enabling the Proxy lifecycle protocol;
-an older Runtime does not send the acknowledgement.
+The capability distinguishes WorkerProxy from ordinary non-BYOC workers; there is no
+BYOC lifecycle enable switch or older-version compatibility mode.
+Runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103 must protect both
+`WorkerLink/Accept` and `FunctionRpc/EventStream`; this change does not implement it.
 
 The acknowledgement is bound to the live stream pair's initialization request ID. Matching
 replay does not advance state; a stale/failed handshake is rejected.
@@ -33,7 +29,7 @@ and is deliberately deferred: the existing public `link` projection remains unch
 (`Unlinked`, with no Runtime identity). This local acknowledgement is only the W1 foundation,
 not completion of the full published Link lifecycle contract.
 
-With the same lifecycle opt-in enabled, WorkerProxy requests removal if no Link is accepted
+WorkerProxy requests removal if no Link is accepted
 within `WorkerProxy:NeverLinkedTimeout` (default five minutes). The duration is frozen for the
 process. Assignment, initialization, retries and configuration reload do not reset it.
 This intentionally uses the existing state-manager startup origin; earlier process-entry capture
@@ -47,8 +43,8 @@ There is no forced process exit or new drain behavior here.
 
 ### Explicit Runtime connection completion
 
-With the same lifecycle opt-in enabled, a Proxy with an accepted Link also requests sticky
-removal when Runtime explicitly completes its gRPC request stream. This uses the relay's
+A Proxy with an accepted Link also requests sticky removal when Runtime explicitly
+completes its gRPC request stream. This uses the relay's
 existing runtime-side `PeerClosed` classification, not a new inference of Runtime death.
 Readiness withdrawal and removal publication share one state update. Existing removal
 handling closes new assignment, Link/stream and HTTP admission while management stays alive.

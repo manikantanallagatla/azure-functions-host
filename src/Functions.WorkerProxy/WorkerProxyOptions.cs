@@ -25,14 +25,7 @@ internal sealed class WorkerProxyOptions
     public string PodName { get; set; } = string.Empty;
 
     /// <summary>
-    /// Gets or sets whether to enable the new Link lifecycle protocol.
-    /// Keep disabled until a compatible Runtime and runtime-to-proxy authentication are deployed.
-    /// </summary>
-    public bool EnableLinkLifecycle { get; set; }
-
-    /// <summary>
     /// Gets or sets the fixed never-linked lifetime, frozen when this process creates its state manager.
-    /// Applies only when <see cref="EnableLinkLifecycle"/> is enabled.
     /// </summary>
     public TimeSpan NeverLinkedTimeout { get; set; } = TimeSpan.FromMinutes(5);
 

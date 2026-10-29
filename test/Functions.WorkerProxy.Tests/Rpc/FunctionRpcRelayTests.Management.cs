@@ -142,6 +142,7 @@ public partial class FunctionRpcRelayTests
             Assert.Equal("runtime-authoritative-directory", relayedInit.WorkerInitRequest.FunctionAppDirectory);
             StreamingMessage initialized = CreateInitResponse(init.RequestId, "http://localhost:1234/");
             StreamingMessage expected = initialized.Clone();
+            expected.WorkerInitResponse.Capabilities["WorkerLinkAcceptance"] = bool.TrueString;
             expected.WorkerInitResponse.Capabilities["HttpUri"] = proxyEndpoint;
             expected.WorkerInitResponse.Capabilities["FunctionGroupName"] = "test-group";
             await worker.WriteAsync(initialized, timeout.Token);
