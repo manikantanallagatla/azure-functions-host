@@ -12,7 +12,7 @@ namespace Azure.Functions.WorkerProxy.Rpc;
 
 /// <summary>
 /// Receives platform Link acknowledgements on the runtime-facing listener only.
-/// Authentication is supplied by the runtime-to-WorkerProxy transport dependency.
+/// Requires the separate runtime-to-WorkerProxy authentication integration before enablement.
 /// </summary>
 internal sealed class WorkerLinkService(
     FunctionRpcRelay relay,
