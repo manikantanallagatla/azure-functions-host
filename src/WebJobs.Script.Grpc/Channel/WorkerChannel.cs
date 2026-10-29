@@ -303,6 +303,9 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
                     case MsgType.WorkerStatusResponse:
                         ReceiveWorkerStatusResponse(msg.RequestId, msg.WorkerStatusResponse);
                         break;
+                    case MsgType.ManagedIdentityTokenRequest:
+                        HandleManagedIdentityTokenRequest(msg);
+                        break;
                     case MsgType.InvocationResponse:
                         _ = InvokeResponse(msg.InvocationResponse);
                         break;
@@ -1503,6 +1506,10 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
                 return;
             }
             _eventManager.Publish(new WorkerErrorEvent(_runtime, Id, exception));
+        }
+
+        protected virtual void HandleManagedIdentityTokenRequest(StreamingMessage message)
+        {
         }
 
         /// <summary>
