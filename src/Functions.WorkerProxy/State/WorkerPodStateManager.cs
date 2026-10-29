@@ -42,11 +42,8 @@ internal sealed class WorkerPodStateManager
         ArgumentException.ThrowIfNullOrWhiteSpace(podName);
 
         _timeProvider = timeProvider;
-        LinkLifecycleEnabled = options.Value.EnableLinkLifecycle;
         _state = WorkerPodState.CreateUnassigned(podName, _timeProvider.GetUtcNow());
     }
-
-    internal bool LinkLifecycleEnabled { get; }
 
     /// <summary>
     /// Gets the current immutable state without incrementing its revision.

@@ -5,24 +5,21 @@ using System;
 using System.Threading.Tasks;
 using Grpc.Core;
 using Microsoft.Azure.WebJobs.Script.Grpc.WorkerLink;
-using Microsoft.Extensions.Options;
 using GrpcRpcException = Grpc.Core.RpcException;
 
 namespace Azure.Functions.WorkerProxy.Rpc;
 
 /// <summary>
 /// Receives platform Link acknowledgements on the runtime-facing listener only.
-/// Requires the separate runtime-to-WorkerProxy authentication integration before enablement.
+/// Requires the separate runtime-to-WorkerProxy authentication integration.
 /// </summary>
 internal sealed class WorkerLinkService(
     FunctionRpcRelay relay,
-    WorkerProxyEndpointConfiguration endpoints,
-    IOptions<WorkerProxyOptions> options) : WorkerLink.WorkerLinkBase
+    WorkerProxyEndpointConfiguration endpoints) : WorkerLink.WorkerLinkBase
 {
     public override Task<AcceptLinkResponse> Accept(AcceptLinkRequest request, ServerCallContext context)
     {
-        if (!options.Value.EnableLinkLifecycle ||
-            !endpoints.TryGetRelaySide(context.GetHttpContext().Connection.LocalPort, out FunctionRpcRelaySide side) ||
+        if (!endpoints.TryGetRelaySide(context.GetHttpContext().Connection.LocalPort, out FunctionRpcRelaySide side) ||
             side != FunctionRpcRelaySide.Runtime)
         {
             throw new GrpcRpcException(new Status(StatusCode.Unimplemented, "Link acceptance is unavailable on this listener."));

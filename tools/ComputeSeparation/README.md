@@ -9,20 +9,16 @@ The tool supplies no `host.json`. It sets the Host's existing read-only app-cont
 - The repository's .NET SDK.
 - For container deployment only, a running Linux x64 Docker engine with Docker Compose.
 
-### Staged Link lifecycle protocol
+### Link acceptance
 
-The new lifecycle protocol is **disabled by default** (`WorkerProxy:EnableLinkLifecycle=false`).
-Do not enable it until runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103
-is integrated and protects the `WorkerLink/Accept` RPC as well as `FunctionRpc/EventStream`.
-This change does not implement authentication.
-
-An enabled WorkerProxy advertises `WorkerLinkAcceptance=True` in its successful
-`WorkerInitResponse`, replacing any customer-worker value. A compatible Runtime then
+WorkerProxy advertises `WorkerLinkAcceptance=True` in its successful
+`WorkerInitResponse`, replacing any customer-worker value. Runtime then
 acknowledges that initialization on the same cached endpoint channel before publishing the
 initialized worker. No Runtime identity setting or startup-time pairing is required.
-Disabled or older Proxies retain the legacy path without an acknowledgement call.
-Deploy a compatible Runtime and authentication before enabling the Proxy lifecycle protocol;
-an older Runtime does not send the acknowledgement.
+The capability distinguishes WorkerProxy from ordinary non-BYOC workers; there is no
+BYOC lifecycle enable switch or older-version compatibility mode.
+Runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103 must protect both
+`WorkerLink/Accept` and `FunctionRpc/EventStream`; this change does not implement it.
 
 The acknowledgement is bound to the live stream pair's initialization request ID. Matching
 replay does not advance state; a stale/failed handshake is rejected.
