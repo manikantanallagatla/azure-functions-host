@@ -53,10 +53,17 @@ public sealed partial class WorkerChannelRegistryTests
                 [EnvironmentSettingNames.MeshInitURI] = "http://appserver.test/",
             })
             .Build();
-        AppServerHostStateClient client = new(httpClientFactory.Object, configuration);
         IHttpWorkerScaleInManager scaleInManager = registry;
+        IRuntimeRetirementWorkerManager retirementWorkerManager = registry;
+        AppServerHostStateClient client = new(
+            httpClientFactory.Object,
+            scaleInManager,
+            retirementWorkerManager,
+            timeProvider,
+            configuration);
         HttpOnDemandWorkerScaleInService service = new(
             scaleInManager,
+            retirementWorkerManager,
             client,
             timeProvider,
             NullLogger<HttpOnDemandWorkerScaleInService>.Instance);
@@ -219,17 +226,127 @@ public sealed partial class WorkerChannelRegistryTests
         harness.ChannelFactory.Verify(factory => factory.Create(otherWorker.Id, otherWorker.Transport), Times.Once);
     }
 
-    private static async Task<(RegistryHarness Harness, ChannelControl Worker, FunctionMetadata Function)>
-        CreateIdleHttpWorkerAsync(ManualTimeProvider timeProvider)
+    [Fact]
+    public async Task RuntimeRetirement_CloseThenDrain_PreservesCommittedWorkAndSelectsOnce()
     {
-        RegistryHarness harness = new(timeProvider);
+        ManualTimeProvider timeProvider = new();
+        (RegistryHarness harness, ChannelControl worker, FunctionMetadata function) =
+            await CreateIdleHttpWorkerAsync(timeProvider);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        IRuntimeRetirementWorkerManager retirementWorkerManager = registry;
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        using RpcClientFunctionInvocationDispatcher dispatcher = new(
+            registry,
+            NullLogger<RpcClientFunctionInvocationDispatcher>.Instance);
+        await dispatcher.InitializeAsync([function]);
+        ScriptInvocationContext invocation = CreateScaleInInvocation(function);
+        await dispatcher.InvokeAsync(invocation);
+        StreamingMessage request = await worker.ReadRequestAsync(StreamingMessage.ContentOneofCase.InvocationRequest);
+        SplitScriptHostActivationFaulted condition = new(
+            retirementWorkerManager.Incarnation,
+            new InvalidOperationException("activation failed"));
+
+        Assert.True(retirementWorkerManager.TryCloseAdmission(condition));
+        Assert.Equal(0, scaleInManager.Current.HttpCapacity);
+        WorkerLinkException linkFailure = await Assert.ThrowsAsync<WorkerLinkException>(
+            () => registry.LinkAsync(
+                "blocked-worker",
+                new Uri("http://127.0.0.1:5001"),
+                CancellationToken.None));
+        Assert.Equal(WorkerLinkFailureReason.RuntimeStopping, linkFailure.Reason);
+
+        Task<RuntimeRetirementDrainResult> drain = retirementWorkerManager.DrainAllWorkersAsync(
+            retirementWorkerManager.Incarnation,
+            CancellationToken.None);
+        Assert.False(drain.IsCompleted);
+        Assert.Equal(0, worker.DisposeCount);
+
+        await SendInvocationResponseAsync(worker, request.InvocationRequest.InvocationId);
+        Assert.NotNull(await invocation.ResultSource.Task.WaitAsync(TestTimeout));
+        Assert.True((await drain.WaitAsync(TestTimeout)).IsComplete);
+        Assert.Empty(registry.GetInitializedChannels());
+        Assert.Equal(1, worker.DisposeCount);
+
+        Assert.True((await retirementWorkerManager.DrainAllWorkersAsync(
+            retirementWorkerManager.Incarnation,
+            CancellationToken.None)).IsComplete);
+        Assert.Equal(1, worker.DisposeCount);
+
+        ManualTimeProvider overlapTimeProvider = new();
+        FunctionsSplitWorkerRemovalAction fallbackAction = new(
+            new(
+                "test-namespace",
+                "overlap-worker",
+                Guid.NewGuid(),
+                "test-legion-stamp",
+                FunctionsSplitPodIdentity.WorkerPodType,
+                new("test-app", 123, "test-antares-stamp")),
+            "RuntimeUnlink");
+        (RegistryHarness overlapHarness, ChannelControl _, FunctionMetadata _) = await CreateIdleHttpWorkerAsync(
+            overlapTimeProvider,
+            completeResponsesOnRequestCompletion: false,
+            unlinkTimeout: TimeSpan.FromSeconds(1),
+            workerIdentity: fallbackAction.Worker);
+        await using WorkerChannelRegistry overlapRegistry = overlapHarness.Registry;
+        IHttpWorkerScaleInManager overlapScaleInManager = overlapRegistry;
+        IRuntimeRetirementWorkerManager overlapRetirementManager = overlapRegistry;
+        HttpWorkerScaleInReservation reservation = overlapScaleInManager.TryReserveIdleWorker(
+            HttpOnDemandWorkerScaleInService.IdleDuration);
+        Assert.NotNull(reservation);
+        Assert.True(overlapScaleInManager.TryCommitReservation(reservation, out Task<bool> existingDrain));
+        while (overlapScaleInManager.Current.LinkedWorkerCount != 0)
+        {
+            long version = overlapScaleInManager.Version;
+            await overlapScaleInManager.WaitForChangeAsync(version).WaitAsync(TestTimeout);
+        }
+
+        SplitScriptHostActivationFaulted overlapCondition = new(
+            overlapRetirementManager.Incarnation,
+            new InvalidOperationException("activation failed during scale-in"));
+        Assert.True(overlapRetirementManager.TryCloseAdmission(overlapCondition));
+        Task<RuntimeRetirementDrainResult> overlappingRetirement = overlapRetirementManager.DrainAllWorkersAsync(
+            overlapRetirementManager.Incarnation,
+            CancellationToken.None);
+
+        Assert.False(overlappingRetirement.IsCompleted);
+        Assert.True(await existingDrain.WaitAsync(TestTimeout));
+        Assert.True((await overlappingRetirement.WaitAsync(TestTimeout)).IsComplete);
+        Assert.Equal(fallbackAction, Assert.Single(overlapScaleInManager.Current.OutstandingWorkerRemovals));
+        Assert.Equal(
+            WorkerRemovalAcknowledgementResult.Accepted,
+            overlapScaleInManager.AcknowledgeWorkerRemoval(fallbackAction));
+    }
+
+    private static async Task<(RegistryHarness Harness, ChannelControl Worker, FunctionMetadata Function)>
+        CreateIdleHttpWorkerAsync(
+            ManualTimeProvider timeProvider,
+            bool completeResponsesOnRequestCompletion = true,
+            TimeSpan? unlinkTimeout = null,
+            FunctionsSplitPodIdentity workerIdentity = null)
+    {
+        RegistryHarness harness = unlinkTimeout.HasValue
+            ? new(timeProvider, unlinkTimeout.Value)
+            : new(timeProvider);
         ChannelControl worker = new(
-            "worker",
+            workerIdentity?.PodName ?? "worker",
             functionGroupName: FunctionGroups.Http,
-            isAlwaysReady: false);
+            isAlwaysReady: false,
+            completeResponsesOnRequestCompletion: completeResponsesOnRequestCompletion);
         harness.Enqueue(worker);
         FunctionMetadata function = CreateScaleInHttpFunction();
-        await LinkAsync(harness.Registry, worker.Id);
+        if (workerIdentity is null)
+        {
+            await LinkAsync(harness.Registry, worker.Id);
+        }
+        else
+        {
+            await harness.Registry.LinkAsync(
+                worker.Id,
+                CreateEndpoint(worker.Id),
+                workerIdentity,
+                CancellationToken.None);
+        }
+
         await harness.Registry.ActivateAsync([function], new ManagedDependencyOptions(), functionTimeout: null);
         await worker.ReadRequestAsync(StreamingMessage.ContentOneofCase.FunctionLoadRequest);
         await SendFunctionLoadResponseAsync(worker, function.GetFunctionId());

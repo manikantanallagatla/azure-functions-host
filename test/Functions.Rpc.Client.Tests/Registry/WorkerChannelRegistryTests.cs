@@ -1826,21 +1826,26 @@ public sealed partial class WorkerChannelRegistryTests
         private readonly ConcurrentQueue<TestDuplexChannel<StreamingMessage>> _transports = new();
 
         public RegistryHarness()
-            : this(null, null)
+            : this(null, null, null)
         {
         }
 
         public RegistryHarness(TimeSpan? linkTimeout)
-            : this(linkTimeout, null)
+            : this(linkTimeout, null, null)
         {
         }
 
         public RegistryHarness(TimeProvider timeProvider)
-            : this(null, timeProvider)
+            : this(null, timeProvider, null)
         {
         }
 
-        private RegistryHarness(TimeSpan? linkTimeout, TimeProvider timeProvider)
+        public RegistryHarness(TimeProvider timeProvider, TimeSpan unlinkTimeout)
+            : this(null, timeProvider, unlinkTimeout)
+        {
+        }
+
+        private RegistryHarness(TimeSpan? linkTimeout, TimeProvider timeProvider, TimeSpan? unlinkTimeout)
         {
             DuplexFactory.Setup(factory => factory.ConnectAsync(It.IsAny<Uri>(), It.IsAny<CancellationToken>()))
                 .Returns((Uri endpoint, CancellationToken cancellationToken) =>
@@ -1878,7 +1883,15 @@ public sealed partial class WorkerChannelRegistryTests
 
                     return channel;
                 });
-            Registry = linkTimeout.HasValue
+            Registry = unlinkTimeout.HasValue
+                ? new(
+                    DuplexFactory.Object,
+                    ChannelFactory.Object,
+                    NullLogger<WorkerChannelRegistry>.Instance,
+                    linkTimeout ?? TimeSpan.FromSeconds(30),
+                    timeProvider,
+                    unlinkTimeout)
+                : linkTimeout.HasValue
                 ? new(
                     DuplexFactory.Object,
                     ChannelFactory.Object,
@@ -1924,6 +1937,7 @@ public sealed partial class WorkerChannelRegistryTests
         private readonly TaskCompletionSource _startRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _setupEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _setupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly bool _completeResponsesOnRequestCompletion;
         private readonly string _functionGroupName;
         private readonly bool? _isAlwaysReady;
         private readonly Exception _setupFailure;
@@ -1940,10 +1954,12 @@ public sealed partial class WorkerChannelRegistryTests
             int setupFailureCount = 0,
             Exception setupFailure = null,
             string functionGroupName = null,
-            bool? isAlwaysReady = null)
+            bool? isAlwaysReady = null,
+            bool completeResponsesOnRequestCompletion = true)
         {
             Id = id;
             Transport = new(blockDisposal);
+            _completeResponsesOnRequestCompletion = completeResponsesOnRequestCompletion;
             _functionGroupName = functionGroupName;
             _isAlwaysReady = isAlwaysReady;
             _remainingSetupFailures = setupFailureCount;
@@ -2100,7 +2116,10 @@ public sealed partial class WorkerChannelRegistryTests
                     WorkerInitResponse = initResponse,
                 });
                 await Transport.Requests.Completion;
-                Transport.CompleteResponses();
+                if (_completeResponsesOnRequestCompletion)
+                {
+                    Transport.CompleteResponses();
+                }
             }
             catch (ChannelClosedException)
             {

@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using Azure.Functions.Rpc.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -21,6 +22,9 @@ internal static class AppServerHostStateServiceCollectionExtensions
             client => client.Timeout = RequestTimeout);
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<AppServerHostStateClient>();
+        services.AddSingleton<RuntimeRetirementManager>();
+        services.AddSingleton<IRuntimeRetirementManager>(
+            provider => provider.GetRequiredService<RuntimeRetirementManager>());
         services.AddSingleton<IHostedService, HttpOnDemandWorkerScaleInService>();
 
         return services;

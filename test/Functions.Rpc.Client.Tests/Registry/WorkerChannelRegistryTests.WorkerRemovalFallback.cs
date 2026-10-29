@@ -55,9 +55,16 @@ public sealed partial class WorkerChannelRegistryTests
                 [EnvironmentSettingNames.MeshInitURI] = "http://appserver.test/",
             })
             .Build();
+        IRuntimeRetirementWorkerManager retirementWorkerManager = registry;
         HttpOnDemandWorkerScaleInService service = new(
             scaleInManager,
-            new AppServerHostStateClient(httpClientFactory.Object, configuration),
+            retirementWorkerManager,
+            new AppServerHostStateClient(
+                httpClientFactory.Object,
+                scaleInManager,
+                retirementWorkerManager,
+                TimeProvider.System,
+                configuration),
             TimeProvider.System,
             NullLogger<HttpOnDemandWorkerScaleInService>.Instance);
 

@@ -15,6 +15,7 @@ namespace Azure.Functions.Host.HostState;
 /// </summary>
 internal sealed partial class HttpOnDemandWorkerScaleInService(
     IHttpWorkerScaleInManager scaleInManager,
+    IRuntimeRetirementWorkerManager retirementWorkerManager,
     AppServerHostStateClient appServerClient,
     TimeProvider timeProvider,
     ILogger<HttpOnDemandWorkerScaleInService> logger) : BackgroundService
@@ -30,6 +31,9 @@ internal sealed partial class HttpOnDemandWorkerScaleInService(
 
     private readonly IHttpWorkerScaleInManager _scaleInManager =
         scaleInManager ?? throw new ArgumentNullException(nameof(scaleInManager));
+
+    private readonly IRuntimeRetirementWorkerManager _retirementWorkerManager =
+        retirementWorkerManager ?? throw new ArgumentNullException(nameof(retirementWorkerManager));
 
     private readonly TimeProvider _timeProvider =
         timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
@@ -58,6 +62,11 @@ internal sealed partial class HttpOnDemandWorkerScaleInService(
 
     internal async Task<long> RunScaleInPassAsync(CancellationToken cancellationToken)
     {
+        if (_retirementWorkerManager.IsRetirementRequested)
+        {
+            return _scaleInManager.Version;
+        }
+
         (AppServerHostStatePublishResult currentResult, HttpWorkerScaleInState publishedState) =
             await PublishCurrentUntilStableAsync(cancellationToken);
         if (currentResult is not AppServerHostStatePublishResult.Applied)

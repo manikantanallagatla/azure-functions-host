@@ -49,6 +49,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
     private bool _draining;
     private long? _idleSinceTimestamp;
     private bool? _isAlwaysReady;
+    private bool _runtimeAdmissionClosed;
     private bool _scaleInReady;
     private Guid? _scaleInReservationId;
     private bool _terminalAdmissionClosed;
@@ -115,6 +116,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
             {
                 return IsHttpFunctionGroup &&
                     _scaleInReady &&
+                    !_runtimeAdmissionClosed &&
                     !_draining &&
                     _scaleInReservationId is null &&
                     !_terminalAdmissionClosed &&
@@ -127,6 +129,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
     // Terminal signals can precede registry cleanup and the base channel's disposal state.
     internal bool IsReadyForInvocations =>
         Volatile.Read(ref _scaleInReady) &&
+        !Volatile.Read(ref _runtimeAdmissionClosed) &&
         !Volatile.Read(ref _draining) &&
         !IsScaleInReserved &&
         !IsTerminated &&
@@ -159,6 +162,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
             lock (_invocationAdmissionLock)
             {
                 if (_draining ||
+                    _runtimeAdmissionClosed ||
                     _scaleInReservationId is not null ||
                     _terminalAdmissionClosed ||
                     IsTerminated ||
@@ -393,6 +397,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
                 _idleSinceTimestamp = null;
             }
             else if (_committedInvocations.Count == 0 &&
+                !_runtimeAdmissionClosed &&
                 !_draining &&
                 _scaleInReservationId is null &&
                 !_terminalAdmissionClosed)
@@ -412,6 +417,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
             if (!IsHttpFunctionGroup ||
                 _isAlwaysReady is not false ||
                 !_scaleInReady ||
+                _runtimeAdmissionClosed ||
                 _draining ||
                 _scaleInReservationId is not null ||
                 _terminalAdmissionClosed ||
@@ -456,6 +462,32 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
             _scaleInReservationId = null;
             Volatile.Write(ref _draining, true);
             CompleteDrainIfReadyLocked();
+            return _drainCompletion.Task;
+        }
+    }
+
+    internal void CloseRuntimeAdmission()
+    {
+        lock (_invocationAdmissionLock)
+        {
+            Volatile.Write(ref _runtimeAdmissionClosed, true);
+            _scaleInReservationId = null;
+            _idleSinceTimestamp = null;
+        }
+    }
+
+    internal Task BeginRuntimeRetirementDrain()
+    {
+        lock (_invocationAdmissionLock)
+        {
+            if (!_runtimeAdmissionClosed)
+            {
+                throw new InvalidOperationException("Runtime invocation admission must close before worker drain selection.");
+            }
+
+            Volatile.Write(ref _draining, true);
+            CompleteDrainIfReadyLocked();
+
             return _drainCompletion.Task;
         }
     }

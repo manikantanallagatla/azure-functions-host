@@ -25,7 +25,8 @@ namespace Azure.Functions.Rpc.Client;
 /// context, and retains terminal identities. Initialized channels remain available for metadata bootstrap before a
 /// ScriptHost function set is known; only ready channels are available for invocation dispatch.
 /// </remarks>
-internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager
+internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager,
+    IRuntimeRetirementWorkerManager
 {
     private const int CompletedWorkerRemovalCapacity = 128;
     private const int DefaultHttpWorkerCapacity = 16;
@@ -48,6 +49,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Dictionary<string, WorkerSlot> _slots = new(StringComparer.Ordinal);
     private readonly Lock _stateLock = new();
+    private readonly RuntimeIncarnation _runtimeIncarnation = RuntimeIncarnation.Create();
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _unlinkTimeout;
     private ChannelSetupContext _activeSetupContext;
@@ -59,6 +61,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
     private DateTimeOffset _scaleInStateCreatedTime;
     private TaskCompletionSource<long> _scaleInStateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _scaleInStateVersion;
+    private Task<RuntimeRetirementDrainResult> _runtimeRetirementDrainTask;
+    private bool _runtimeRetirementRequested;
 
     // Setup writers hold _stateLock; ready-channel readers observe this published signal without taking that lock.
     private TaskCompletionSource<IReadOnlyList<WorkerChannel>> _readyChannelsAvailable = CreateReadyChannelsSignal();
@@ -120,6 +124,19 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             {
                 RefreshScaleInStateLocked();
                 return _scaleInStateVersion;
+            }
+        }
+    }
+
+    RuntimeIncarnation IRuntimeRetirementWorkerManager.Incarnation => _runtimeIncarnation;
+
+    bool IRuntimeRetirementWorkerManager.IsRetirementRequested
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _runtimeRetirementRequested;
             }
         }
     }
@@ -192,6 +209,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         lock (_stateLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_runtimeRetirementRequested)
+            {
+                throw new WorkerLinkException(
+                    WorkerLinkFailureReason.RuntimeStopping,
+                    "The Runtime is retiring and no longer accepts Worker Links.");
+            }
+
             if (_linkAttempts.TryGetValue(workerId, out WorkerSlot existing))
             {
                 if (!string.Equals(existing.Endpoint.AbsoluteUri, grpcEndpoint.AbsoluteUri, StringComparison.Ordinal))
@@ -256,7 +280,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         lock (_stateLock)
         {
-            if (_disposed)
+            if (_disposed || _runtimeRetirementRequested)
             {
                 return null;
             }
@@ -292,6 +316,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         {
             RefreshScaleInStateLocked();
             if (_disposed ||
+                _runtimeRetirementRequested ||
                 _scaleInStateVersion != reservation.ProjectedState.Version ||
                 _scaleInHttpCapacity != reservation.ProjectedState.HttpCapacity ||
                 _scaleInLinkedWorkerCount != reservation.ProjectedState.LinkedWorkerCount ||
@@ -333,6 +358,92 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             SignalScaleInStateChangedLocked();
             return true;
         }
+    }
+
+    bool IRuntimeRetirementWorkerManager.TryCloseAdmission(SplitScriptHostActivationFaulted condition)
+    {
+        ArgumentNullException.ThrowIfNull(condition);
+
+        lock (_stateLock)
+        {
+            if (_disposed || condition.Incarnation != _runtimeIncarnation)
+            {
+                return false;
+            }
+
+            if (_runtimeRetirementRequested)
+            {
+                return true;
+            }
+
+            _runtimeRetirementRequested = true;
+            foreach (WorkerSlot slot in _slots.Values)
+            {
+                slot.Channel?.CloseRuntimeAdmission();
+            }
+
+            SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
+            return true;
+        }
+    }
+
+    Task<RuntimeRetirementDrainResult> IRuntimeRetirementWorkerManager.DrainAllWorkersAsync(
+        RuntimeIncarnation incarnation,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        List<Task<bool>> existingDrains = null;
+        List<(string WorkerId, WorkerSlot Slot, Task InvocationDrainTask, TaskCompletionSource<bool> Completion)> selections = null;
+        TaskCompletionSource<RuntimeRetirementDrainResult> retirementCompletion = null;
+        Task<RuntimeRetirementDrainResult> drainTask;
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_runtimeRetirementRequested || incarnation != _runtimeIncarnation)
+            {
+                throw new InvalidOperationException("Runtime retirement drain does not match the active retiring incarnation.");
+            }
+
+            if (_runtimeRetirementDrainTask is null)
+            {
+                existingDrains = [];
+                selections = [];
+                foreach ((string workerId, WorkerSlot slot) in _slots)
+                {
+                    if (slot.DrainTask is not null)
+                    {
+                        existingDrains.Add(slot.DrainTask);
+                        continue;
+                    }
+
+                    if (slot.Channel is not { } channel)
+                    {
+                        continue;
+                    }
+
+                    Task invocationDrainTask = channel.BeginRuntimeRetirementDrain();
+                    TaskCompletionSource<bool> completion =
+                        new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    slot.DrainTask = completion.Task;
+                    selections.Add((workerId, slot, invocationDrainTask, completion));
+                }
+
+                SignalReadyChannelsLocked();
+                retirementCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                _runtimeRetirementDrainTask = retirementCompletion.Task;
+            }
+
+            drainTask = _runtimeRetirementDrainTask;
+        }
+
+        if (retirementCompletion is not null)
+        {
+            _ = CompleteRuntimeRetirementDrainAsync(existingDrains, selections, retirementCompletion);
+        }
+
+        return drainTask.WaitAsync(cancellationToken);
     }
 
     private async Task LinkAndCompleteAsync(string workerId, Uri grpcEndpoint, WorkerSlot slot, TaskCompletionSource<WorkerChannel> linkCompletion,
@@ -887,7 +998,44 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
         catch (Exception exception)
         {
-            drainCompletion.TrySetException(exception);
+            if (IsRuntimeRetirementFallbackOutstanding(slot))
+            {
+                drainCompletion.TrySetResult(true);
+            }
+            else
+            {
+                drainCompletion.TrySetException(exception);
+            }
+        }
+    }
+
+    private async Task CompleteRuntimeRetirementDrainAsync(
+        IReadOnlyList<Task<bool>> existingDrains,
+        IReadOnlyList<(string WorkerId, WorkerSlot Slot, Task InvocationDrainTask, TaskCompletionSource<bool> Completion)> selections,
+        TaskCompletionSource<RuntimeRetirementDrainResult> retirementCompletion)
+    {
+        try
+        {
+            foreach (var selection in selections)
+            {
+                _ = CompleteDrainAsync(
+                    selection.WorkerId,
+                    selection.Slot,
+                    selection.InvocationDrainTask,
+                    selection.Completion);
+            }
+
+            IEnumerable<Task<bool>> workerDrains = existingDrains.Concat(
+                selections.Select(static selection => selection.Completion.Task));
+            bool[] results = await Task.WhenAll(workerDrains);
+            RuntimeRetirementDrainResult result = results.All(static workerDrained => workerDrained)
+                ? new(true, null)
+                : new(false, "At least one Worker could not complete its drain and unlink.");
+            retirementCompletion.TrySetResult(result);
+        }
+        catch (Exception exception)
+        {
+            retirementCompletion.TrySetException(exception);
         }
     }
 
@@ -898,6 +1046,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         lock (_stateLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_runtimeRetirementRequested)
+            {
+                throw new WorkerLinkException(
+                    WorkerLinkFailureReason.RuntimeStopping,
+                    "The Runtime started retiring before the Worker Link was registered.");
+            }
+
             // Setup can hold this lock past the link deadline or transport lifetime.
             cancellationToken.ThrowIfCancellationRequested();
             if (channel.IsTerminated)
@@ -1050,16 +1205,28 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         FunctionsSplitWorkerRemovalAction action = new(slot.Worker, UnlinkRemovalReason);
         lock (_stateLock)
         {
-            if (_completedWorkerRemovals.Contains(action) || !_outstandingWorkerRemovalSet.Add(action))
+            if (_completedWorkerRemovals.Contains(action) || _outstandingWorkerRemovalSet.Contains(action))
             {
+                slot.RemovalFallbackRecorded = true;
                 return;
             }
 
+            _outstandingWorkerRemovalSet.Add(action);
             _outstandingWorkerRemovals.Add(action);
+            slot.RemovalFallbackRecorded = true;
             SignalScaleInStateChangedLocked();
         }
 
         Log.WorkerRemovalFallbackAdded(_logger, slot.Worker.PodName, slot.Worker.PodGuid);
+    }
+
+    private bool IsRuntimeRetirementFallbackOutstanding(WorkerSlot slot)
+    {
+        lock (_stateLock)
+        {
+            return _runtimeRetirementRequested &&
+                slot.RemovalFallbackRecorded;
+        }
     }
 
     private void AddCompletedWorkerRemovalLocked(FunctionsSplitWorkerRemovalAction action)
@@ -1190,6 +1357,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         // The original failure from the attempted setup context, or null after successful setup.
         public Exception SetupException { get; set; }
+
+        // Indicates that an uncertain unlink produced an exact fallback handoff.
+        public bool RemovalFallbackRecorded { get; set; }
 
         // Indicates that a previously accepted link has terminated and cannot be replayed.
         public bool Terminal { get; set; }
