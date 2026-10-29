@@ -25,7 +25,6 @@ using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
-using Microsoft.Azure.WebJobs.Script.Grpc.WorkerLink;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
@@ -44,18 +43,14 @@ public class RpcClientScriptHostStartupIntegrationTests
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(30);
 
     [Theory]
-    [InlineData(null, null, StatusCode.OK)]
-    [InlineData("", null, StatusCode.OK)]
-    [InlineData("node", null, StatusCode.OK)]
-    [InlineData("python", "node", StatusCode.OK)]
-    [InlineData(null, null, StatusCode.FailedPrecondition)]
-    [InlineData(null, null, StatusCode.Unimplemented)]
-    [InlineData(null, null, StatusCode.Cancelled)]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    [InlineData("node", null)]
+    [InlineData("python", "node")]
     public async Task FirstLink_WorkerLanguageControlsRuntimeIndexingAndInvocation(
-        string? configuredRuntime, string? profileRuntime, StatusCode acceptanceStatus)
+        string? configuredRuntime, string? profileRuntime)
     {
         await using TestWorker worker = await TestWorker.StartAsync("worker", "python");
-        worker.Acceptance.ResponseStatus = acceptanceStatus;
         var configureBuilder = new Mock<IConfigureBuilder<IServiceCollection>>();
         configureBuilder.Setup(builder => builder.Configure(It.IsAny<IServiceCollection>()))
             .Callback<IServiceCollection>(services =>
@@ -76,33 +71,7 @@ public class RpcClientScriptHostStartupIntegrationTests
         RpcClientScriptHostStartupCoordinator coordinator = testHost.Host.Services.GetRequiredService<RpcClientScriptHostStartupCoordinator>();
         IScriptHostManager manager = testHost.Host.Services.GetRequiredService<IScriptHostManager>();
 
-        if (acceptanceStatus != StatusCode.OK)
-        {
-            Task<WorkerLinkResult> link = registry.LinkAsync("worker", worker.Endpoint, cancellationToken: timeout.Token);
-            if (acceptanceStatus == StatusCode.Cancelled)
-            {
-                await worker.Acceptance.Started.Task.WaitAsync(timeout.Token);
-                Assert.Empty(registry.GetInitializedChannels());
-                timeout.Cancel();
-                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => link);
-                Assert.True(link.IsCanceled);
-            }
-            else
-            {
-                Grpc.Core.RpcException error = await Assert.ThrowsAsync<Grpc.Core.RpcException>(() => link);
-                Assert.Equal(acceptanceStatus, error.StatusCode);
-            }
-
-            Assert.Equal(1, worker.Acceptance.Calls);
-            Assert.Empty(registry.GetInitializedChannels());
-            Assert.Null(manager.Services);
-            Assert.False(coordinator.ActivationTask!.IsCompleted);
-            Assert.Equal(0, worker.Service.MetadataRequests);
-            return;
-        }
-
         await registry.LinkAsync("worker", worker.Endpoint, cancellationToken: timeout.Token);
-        Assert.Equal(1, worker.Acceptance.Calls);
         await coordinator.ActivationTask!.WaitAsync(timeout.Token);
         await WaitForHostStateAsync(manager, ScriptHostState.Running, timeout.Token);
         await worker.Service.FunctionLoaded.Task.WaitAsync(timeout.Token);
@@ -401,8 +370,6 @@ public class RpcClientScriptHostStartupIntegrationTests
 
         public TestWorkerService Service { get; } = service;
 
-        public TestLinkService Acceptance => application.Services.GetRequiredService<TestLinkService>();
-
         public static async Task<TestWorker> StartAsync(string workerId, string language = "dotnet-isolated")
         {
             WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
@@ -411,11 +378,9 @@ public class RpcClientScriptHostStartupIntegrationTests
                 options.Listen(IPAddress.Loopback, 0, listener => listener.Protocols = HttpProtocols.Http2));
             TestWorkerService service = new(workerId, language);
             builder.Services.AddSingleton(service);
-            builder.Services.AddSingleton<TestLinkService>();
             builder.Services.AddGrpc();
             WebApplication application = builder.Build();
             application.MapGrpcService<TestWorkerService>();
-            application.MapGrpcService<TestLinkService>();
             await application.StartAsync();
             IServer server = application.Services.GetRequiredService<IServer>();
             string address = server.Features.Get<IServerAddressesFeature>()!.Addresses.Single();
@@ -430,47 +395,11 @@ public class RpcClientScriptHostStartupIntegrationTests
         }
     }
 
-    public sealed class TestLinkService(TestWorkerService worker) : WorkerLink.WorkerLinkBase
-    {
-        private int _calls;
-
-        public int Calls => Interlocked.CompareExchange(ref _calls, 0, 0);
-
-        public StatusCode ResponseStatus { get; set; }
-
-        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public override async Task<AcceptLinkResponse> Accept(AcceptLinkRequest request, ServerCallContext context)
-        {
-            Interlocked.Increment(ref _calls);
-            if (string.IsNullOrWhiteSpace(request.InitializationId) ||
-                !string.Equals(request.InitializationId, worker.InitializationId, StringComparison.Ordinal))
-            {
-                throw new Grpc.Core.RpcException(new Status(StatusCode.InvalidArgument, "Incorrect initialization ID."));
-            }
-
-            Started.TrySetResult();
-            if (ResponseStatus == StatusCode.Cancelled)
-            {
-                await Task.Delay(Timeout.Infinite, context.CancellationToken);
-            }
-
-            if (ResponseStatus != StatusCode.OK)
-            {
-                throw new Grpc.Core.RpcException(new Status(ResponseStatus, "Acceptance rejected."));
-            }
-
-            return new AcceptLinkResponse();
-        }
-    }
-
     public sealed class TestWorkerService(string workerId, string language) : FunctionRpc.FunctionRpcBase
     {
         private int _functionLoadRequests;
         private int _metadataRequests;
         private int _invocations;
-
-        public string? InitializationId { get; private set; }
 
         public int FunctionLoadRequests => Interlocked.CompareExchange(ref _functionLoadRequests, 0, 0);
 
@@ -495,7 +424,6 @@ public class RpcClientScriptHostStartupIntegrationTests
                     switch (request.ContentCase)
                     {
                         case StreamingMessage.ContentOneofCase.WorkerInitRequest:
-                            InitializationId = request.RequestId;
                             response.WorkerInitResponse = new() { Result = Success() };
                             break;
                         case StreamingMessage.ContentOneofCase.FunctionsMetadataRequest:

@@ -10,7 +10,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Net.Client;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
-using Microsoft.Azure.WebJobs.Script.Grpc.WorkerLink;
 using Microsoft.Extensions.Logging;
 
 namespace Azure.Functions.Rpc.Client;
@@ -170,29 +169,6 @@ internal sealed class RpcClientFactory : IRpcClientFactory
                     _operationsCompleted.TrySetResult();
                 }
             }
-        }
-    }
-
-    /// <inheritdoc />
-    public async Task AcceptLinkAsync(Uri endpoint, AcceptLinkRequest request, CancellationToken cancellationToken)
-    {
-        await CreateAsync(endpoint, cancellationToken);
-        GrpcChannel channel;
-        lock (_syncLock)
-        {
-            ThrowIfDisposed();
-            channel = _channels[endpoint];
-        }
-
-        using var call = new WorkerLink.WorkerLinkClient(channel).AcceptAsync(request, cancellationToken: cancellationToken);
-        try
-        {
-            await call.ResponseAsync;
-        }
-        catch (Grpc.Core.RpcException exception) when (
-            exception.StatusCode == Grpc.Core.StatusCode.Cancelled && cancellationToken.IsCancellationRequested)
-        {
-            throw new OperationCanceledException(exception.Message, exception, cancellationToken);
         }
     }
 

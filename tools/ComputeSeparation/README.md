@@ -9,30 +9,29 @@ The tool supplies no `host.json`. It sets the Host's existing read-only app-cont
 - The repository's .NET SDK.
 - For container deployment only, a running Linux x64 Docker engine with Docker Compose.
 
-### Link acceptance
+### Link completion
 
-Runtime always acknowledges successful initialization on the same cached WorkerProxy
-endpoint channel before publishing the initialized worker. There is no capability
-negotiation, lifecycle enable switch, Runtime identity setting or startup-time pairing.
-Runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103 must protect both
-`WorkerLink/Accept` and `FunctionRpc/EventStream`; this change does not implement it.
+WorkerProxy records local Link completion when the worker successfully initializes on
+the current live Runtime/worker stream pair. It uses the existing initialization exchange;
+there is no extra acknowledgement API, correlation field, capability negotiation or enable switch.
+This completion point does not prove Runtime registration or receipt of Link success by RCP.
+Runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103 must protect
+`FunctionRpc/EventStream`; this change does not implement it.
 
-The acknowledgement is bound to the live stream pair's initialization request ID. Matching
-replay does not advance state; a stale/failed handshake is rejected.
-WorkerProxy retains only a local accepted-Link fact, including after transport loss, and
-cannot be retargeted after acceptance. Acceptance does not promote serving readiness.
+Repeated successful initialization does not advance state. WorkerProxy retains local linked
+history after transport loss and cannot be retargeted after linking.
+Link completion does not promote serving readiness.
 Publishing historical `link.runtime` requires authoritative full Runtime identity delivery
 and is deliberately deferred: the existing public `link` projection remains unchanged
-(`Unlinked`, with no Runtime identity). This local acknowledgement is only the W1 foundation,
+(`Unlinked`, with no Runtime identity). This local history is only the W1 foundation,
 not completion of the full published Link lifecycle contract.
-
-WorkerProxy requests removal if no Link is accepted
+WorkerProxy requests removal if initialization does not complete
 within `WorkerProxy:NeverLinkedTimeout` (default five minutes). The duration is frozen for the
-process. Assignment, initialization, retries and configuration reload do not reset it.
+process. Assignment, initialization progress/failure, retries and configuration reload do not reset it.
 This intentionally uses the existing state-manager startup origin; earlier process-entry capture
 is deferred. Elapsed-time decisions use the monotonic clock.
 
-Accepted Link and expiry compete under one lifecycle lock. Expiry is sticky, withdraws readiness
+Successful initialization and expiry compete under one lifecycle lock. Expiry is sticky, withdraws readiness
 and HTTP forwarding (including an explicit `WorkerHttpEndpoint` override), and rejects late
 assignment and Link/stream admission. Management readiness
 and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.

@@ -5,7 +5,6 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
-using Microsoft.Azure.WebJobs.Script.Grpc.WorkerLink;
 
 namespace Azure.Functions.Rpc.Client;
 
@@ -29,13 +28,4 @@ internal interface IRpcClientFactory : IAsyncDisposable
     /// <param name="cancellationToken">A token that cancels connection establishment or waiting for an existing connection.</param>
     /// <returns>The FunctionRpc client.</returns>
     ValueTask<FunctionRpc.FunctionRpcClient> CreateAsync(Uri endpoint, CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// Acknowledges initialization on the same cached endpoint channel.
-    /// </summary>
-    /// <param name="endpoint">The worker's runtime-facing endpoint.</param>
-    /// <param name="request">The current initialization request ID.</param>
-    /// <param name="cancellationToken">The Link operation's deadline and cancellation.</param>
-    /// <returns>A task completed after WorkerProxy accepts the link.</returns>
-    Task AcceptLinkAsync(Uri endpoint, AcceptLinkRequest request, CancellationToken cancellationToken);
 }
