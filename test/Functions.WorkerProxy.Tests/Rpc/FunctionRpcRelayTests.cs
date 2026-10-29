@@ -477,6 +477,9 @@ public partial class FunctionRpcRelayTests
     }
 
     private static RelayClient CreateClient(Uri address, CancellationToken cancellationToken)
+        => CreateClient(address, EventStreamMethod, cancellationToken);
+
+    private static RelayClient CreateClient(Uri address, Method<StreamingMessage, StreamingMessage> method, CancellationToken cancellationToken)
     {
         UriBuilder normalizedAddress = new(address);
         if (IPAddress.TryParse(address.Host.Trim('[', ']'), out IPAddress? ipAddress)
@@ -487,7 +490,7 @@ public partial class FunctionRpcRelayTests
 
         GrpcChannel channel = GrpcChannel.ForAddress(normalizedAddress.Uri);
         AsyncDuplexStreamingCall<StreamingMessage, StreamingMessage> call =
-            channel.CreateCallInvoker().AsyncDuplexStreamingCall(EventStreamMethod, host: null,
+            channel.CreateCallInvoker().AsyncDuplexStreamingCall(method, host: null,
                 new CallOptions(cancellationToken: cancellationToken));
 
         return new RelayClient(channel, call);

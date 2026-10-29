@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Azure.Functions.WorkerProxy.Rpc;
 using Azure.Functions.WorkerProxy.State;
+using Google.Protobuf;
 using Grpc.Core;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
 using Microsoft.Extensions.DependencyInjection;
@@ -19,18 +20,27 @@ namespace Azure.Functions.WorkerProxy.Tests;
 public partial class FunctionRpcRelayTests
 {
     [Theory]
-    [InlineData(false, true)]
-    [InlineData(true, true)]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    public async Task PeerClose_InitializedAttachment_PublishesStickyRemovalAndClosesIntake(bool assigned, bool runtimeSide)
+    [InlineData(false, true, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(true, true, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(false, false, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(true, false, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(false, true, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(true, true, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(false, false, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(true, false, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(false, true, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(true, true, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(false, false, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(true, false, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    public async Task PeerTermination_InitializedAttachment_PublishesStickyRemovalAndClosesIntake(
+        bool assigned, bool runtimeSide, string termination)
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
         using CancellationTokenSource timeout = new(TestTimeout);
         using HttpClient management = factory.CreateWorkerProxyClient();
-        await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
-        await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
+        await using RelayClient worker = CreateFaultableClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
+        await using RelayClient runtime = CreateFaultableClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
         if (assigned)
         {
@@ -45,9 +55,20 @@ public partial class FunctionRpcRelayTests
         Task<HttpResponseMessage> poll = PollSplitManagementStateAsync(management, accepted, timeout.Token);
         await WaitForManagementPollAsync(factory.Services.GetRequiredService<WorkerPodStateManager>(), timeout.Token);
 
-        await (runtimeSide ? runtime : worker).CompleteRequestAsync(timeout.Token);
-        Assert.Equal(StatusCode.Unavailable, await runtime.WaitForTerminationAsync(timeout.Token));
-        Assert.Equal(StatusCode.Unavailable, await worker.WaitForTerminationAsync(timeout.Token));
+        await TerminatePeerAsync(runtimeSide ? runtime : worker, termination, timeout.Token);
+        StatusCode siblingStatus = await (runtimeSide ? worker : runtime).WaitForTerminationAsync(timeout.Token);
+        bool canceled = string.Equals(termination, nameof(FunctionRpcRelayTerminationReason.Canceled), StringComparison.Ordinal);
+        Assert.Equal(canceled
+            ? StatusCode.Cancelled : StatusCode.Unavailable, siblingStatus);
+        if (!canceled)
+        {
+            Assert.Equal(StatusCode.Unavailable, await (runtimeSide ? runtime : worker).WaitForTerminationAsync(timeout.Token));
+        }
+
+        FunctionRpcRelay relay = factory.Services.GetRequiredService<FunctionRpcRelay>();
+        await WaitForReleaseAsync(relay, timeout.Token);
+        Assert.Equal(termination, relay.LastTerminalState?.Reason.ToString());
+        Assert.Equal(runtimeSide ? FunctionRpcRelaySide.Runtime : FunctionRpcRelaySide.Worker, relay.LastTerminalState?.Side);
         using HttpResponseMessage changed = await poll;
         SplitWorkerOriginState removed = await ReadSplitManagementStateAsync(changed, timeout.Token);
         Assert.Equal(SplitWorkerStatus.RemovalRequested, removed.Status);
@@ -68,12 +89,20 @@ public partial class FunctionRpcRelayTests
     }
 
     [Theory]
-    [InlineData(false, true)]
-    [InlineData(true, true)]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    public async Task PeerClose_BeforeInitialization_AllowsRetryWithoutResettingNeverLinkedDeadline(
-        bool failedInitialization, bool runtimeSide)
+    [InlineData(false, true, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(true, true, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(false, false, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(true, false, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(false, true, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(true, true, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(false, false, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(true, false, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(false, true, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(true, true, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(false, false, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(true, false, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    public async Task PeerTermination_BeforeInitialization_AllowsRetryWithoutResettingNeverLinkedDeadline(
+        bool failedInitialization, bool runtimeSide, string termination)
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
@@ -82,8 +111,8 @@ public partial class FunctionRpcRelayTests
         FunctionRpcRelay relay = factory.Services.GetRequiredService<FunctionRpcRelay>();
         SplitWorkerOriginState initial = await ReadSplitManagementStateAsync(management, timeout.Token);
         clock.Advance(TimeSpan.FromMinutes(4));
-        await using (RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token))
-        await using (RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token))
+        await using (RelayClient worker = CreateFaultableClient(factory, FunctionRpcRelaySide.Worker, timeout.Token))
+        await using (RelayClient runtime = CreateFaultableClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token))
         {
             if (failedInitialization)
             {
@@ -105,12 +134,12 @@ public partial class FunctionRpcRelayTests
                 await ExchangeAsync(runtime, worker, "not-initialized", timeout.Token);
             }
 
-            await (runtimeSide ? runtime : worker).CompleteRequestAsync(timeout.Token);
-            await runtime.WaitForTerminationAsync(timeout.Token);
-            await worker.WaitForTerminationAsync(timeout.Token);
+            await TerminatePeerAsync(runtimeSide ? runtime : worker, termination, timeout.Token);
+            await (runtimeSide ? worker : runtime).WaitForTerminationAsync(timeout.Token);
         }
 
         await WaitForReleaseAsync(relay, timeout.Token);
+        Assert.Equal(termination, relay.LastTerminalState?.Reason.ToString());
         Assert.Equal(SplitWorkerStatus.Starting, (await ReadSplitManagementStateAsync(management, timeout.Token)).Status);
         await using RelayClient replacementWorker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient replacementRuntime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
@@ -124,7 +153,7 @@ public partial class FunctionRpcRelayTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task PeerClose_CanceledCall_DoesNotSelectANewLossPolicy(bool runtimeSide)
+    public async Task PeerTermination_ProxyShutdown_DoesNotRequestRemoval(bool initialized)
     {
         LifecycleClock clock = new();
         await using WorkerProxyWebApplicationFactory factory = CreateTimeoutFactory(clock);
@@ -132,15 +161,22 @@ public partial class FunctionRpcRelayTests
         using HttpClient management = factory.CreateWorkerProxyClient();
         await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
-        await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
-        await (runtimeSide ? runtime : worker).DisposeAsync();
+        if (initialized)
+        {
+            await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
+        }
+        else
+        {
+            await ExchangeAsync(runtime, worker, "before-shutdown", timeout.Token);
+        }
 
-        await (runtimeSide ? worker : runtime).WaitForTerminationAsync(timeout.Token);
-        await WaitForReleaseAsync(factory.Services.GetRequiredService<FunctionRpcRelay>(), timeout.Token);
+        FunctionRpcRelay relay = factory.Services.GetRequiredService<FunctionRpcRelay>();
+        await relay.StopAsync(timeout.Token);
+        await runtime.WaitForTerminationAsync(timeout.Token);
+        await worker.WaitForTerminationAsync(timeout.Token);
+        Assert.Equal(FunctionRpcRelayTerminationReason.Shutdown, relay.LastTerminalState?.Reason);
         SplitWorkerOriginState disconnected = await ReadSplitManagementStateAsync(management, timeout.Token);
         Assert.Equal(SplitWorkerStatus.Starting, disconnected.Status);
-        clock.Advance(TimeSpan.FromHours(1));
-        Assert.Equal(disconnected, await ReadSplitManagementStateAsync(management, timeout.Token));
         await AssertReadinessAsync(management, "/admin/worker/ready", HttpStatusCode.ServiceUnavailable, timeout.Token);
     }
 
@@ -184,9 +220,13 @@ public partial class FunctionRpcRelayTests
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task PeerClose_HttpOverride_ClosesAfterInitializedPeerCompletion(bool runtimeSide)
+    [InlineData(true, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(false, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(true, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(false, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(true, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(false, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    public async Task PeerTermination_HttpOverride_ClosesAfterInitializedAttachmentLoss(bool runtimeSide, string termination)
     {
         int forwardedRequests = 0;
         await using var destination = await WorkerHttpForwardingTests.StartWorkerAsync(_ =>
@@ -200,15 +240,14 @@ public partial class FunctionRpcRelayTests
         using CancellationTokenSource timeout = new(TestTimeout);
         using HttpClient http = factory.CreateHttpForwardingClient();
         using HttpClient management = factory.CreateWorkerProxyClient();
-        await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
-        await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
+        await using RelayClient worker = CreateFaultableClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
+        await using RelayClient runtime = CreateFaultableClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
 
         using HttpResponseMessage before = await http.GetAsync("/before-runtime-close", timeout.Token);
         Assert.Equal(HttpStatusCode.OK, before.StatusCode);
-        await (runtimeSide ? runtime : worker).CompleteRequestAsync(timeout.Token);
-        await runtime.WaitForTerminationAsync(timeout.Token);
-        await worker.WaitForTerminationAsync(timeout.Token);
+        await TerminatePeerAsync(runtimeSide ? runtime : worker, termination, timeout.Token);
+        await (runtimeSide ? worker : runtime).WaitForTerminationAsync(timeout.Token);
         using HttpResponseMessage after = await http.GetAsync("/after-runtime-close", timeout.Token);
         Assert.Equal(HttpStatusCode.ServiceUnavailable, after.StatusCode);
         Assert.Equal(1, Volatile.Read(ref forwardedRequests));
@@ -216,8 +255,14 @@ public partial class FunctionRpcRelayTests
             (await ReadSplitManagementStateAsync(management, timeout.Token)).Status);
     }
 
-    [Fact]
-    public async Task WorkerClose_InitializedAttachment_DoesNotRemoveAnotherProxy()
+    [Theory]
+    [InlineData(true, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(false, nameof(FunctionRpcRelayTerminationReason.PeerClosed))]
+    [InlineData(true, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(false, nameof(FunctionRpcRelayTerminationReason.Canceled))]
+    [InlineData(true, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    [InlineData(false, nameof(FunctionRpcRelayTerminationReason.Faulted))]
+    public async Task PeerTermination_InitializedAttachment_DoesNotRemoveAnotherProxy(bool runtimeSide, string termination)
     {
         int forwardedRequests = 0;
         await using var destination = await WorkerHttpForwardingTests.StartWorkerAsync(_ =>
@@ -233,8 +278,8 @@ public partial class FunctionRpcRelayTests
         using HttpClient healthyManagement = healthyFactory.CreateWorkerProxyClient();
         using HttpClient closingHttp = closingFactory.CreateHttpForwardingClient();
         using HttpClient healthyHttp = healthyFactory.CreateHttpForwardingClient();
-        await using RelayClient closingWorker = CreateClient(closingFactory, FunctionRpcRelaySide.Worker, timeout.Token);
-        await using RelayClient closingRuntime = CreateClient(closingFactory, FunctionRpcRelaySide.Runtime, timeout.Token);
+        await using RelayClient closingWorker = CreateFaultableClient(closingFactory, FunctionRpcRelaySide.Worker, timeout.Token);
+        await using RelayClient closingRuntime = CreateFaultableClient(closingFactory, FunctionRpcRelaySide.Runtime, timeout.Token);
         await using RelayClient healthyWorker = CreateClient(healthyFactory, FunctionRpcRelaySide.Worker, timeout.Token);
         await using RelayClient healthyRuntime = CreateClient(healthyFactory, FunctionRpcRelaySide.Runtime, timeout.Token);
         await InitializeLinkAsync(closingWorker, closingRuntime, string.Empty, timeout.Token);
@@ -243,9 +288,8 @@ public partial class FunctionRpcRelayTests
         using HttpResponseMessage before = await healthyHttp.GetAsync("/before-worker-close", timeout.Token);
         Assert.Equal(HttpStatusCode.OK, before.StatusCode);
 
-        await closingWorker.CompleteRequestAsync(timeout.Token);
-        Assert.Equal(StatusCode.Unavailable, await closingRuntime.WaitForTerminationAsync(timeout.Token));
-        Assert.Equal(StatusCode.Unavailable, await closingWorker.WaitForTerminationAsync(timeout.Token));
+        await TerminatePeerAsync(runtimeSide ? closingRuntime : closingWorker, termination, timeout.Token);
+        await (runtimeSide ? closingWorker : closingRuntime).WaitForTerminationAsync(timeout.Token);
 
         Assert.Equal(SplitWorkerStatus.RemovalRequested,
             (await ReadSplitManagementStateAsync(closingManagement, timeout.Token)).Status);
@@ -262,5 +306,36 @@ public partial class FunctionRpcRelayTests
         await healthyWorker.WriteAsync(message, timeout.Token);
         Assert.Equal(message, await healthyRuntime.ReadAsync(timeout.Token));
         Assert.Equal(2, Volatile.Read(ref forwardedRequests));
+    }
+
+    private static RelayClient CreateFaultableClient(
+        WorkerProxyWebApplicationFactory factory, FunctionRpcRelaySide side, CancellationToken cancellationToken)
+    {
+        Marshaller<StreamingMessage> marshaller = Marshallers.Create(
+            static message => string.Equals(message.RequestId, "malformed-frame", StringComparison.Ordinal)
+                ? [0x80]
+                : message.ToByteArray(),
+            static payload => StreamingMessage.Parser.ParseFrom(payload));
+        Method<StreamingMessage, StreamingMessage> method = new(
+            MethodType.DuplexStreaming, FunctionRpcServiceName, EventStreamMethodName, marshaller, StreamingMessageMarshaller);
+        return CreateClient(factory.GetFunctionRpcAddress(side), method, cancellationToken);
+    }
+
+    private static async Task TerminatePeerAsync(RelayClient peer, string termination, CancellationToken cancellationToken)
+    {
+        switch (termination)
+        {
+            case nameof(FunctionRpcRelayTerminationReason.PeerClosed):
+                await peer.CompleteRequestAsync(cancellationToken);
+                break;
+            case nameof(FunctionRpcRelayTerminationReason.Canceled):
+                await peer.DisposeAsync();
+                break;
+            case nameof(FunctionRpcRelayTerminationReason.Faulted):
+                await peer.WriteAsync(CreateMessage("malformed-frame"), cancellationToken);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(termination));
+        }
     }
 }

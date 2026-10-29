@@ -38,19 +38,23 @@ assignment and Link/stream admission. Management readiness
 and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.
 There is no forced process exit or new drain behavior here.
 
-### Explicit connection completion
+### Initialized connection termination
 
 A Proxy with successfully initialized linked history also requests sticky removal when Runtime or the
-customer worker explicitly completes its gRPC request stream. This uses the relay's existing
-`PeerClosed` classification, not a new inference of process death. An initialized attachment cannot be
-replaced in the same Proxy, so customer-worker completion retires that otherwise unusable pod.
+customer worker explicitly completes its gRPC request stream, or the relay terminates the attachment
+through call cancellation or a stream-operation failure. This uses the existing `PeerClosed`, `Canceled`
+and `Faulted` classifications, not a new inference of process death. These terminal states already
+tear down the stream pair, and an initialized attachment cannot be replaced in the same Proxy.
+Removal therefore retires an otherwise unusable pod.
 Readiness withdrawal and removal publication share one state update. Existing removal
 handling closes new assignment, Link/stream and HTTP admission while management stays alive.
 
-A close before successful initialization retains the existing retry behavior and original never-linked
-deadline. Canceled or faulted calls and Proxy shutdown do not activate this removal path.
-Their terminal-loss/recovery policy remains deferred; explicit completion does not implement general
-network-loss detection, customer-worker health classification, invocation draining or physical deletion.
+Completion, cancellation or failure before successful initialization retains the existing recovery
+rules and original never-linked deadline. Proxy shutdown does not independently select removal.
+The first terminal classification still wins, including when shutdown races with peer termination.
+Transient disruptions that do not terminate the relay session do not select removal. There is no
+new network-loss detector or timeout, customer-worker health classification, invocation draining or
+physical deletion.
 Local linked history stays retained; full published Runtime identity is still deferred.
 
 Runtime's `IWorkerChannelRegistry.UnlinkAsync` withdraws the channel locally, completes its
@@ -60,7 +64,7 @@ A timeout is reported to the caller, and caller cancellation still releases loca
 The worker ID remains terminal in either case. Peer transport failures are logged; unlink
 success means local removal, not proof of remote removal or physical deletion by Legion.
 Ordinary disposal and Runtime shutdown still abort calls without waiting for graceful close.
-No new endpoint, authentication implementation, forced exit, or network-loss policy is added.
+No new endpoint, authentication implementation, forced exit, or network-loss detector is added.
 
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.
 
