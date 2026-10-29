@@ -78,7 +78,8 @@ internal sealed partial class RpcClientFunctionInvocationDispatcher : IRpcClient
 
         // Keep the common path synchronous after the registry snapshot.
         ValueTask<IReadOnlyList<WorkerChannel>> readyChannels = _channelRegistry.GetReadyChannelsAsync();
-        if (readyChannels.IsCompletedSuccessfully && TryDispatchInvocation(invocationContext, readyChannels.Result))
+        if (readyChannels.IsCompletedSuccessfully &&
+            TryDispatchInvocation(invocationContext, readyChannels.Result, CancellationToken.None))
         {
             return Task.CompletedTask;
         }
@@ -86,7 +87,10 @@ internal sealed partial class RpcClientFunctionInvocationDispatcher : IRpcClient
         return InvokeWhenChannelIsReadyAsync(invocationContext, readyChannels);
     }
 
-    private bool TryDispatchInvocation(ScriptInvocationContext invocationContext, IReadOnlyList<WorkerChannel> channels)
+    private bool TryDispatchInvocation(
+        ScriptInvocationContext invocationContext,
+        IReadOnlyList<WorkerChannel> channels,
+        CancellationToken cancellationToken)
     {
         if (channels.Count == 0)
         {
@@ -98,7 +102,9 @@ internal sealed partial class RpcClientFunctionInvocationDispatcher : IRpcClient
             : (int)((uint)Interlocked.Increment(ref _nextChannelIndex) % (uint)channels.Count);
         for (int offset = 0; offset < channels.Count; offset++)
         {
-            if (channels[(startIndex + offset) % channels.Count] is not RpcClientWorkerChannel channel)
+            WorkerChannel candidate = channels[(startIndex + offset) % channels.Count];
+            cancellationToken.ThrowIfCancellationRequested();
+            if (candidate is not RpcClientWorkerChannel channel)
             {
                 continue;
             }
@@ -229,7 +235,7 @@ internal sealed partial class RpcClientFunctionInvocationDispatcher : IRpcClient
                 IReadOnlyList<WorkerChannel> channels = readyChannels.IsCompletedSuccessfully
                     ? readyChannels.Result
                     : await readyChannels.AsTask().WaitAsync(operationSource.Token);
-                if (TryDispatchInvocation(invocationContext, channels))
+                if (TryDispatchInvocation(invocationContext, channels, operationSource.Token))
                 {
                     return;
                 }

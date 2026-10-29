@@ -148,31 +148,9 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
 
     internal void CompleteRequests() => _requestWriter.TryComplete();
 
-    internal Task BeginDrain()
-    {
-        lock (_invocationAdmissionLock)
-        {
-            _scaleInReservationId = null;
-            if (!_draining)
-            {
-                Volatile.Write(ref _draining, true);
-                CompleteDrainIfReadyLocked();
-            }
-
-            return _drainCompletion.Task;
-        }
-    }
-
     internal bool TryDispatchInvocation(ScriptInvocationContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
-
-        string functionId = context.FunctionMetadata.GetFunctionId();
-        if (!FunctionInputBuffers.TryGetValue(functionId, out BufferBlock<ScriptInvocationContext> inputBuffer))
-        {
-            throw new InvalidOperationException(
-                $"Function '{context.FunctionMetadata.Name}' is not loaded by worker '{Id}'.");
-        }
 
         InvocationPermit permit = null;
         bool posted = false;
@@ -188,6 +166,13 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
                     !IsChannelReadyForInvocations())
                 {
                     return false;
+                }
+
+                string functionId = context.FunctionMetadata.GetFunctionId();
+                if (!FunctionInputBuffers.TryGetValue(functionId, out BufferBlock<ScriptInvocationContext> inputBuffer))
+                {
+                    throw new InvalidOperationException(
+                        $"Function '{context.FunctionMetadata.Name}' is not loaded by worker '{Id}'.");
                 }
 
                 Guid invocationId = context.ExecutionContext.InvocationId;

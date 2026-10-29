@@ -4,6 +4,8 @@ A local development tool for running the real Functions Host, WorkerProxy, and .
 
 The tool supplies no `host.json`. It sets the Host's existing read-only app-content option, so the unchanged Host uses defaults without writing that file.
 
+See [HTTP on-demand worker scale-in](HTTP-WORKER-SCALE-IN.md) for the reviewer guide to idle worker reservation, AppServer capacity fencing, invocation draining, and unlink ownership.
+
 ## Prerequisites
 
 - The repository's .NET SDK.

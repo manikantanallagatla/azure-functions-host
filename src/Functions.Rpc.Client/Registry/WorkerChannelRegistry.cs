@@ -444,46 +444,6 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
     }
 
-    internal Task<bool> DrainAsync(string workerId, CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(workerId);
-        cancellationToken.ThrowIfCancellationRequested();
-
-        Task<bool> drainTask;
-        Task invocationDrainTask;
-        TaskCompletionSource<bool> drainCompletion;
-        WorkerSlot slot;
-        lock (_stateLock)
-        {
-            if (_disposed || !_linkAttempts.TryGetValue(workerId, out slot))
-            {
-                return Task.FromResult(false);
-            }
-
-            if (slot.DrainTask is not null)
-            {
-                return slot.DrainTask.WaitAsync(cancellationToken);
-            }
-
-            RpcClientWorkerChannel channel = slot.Channel;
-            if (channel is null)
-            {
-                return Task.FromResult(false);
-            }
-
-            drainCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            drainTask = drainCompletion.Task;
-            slot.DrainTask = drainTask;
-            invocationDrainTask = channel.BeginDrain();
-            SignalReadyChannelsLocked();
-            SignalScaleInStateChangedLocked();
-        }
-
-        _ = CompleteDrainAsync(workerId, slot, invocationDrainTask, drainCompletion);
-
-        return drainTask.WaitAsync(cancellationToken);
-    }
-
     public bool TryGetInitializedChannel(string workerId, out WorkerChannel channel)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerId);
@@ -1097,7 +1057,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         // The initial link owns this gate before its slot is published.
         public SemaphoreSlim Gate { get; } = new(0, 1);
 
-        // The irreversible drain shared by repeated selection calls.
+        // The committed scale-in drain for this worker.
         public Task<bool> DrainTask { get; set; }
 
         // The recorded gRPC endpoint distinguishes exact retries from conflicting requests.

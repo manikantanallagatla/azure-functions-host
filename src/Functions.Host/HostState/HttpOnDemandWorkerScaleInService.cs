@@ -56,7 +56,7 @@ internal sealed partial class HttpOnDemandWorkerScaleInService(
         }
     }
 
-    private async Task<long> RunScaleInPassAsync(CancellationToken cancellationToken)
+    internal async Task<long> RunScaleInPassAsync(CancellationToken cancellationToken)
     {
         (AppServerHostStatePublishResult currentResult, HttpWorkerScaleInState publishedState) =
             await PublishCurrentUntilStableAsync(cancellationToken);

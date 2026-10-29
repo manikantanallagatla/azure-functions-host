@@ -1789,7 +1789,9 @@ public sealed partial class WorkerChannelRegistryTests
         }
     }
 
-    private static RpcClientWorkerChannelFactory CreateRealChannelFactory(IMetricsLogger metricsLogger = null)
+    private static RpcClientWorkerChannelFactory CreateRealChannelFactory(
+        IMetricsLogger metricsLogger = null,
+        TimeProvider timeProvider = null)
     {
         Mock<IScriptHostManager> hostManager = new();
         hostManager.As<IServiceProvider>()
@@ -1813,7 +1815,8 @@ public sealed partial class WorkerChannelRegistryTests
             Options.Create(new FunctionsHostingConfigOptions()),
             appCapabilitiesStore.Object,
             Mock.Of<IHttpProxyService>(),
-            metricsLogger ?? Mock.Of<IMetricsLogger>());
+            metricsLogger ?? Mock.Of<IMetricsLogger>(),
+            timeProvider);
     }
 
     private sealed class RegistryHarness
@@ -1823,11 +1826,21 @@ public sealed partial class WorkerChannelRegistryTests
         private readonly ConcurrentQueue<TestDuplexChannel<StreamingMessage>> _transports = new();
 
         public RegistryHarness()
-            : this(null)
+            : this(null, null)
         {
         }
 
         public RegistryHarness(TimeSpan? linkTimeout)
+            : this(linkTimeout, null)
+        {
+        }
+
+        public RegistryHarness(TimeProvider timeProvider)
+            : this(null, timeProvider)
+        {
+        }
+
+        private RegistryHarness(TimeSpan? linkTimeout, TimeProvider timeProvider)
         {
             DuplexFactory.Setup(factory => factory.ConnectAsync(It.IsAny<Uri>(), It.IsAny<CancellationToken>()))
                 .Returns((Uri endpoint, CancellationToken cancellationToken) =>
@@ -1859,15 +1872,29 @@ public sealed partial class WorkerChannelRegistryTests
                         throw new InvalidOperationException($"No test channel was configured for worker '{workerId}'.");
                     }
 
-                    RpcClientWorkerChannel channel = CreateRealChannelFactory(control.MetricsLogger.Object)
+                    RpcClientWorkerChannel channel = CreateRealChannelFactory(control.MetricsLogger.Object, timeProvider)
                         .Create(control.Id, ownedChannel);
                     control.Attach(channel);
 
                     return channel;
                 });
             Registry = linkTimeout.HasValue
-                ? new(DuplexFactory.Object, ChannelFactory.Object, NullLogger<WorkerChannelRegistry>.Instance, linkTimeout.Value)
-                : new(DuplexFactory.Object, ChannelFactory.Object, NullLogger<WorkerChannelRegistry>.Instance);
+                ? new(
+                    DuplexFactory.Object,
+                    ChannelFactory.Object,
+                    NullLogger<WorkerChannelRegistry>.Instance,
+                    linkTimeout.Value,
+                    timeProvider)
+                : timeProvider is not null
+                    ? new(
+                        DuplexFactory.Object,
+                        ChannelFactory.Object,
+                        NullLogger<WorkerChannelRegistry>.Instance,
+                        timeProvider)
+                    : new(
+                        DuplexFactory.Object,
+                        ChannelFactory.Object,
+                        NullLogger<WorkerChannelRegistry>.Instance);
         }
 
         internal Mock<IRpcClientWorkerChannelFactory> ChannelFactory { get; } = new();
@@ -1897,6 +1924,8 @@ public sealed partial class WorkerChannelRegistryTests
         private readonly TaskCompletionSource _startRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _setupEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _setupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly string _functionGroupName;
+        private readonly bool? _isAlwaysReady;
         private readonly Exception _setupFailure;
         private int _remainingSetupFailures;
         private int _setupAttempts;
@@ -1909,10 +1938,14 @@ public sealed partial class WorkerChannelRegistryTests
             bool blockDisposal = false,
             bool blockSetup = false,
             int setupFailureCount = 0,
-            Exception setupFailure = null)
+            Exception setupFailure = null,
+            string functionGroupName = null,
+            bool? isAlwaysReady = null)
         {
             Id = id;
             Transport = new(blockDisposal);
+            _functionGroupName = functionGroupName;
+            _isAlwaysReady = isAlwaysReady;
             _remainingSetupFailures = setupFailureCount;
             _setupFailure = setupFailure ?? new InvalidOperationException("Channel setup failed.");
             if (!blockStart)
@@ -2046,12 +2079,25 @@ public sealed partial class WorkerChannelRegistryTests
                     return;
                 }
 
+                WorkerInitResponse initResponse = new()
+                {
+                    Result = new() { Status = StatusResult.Types.Status.Success },
+                };
+                if (_functionGroupName is not null)
+                {
+                    initResponse.Capabilities.Add(RpcClientWorkerChannel.FunctionGroupNameCapability, _functionGroupName);
+                }
+
+                if (_isAlwaysReady.HasValue)
+                {
+                    initResponse.Capabilities.Add(
+                        RpcClientWorkerChannel.IsAlwaysReadyCapability,
+                        _isAlwaysReady.Value.ToString());
+                }
+
                 await Transport.SendResponseAsync(new StreamingMessage
                 {
-                    WorkerInitResponse = new WorkerInitResponse
-                    {
-                        Result = new() { Status = StatusResult.Types.Status.Success },
-                    },
+                    WorkerInitResponse = initResponse,
                 });
                 await Transport.Requests.Completion;
                 Transport.CompleteResponses();
