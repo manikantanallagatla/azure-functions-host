@@ -41,6 +41,6 @@ internal sealed record SplitWorkerOriginState(
             state.StartupTime,
             checked((int)state.Revision),
             SplitWorkerStatus.Starting,
-            state.AcceptedRuntime is { } runtime ? new(SplitWorkerLinkState.Linked, runtime) : Unlinked,
+            Unlinked,
             state.AssignmentState == WorkerAssignmentState.Failed);
 }

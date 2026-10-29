@@ -21,7 +21,7 @@ internal sealed record WorkerPodState(
     bool? IsAlwaysReady,
     DateTimeOffset StartupTime)
 {
-    public SplitPodIdentity? AcceptedRuntime { get; init; }
+    public bool HasAcceptedLink { get; init; }
 
     // WorkerId is recorded only after validated StartStream. Retaining it after termination does not imply readiness.
     public bool IsWorkerReady => IsWorkerAttached && WorkerId is not null;

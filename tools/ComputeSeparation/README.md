@@ -16,19 +16,22 @@ Do not enable it until runtime-to-WorkerProxy JWT/TLS authentication from Host P
 is integrated and protects the `WorkerLink/Accept` RPC as well as `FunctionRpc/EventStream`.
 This change does not implement authentication.
 
-For a compatible Runtime, the platform supplies `FUNCTIONS_RUNTIME_IDENTITY` as JSON with
-`resourceNamespace`, `podName`, `podGuid`, `legionStampName`, `podType` (`FunctionsSplitRuntimePod`),
-and `app` (`functionAppName`, numerical `functionAppSiteId`, `antaresStampName`).
-It is the Runtime's own exact pod/app identity, not customer-supplied configuration.
-The Runtime freezes that identity and acknowledges the successful initialization handshake on
-the same cached endpoint channel before publishing the initialized worker.
-Missing identity retains the legacy Link path; a lifecycle-enabled Proxy requires a compatible
-Runtime. Deploy both sides and authentication before opting in.
+An enabled WorkerProxy advertises `WorkerLinkAcceptance=True` in its successful
+`WorkerInitResponse`, replacing any customer-worker value. A compatible Runtime then
+acknowledges that initialization on the same cached endpoint channel before publishing the
+initialized worker. No Runtime identity setting or startup-time pairing is required.
+Disabled or older Proxies retain the legacy path without an acknowledgement call.
+Deploy a compatible Runtime and authentication before enabling the Proxy lifecycle protocol;
+an older Runtime does not send the acknowledgement.
 
 The acknowledgement is bound to the live stream pair's initialization request ID. Matching
-replay does not advance state; a different Runtime or a stale/failed handshake is rejected.
-WorkerProxy publishes historical `Linked` without promoting the worker to serving capacity.
-Once accepted, the Runtime identity survives transport loss and the Proxy cannot be retargeted.
+replay does not advance state; a stale/failed handshake is rejected.
+WorkerProxy retains only a local accepted-Link fact, including after transport loss, and
+cannot be retargeted after acceptance. Acceptance does not promote serving readiness.
+Publishing historical `link.runtime` requires authoritative full Runtime identity delivery
+and is deliberately deferred: the existing public `link` projection remains unchanged
+(`Unlinked`, with no Runtime identity). This local acknowledgement is only the W1 foundation,
+not completion of the full published Link lifecycle contract.
 Never-linked timeout/removal is not implemented by this protocol change.
 
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.

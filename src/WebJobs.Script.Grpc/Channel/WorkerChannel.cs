@@ -222,6 +222,11 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
         /// </summary>
         protected string WorkerInitializationRequestId { get; } = Guid.NewGuid().ToString();
 
+        /// <summary>
+        /// Gets the advertised state of a worker capability.
+        /// </summary>
+        protected string GetWorkerCapabilityState(string capability) => _workerCapabilities.GetCapabilityState(capability);
+
         internal List<IDisposable> EventSubscriptions => _eventSubscriptions;
 
         internal RpcWorkerChannelState State

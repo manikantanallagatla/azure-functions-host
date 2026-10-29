@@ -42,8 +42,11 @@ internal sealed class WorkerPodStateManager
         ArgumentException.ThrowIfNullOrWhiteSpace(podName);
 
         _timeProvider = timeProvider;
+        LinkLifecycleEnabled = options.Value.EnableLinkLifecycle;
         _state = WorkerPodState.CreateUnassigned(podName, _timeProvider.GetUtcNow());
     }
+
+    internal bool LinkLifecycleEnabled { get; }
 
     /// <summary>
     /// Gets the current immutable state without incrementing its revision.
@@ -190,29 +193,27 @@ internal sealed class WorkerPodStateManager
     }
 
     /// <summary>
-    /// Commits accepted attachment history without changing serving readiness.
+    /// Records completed Link acceptance locally without changing published identity or serving readiness.
     /// </summary>
-    public bool AcceptLink(long sessionId, SplitPodIdentity runtime)
+    public bool AcceptLink(long sessionId)
     {
         lock (_stateLock)
         {
             if (_state.SessionId != sessionId || !_state.IsWorkerReady ||
-                _state.AssignmentState == WorkerAssignmentState.Failed ||
-                (_state.FunctionAppName is { } appName &&
-                 !string.Equals(appName, runtime.App.FunctionAppName, StringComparison.Ordinal)))
+                _state.AssignmentState == WorkerAssignmentState.Failed)
             {
                 return false;
             }
 
-            if (_state.AcceptedRuntime is not null)
+            if (_state.HasAcceptedLink)
             {
-                return _state.AcceptedRuntime == runtime;
+                return true;
             }
 
             UpdateStateAndNotifyWaitersLocked(_state with
             {
                 Revision = checked(_state.Revision + 1),
-                AcceptedRuntime = runtime
+                HasAcceptedLink = true
             });
             return true;
         }
@@ -264,12 +265,6 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
-            if (_state.AcceptedRuntime is { } runtime &&
-                !string.Equals(runtime.App.FunctionAppName, assignment.FunctionAppName, StringComparison.Ordinal))
-            {
-                return WorkerAssignmentResult.AssignmentConflict;
-            }
-
             // Replay/conflict takes precedence over current readiness, including after the assigned stream terminates.
             if (_assignment is not null)
             {

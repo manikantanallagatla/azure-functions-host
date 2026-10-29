@@ -24,7 +24,7 @@ internal sealed class WorkerProxyOptions
 
     /// <summary>
     /// Gets or sets whether to enable the new Link lifecycle protocol.
-    /// Keep disabled until compatible Runtime identity and runtime-to-proxy authentication are deployed.
+    /// Keep disabled until a compatible Runtime and runtime-to-proxy authentication are deployed.
     /// </summary>
     public bool EnableLinkLifecycle { get; set; }
 

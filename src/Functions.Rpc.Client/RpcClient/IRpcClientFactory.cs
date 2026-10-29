@@ -34,7 +34,7 @@ internal interface IRpcClientFactory : IAsyncDisposable
     /// Acknowledges initialization on the same cached endpoint channel.
     /// </summary>
     /// <param name="endpoint">The worker's runtime-facing endpoint.</param>
-    /// <param name="request">The initialized attachment and runtime identity.</param>
+    /// <param name="request">The current initialization request ID.</param>
     /// <param name="cancellationToken">The Link operation's deadline and cancellation.</param>
     /// <returns>A task completed after WorkerProxy accepts the link.</returns>
     Task AcceptLinkAsync(Uri endpoint, AcceptLinkRequest request, CancellationToken cancellationToken);
