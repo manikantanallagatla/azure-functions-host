@@ -23,6 +23,12 @@ internal sealed class WorkerProxyOptions
     public string PodName { get; set; } = string.Empty;
 
     /// <summary>
+    /// Gets or sets whether to enable the new Link lifecycle protocol.
+    /// Keep disabled until compatible Runtime identity and runtime-to-proxy authentication are deployed.
+    /// </summary>
+    public bool EnableLinkLifecycle { get; set; }
+
+    /// <summary>
     /// Gets or sets the HTTP/1 management listener port.
     /// </summary>
     public int ManagementPort { get; set; } = 80;

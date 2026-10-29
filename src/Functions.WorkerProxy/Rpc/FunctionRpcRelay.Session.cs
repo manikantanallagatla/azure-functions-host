@@ -41,6 +41,8 @@ internal sealed partial class FunctionRpcRelay
         private Uri? _workerHttpDestination;
         private bool _runtimeAttached;
         private bool _workerAttached;
+        private string? _initializationId;
+        private bool _initialized;
 
         /// <summary>
         /// Gets the terminal state recorded for this session, or <see langword="null"/> if the session has not terminated.
@@ -120,6 +122,16 @@ internal sealed partial class FunctionRpcRelay
             lock (_stateLock)
             {
                 return IsAttachedLocked(side);
+            }
+        }
+
+        public bool AcceptLink(string initializationId, SplitPodIdentity runtime)
+        {
+            lock (_stateLock)
+            {
+                return _terminalState is null && _runtimeAttached && _workerAttached && _initialized &&
+                    string.Equals(_initializationId, initializationId, StringComparison.Ordinal) &&
+                    stateManager.AcceptLink(id, runtime);
             }
         }
 
@@ -230,6 +242,19 @@ internal sealed partial class FunctionRpcRelay
         {
             if (side != FunctionRpcRelaySide.Worker)
             {
+                if (message.WorkerInitRequest is not null)
+                {
+                    lock (_stateLock)
+                    {
+                        if (_terminalState is not null)
+                        {
+                            return null;
+                        }
+
+                        _initializationId ??= message.RequestId;
+                    }
+                }
+
                 return message;
             }
 
@@ -287,6 +312,8 @@ internal sealed partial class FunctionRpcRelay
                     // Publish the real destination before the rewritten response can reach the runtime.
                     _capabilities = capabilities;
                     _workerHttpDestination = destination;
+                    _initialized = string.Equals(message.RequestId, _initializationId, StringComparison.Ordinal) &&
+                        !string.IsNullOrWhiteSpace(_initializationId);
                 }
             }
             else

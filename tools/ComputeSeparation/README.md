@@ -9,6 +9,28 @@ The tool supplies no `host.json`. It sets the Host's existing read-only app-cont
 - The repository's .NET SDK.
 - For container deployment only, a running Linux x64 Docker engine with Docker Compose.
 
+### Staged Link lifecycle protocol
+
+The new lifecycle protocol is **disabled by default** (`WorkerProxy:EnableLinkLifecycle=false`).
+Do not enable it until runtime-to-WorkerProxy JWT/TLS authentication from Host PR #12103
+is integrated and protects the `WorkerLink/Accept` RPC as well as `FunctionRpc/EventStream`.
+This change does not implement authentication.
+
+For a compatible Runtime, the platform supplies `FUNCTIONS_RUNTIME_IDENTITY` as JSON with
+`resourceNamespace`, `podName`, `podGuid`, `legionStampName`, `podType` (`FunctionsSplitRuntimePod`),
+and `app` (`functionAppName`, numerical `functionAppSiteId`, `antaresStampName`).
+It is the Runtime's own exact pod/app identity, not customer-supplied configuration.
+The Runtime freezes that identity and acknowledges the successful initialization handshake on
+the same cached endpoint channel before publishing the initialized worker.
+Missing identity retains the legacy Link path; a lifecycle-enabled Proxy requires a compatible
+Runtime. Deploy both sides and authentication before opting in.
+
+The acknowledgement is bound to the live stream pair's initialization request ID. Matching
+replay does not advance state; a different Runtime or a stale/failed handshake is rejected.
+WorkerProxy publishes historical `Linked` without promoting the worker to serving capacity.
+Once accepted, the Runtime identity survives transport loss and the Proxy cannot be retargeted.
+Never-linked timeout/removal is not implemented by this protocol change.
+
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.
 
 Run the commands below from the repository root.

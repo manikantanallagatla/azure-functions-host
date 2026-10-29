@@ -35,6 +35,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
     private readonly ILogger<WorkerChannelRegistry> _logger;
     private readonly Dictionary<string, WorkerSlot> _linkAttempts = new(StringComparer.Ordinal);
     private readonly TimeSpan _linkTimeout;
+    private readonly WorkerLinkAcceptance _acceptance;
     private readonly HashSet<Task> _monitorTasks = [];
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Dictionary<string, WorkerSlot> _slots = new(StringComparer.Ordinal);
@@ -53,6 +54,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         ILogger<WorkerChannelRegistry> logger)
         : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout)
     {
+    }
+
+    public WorkerChannelRegistry(
+        IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
+        IRpcClientWorkerChannelFactory channelFactory,
+        ILogger<WorkerChannelRegistry> logger,
+        WorkerLinkAcceptance acceptance)
+        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout)
+    {
+        _acceptance = acceptance ?? throw new ArgumentNullException(nameof(acceptance));
     }
 
     internal WorkerChannelRegistry(
@@ -176,6 +187,11 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                 }
 
                 operationSource.Token.ThrowIfCancellationRequested();
+                if (_acceptance is not null)
+                {
+                    await _acceptance.AcceptAsync(grpcEndpoint, candidate.LinkInitializationId, operationSource.Token);
+                }
+
                 RegisterInitializedChannel(workerId, slot, candidate, operationSource.Token);
 
                 WorkerChannel linkedChannel = candidate;

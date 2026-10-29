@@ -190,6 +190,35 @@ internal sealed class WorkerPodStateManager
     }
 
     /// <summary>
+    /// Commits accepted attachment history without changing serving readiness.
+    /// </summary>
+    public bool AcceptLink(long sessionId, SplitPodIdentity runtime)
+    {
+        lock (_stateLock)
+        {
+            if (_state.SessionId != sessionId || !_state.IsWorkerReady ||
+                _state.AssignmentState == WorkerAssignmentState.Failed ||
+                (_state.FunctionAppName is { } appName &&
+                 !string.Equals(appName, runtime.App.FunctionAppName, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            if (_state.AcceptedRuntime is not null)
+            {
+                return _state.AcceptedRuntime == runtime;
+            }
+
+            UpdateStateAndNotifyWaitersLocked(_state with
+            {
+                Revision = checked(_state.Revision + 1),
+                AcceptedRuntime = runtime
+            });
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Withdraws readiness on relay termination or worker detachment. Old notifications have no effect.
     /// </summary>
     public bool OnSessionTerminated(long sessionId)
@@ -235,6 +264,12 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
+            if (_state.AcceptedRuntime is { } runtime &&
+                !string.Equals(runtime.App.FunctionAppName, assignment.FunctionAppName, StringComparison.Ordinal))
+            {
+                return WorkerAssignmentResult.AssignmentConflict;
+            }
+
             // Replay/conflict takes precedence over current readiness, including after the assigned stream terminates.
             if (_assignment is not null)
             {

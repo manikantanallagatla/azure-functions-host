@@ -30,6 +30,9 @@
 
   <ItemGroup>
     <Protobuf
+      Include="..\WebJobs.Script.Grpc\Protos\WorkerLink.proto"
+      GrpcServices="server" />
+    <Protobuf
       Include="..\WebJobs.Script.Grpc\azure-functions-language-worker-protobuf\src\proto\**\*.proto"
       GrpcServices="server"
       ProtoRoot="..\WebJobs.Script.Grpc\azure-functions-language-worker-protobuf\src\proto" />

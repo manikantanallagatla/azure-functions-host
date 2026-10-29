@@ -217,6 +217,11 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
         /// </summary>
         protected Task<bool> WorkerInitialization => _workerInitTask.Task;
 
+        /// <summary>
+        /// Gets the correlation ID of this channel's initialization handshake.
+        /// </summary>
+        protected string WorkerInitializationRequestId { get; } = Guid.NewGuid().ToString();
+
         internal List<IDisposable> EventSubscriptions => _eventSubscriptions;
 
         internal RpcWorkerChannelState State
@@ -528,6 +533,7 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
 
             SendStreamingMessage(new StreamingMessage
             {
+                RequestId = WorkerInitializationRequestId,
                 WorkerInitRequest = initRequest
             });
         }

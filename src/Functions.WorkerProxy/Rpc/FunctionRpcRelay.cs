@@ -107,6 +107,17 @@ internal sealed partial class FunctionRpcRelay(
     }
 
     /// <summary>
+    /// Accepts only the initialized, live stream pair that produced the supplied handshake ID.
+    /// </summary>
+    internal bool AcceptLink(string initializationId, SplitPodIdentity runtime)
+    {
+        lock (_syncLock)
+        {
+            return !_stopping && _currentSession?.AcceptLink(initializationId, runtime) == true;
+        }
+    }
+
+    /// <summary>
     /// Attaches one gRPC duplex stream to the current relay session.
     /// </summary>
     /// <param name="side">The role owned by the listener accepting the stream.</param>
@@ -136,6 +147,12 @@ internal sealed partial class FunctionRpcRelay(
             if (_currentSession?.IsTerminalAndReleased == true)
             {
                 ClearCurrentSessionLocked();
+            }
+
+            if (_currentSession is null && _stateManager.State.AcceptedRuntime is not null)
+            {
+                throw new FunctionRpcRelayAttachmentException(side, FunctionRpcRelayAttachmentFailure.PreviousSessionTearingDown,
+                    "An accepted attachment cannot be replaced in this WorkerProxy.");
             }
 
             session = _currentSession ??= new FunctionRpcRelaySession(
