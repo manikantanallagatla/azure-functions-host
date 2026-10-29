@@ -38,19 +38,23 @@ assignment and Link/stream admission. Management readiness
 and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.
 There is no forced process exit or new drain behavior here.
 
-### Initialized connection termination
+### Terminal connection cleanup
 
-A Proxy with successfully initialized linked history also requests sticky removal when Runtime or the
-customer worker explicitly completes its gRPC request stream, or the relay terminates the attachment
+A Proxy with an accepted assignment or successfully initialized linked history also requests sticky
+removal when Runtime or the customer worker explicitly completes its gRPC request stream, or the relay terminates the attachment
 through call cancellation or a stream-operation failure. This uses the existing `PeerClosed`, `Canceled`
 and `Faulted` classifications, not a new inference of process death. These terminal states already
-tear down the stream pair, and an initialized attachment cannot be replaced in the same Proxy.
+tear down the stream pair. An initialized attachment cannot be replaced in the same Proxy; an assigned
+session's termination already makes its assignment permanently failed, even before initialization.
 Removal therefore retires an otherwise unusable pod.
 Readiness withdrawal and removal publication share one state update. Existing removal
 handling closes new assignment, Link/stream and HTTP admission while management stays alive.
 
-Completion, cancellation or failure before successful initialization retains the existing recovery
-rules and original never-linked deadline. Proxy shutdown does not independently select removal.
+An assigned Proxy therefore requests removal immediately when its relay terminates, without waiting
+for the never-linked deadline. A failed initialization response alone does not select removal while
+the relay remains live.
+Unassigned sessions without successful initialization retain their existing recovery rules and
+original never-linked deadline. Proxy shutdown does not independently select removal.
 The first terminal classification still wins, including when shutdown races with peer termination.
 Transient disruptions that do not terminate the relay session do not select removal. There is no
 new network-loss detector or timeout, customer-worker health classification, invocation draining or

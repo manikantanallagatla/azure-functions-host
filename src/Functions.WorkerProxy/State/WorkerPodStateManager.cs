@@ -233,7 +233,7 @@ internal sealed class WorkerPodStateManager
     public bool OnSessionTerminated(long sessionId) => OnSessionTerminated(sessionId, peerTerminated: false);
 
     /// <summary>
-    /// Also requests removal when an initialized attachment ends through peer completion, cancellation, or failure.
+    /// Also requests removal when an assigned or initialized attachment ends through peer completion, cancellation, or failure.
     /// </summary>
     public bool OnSessionTerminated(long sessionId, bool peerTerminated)
     {
@@ -262,8 +262,9 @@ internal sealed class WorkerPodStateManager
             {
                 Revision = checked(_state.Revision + 1),
                 IsWorkerAttached = false,
-                RemovalRequested = _state.RemovalRequested || (peerTerminated && _state.HasAcceptedLink),
-                // Preserve assignment identity so equivalent retries report failure and different assignments still conflict.
+                RemovalRequested = _state.RemovalRequested ||
+                    (peerTerminated && (_state.HasAcceptedLink || _assignment is not null)),
+                // Preserve assignment identity; a terminal assignment cannot be retried or retargeted.
                 AssignmentState = _assignment is null ? WorkerAssignmentState.Unassigned : WorkerAssignmentState.Failed
             });
             return true;
