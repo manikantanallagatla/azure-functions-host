@@ -14,8 +14,10 @@ using System.Threading.Tasks;
 using Azure.Functions.Host.Models;
 using Azure.Functions.Host.WorkerLink;
 using Azure.Functions.Rpc.Client;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies;
 using Microsoft.Extensions.Logging;
 using GrpcException = Grpc.Core.RpcException;
 using WorkerRpcException = Microsoft.Azure.WebJobs.Script.Workers.Rpc.RpcException;
@@ -75,7 +77,7 @@ public sealed partial class WorkerLinkController : Controller
     /// </remarks>
     [HttpPut]
     [Route("admin/workers/{workerId}")]
-    // [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+    [Authorize(Policy = PolicyNames.AdminAuthLevel)]
     public async Task<IActionResult> LinkWorker([FromRoute] string workerId, [FromBody] WorkerLinkRequest? request,
         CancellationToken cancellationToken = default)
     {
@@ -89,7 +91,7 @@ public sealed partial class WorkerLinkController : Controller
             return BadRequest(new RequestValidationResponse(errors));
         }
 
-        return await LinkValidatedWorkerAsync(workerId, grpcEndpoint, started, cancellationToken);
+        return await LinkValidatedWorkerAsync(workerId, grpcEndpoint, request!.Worker, started, cancellationToken);
     }
 
     private IReadOnlyList<RequestValidationError> ValidateRequest(string workerId, WorkerLinkRequest? request,
@@ -119,17 +121,35 @@ public sealed partial class WorkerLinkController : Controller
                 : new(ErrorCodes.InvalidEndpoint, "workerGrpcEndpoint"));
         }
 
+        if (request.Worker is not null)
+        {
+            if (!request.Worker.IsValid())
+            {
+                errors.Add(new(ErrorCodes.InvalidWorkerIdentity, "worker"));
+            }
+            else if (!string.Equals(workerId, request.Worker.PodName, StringComparison.Ordinal))
+            {
+                errors.Add(new(ErrorCodes.WorkerIdentityMismatch, "worker.podName"));
+            }
+        }
+
         return errors;
     }
 
     // Wait for initialization and registration, then map the outcome to an HTTP response.
-    private async Task<IActionResult> LinkValidatedWorkerAsync(string workerId, Uri grpcEndpoint, long started,
+    private async Task<IActionResult> LinkValidatedWorkerAsync(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity? worker,
+        long started,
         CancellationToken cancellationToken)
     {
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            WorkerLinkResult result = await _registry.LinkAsync(workerId, grpcEndpoint, cancellationToken);
+            WorkerLinkResult result = worker is null
+                ? await _registry.LinkAsync(workerId, grpcEndpoint, cancellationToken)
+                : await _registry.LinkAsync(workerId, grpcEndpoint, worker, cancellationToken);
             Log.LinkAccepted(_logger, workerId, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
             return StatusCode(result.IsNewLink ? StatusCodes.Status201Created : StatusCodes.Status200OK);
@@ -198,10 +218,12 @@ public sealed partial class WorkerLinkController : Controller
     {
         public const string InvalidBody = nameof(InvalidBody);
         public const string InvalidEndpoint = nameof(InvalidEndpoint);
+        public const string InvalidWorkerIdentity = nameof(InvalidWorkerIdentity);
         public const string LinkConflict = nameof(LinkConflict);
         public const string LinkTimeout = nameof(LinkTimeout);
         public const string Required = nameof(Required);
         public const string RuntimeStopping = nameof(RuntimeStopping);
+        public const string WorkerIdentityMismatch = nameof(WorkerIdentityMismatch);
         public const string WorkerTerminated = nameof(WorkerTerminated);
         public const string WorkerUnavailable = nameof(WorkerUnavailable);
     }

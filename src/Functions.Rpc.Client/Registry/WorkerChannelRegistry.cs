@@ -27,22 +27,29 @@ namespace Azure.Functions.Rpc.Client;
 /// </remarks>
 internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager
 {
+    private const int CompletedWorkerRemovalCapacity = 128;
     private const int DefaultHttpWorkerCapacity = 16;
+    private const string UnlinkRemovalReason = "RuntimeUnlink";
 
     private static readonly TimeSpan DefaultLinkTimeout = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan UnlinkTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan DefaultUnlinkTimeout = TimeSpan.FromSeconds(10);
 
     private readonly IRpcClientWorkerChannelFactory _channelFactory;
+    private readonly HashSet<FunctionsSplitWorkerRemovalAction> _completedWorkerRemovals = [];
+    private readonly Queue<FunctionsSplitWorkerRemovalAction> _completedWorkerRemovalOrder = [];
     private readonly Lock _disposeLock = new();
     private readonly IDuplexChannelFactory<StreamingMessage> _duplexChannelFactory;
     private readonly ILogger<WorkerChannelRegistry> _logger;
     private readonly Dictionary<string, WorkerSlot> _linkAttempts = new(StringComparer.Ordinal);
     private readonly TimeSpan _linkTimeout;
     private readonly HashSet<Task> _monitorTasks = [];
+    private readonly List<FunctionsSplitWorkerRemovalAction> _outstandingWorkerRemovals = [];
+    private readonly HashSet<FunctionsSplitWorkerRemovalAction> _outstandingWorkerRemovalSet = [];
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Dictionary<string, WorkerSlot> _slots = new(StringComparer.Ordinal);
     private readonly Lock _stateLock = new();
     private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _unlinkTimeout;
     private ChannelSetupContext _activeSetupContext;
     private Task _disposeTask;
     private bool _disposed;
@@ -78,7 +85,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger,
         TimeSpan linkTimeout,
-        TimeProvider timeProvider = null)
+        TimeProvider timeProvider = null,
+        TimeSpan? unlinkTimeout = null)
     {
         _duplexChannelFactory = duplexChannelFactory ?? throw new ArgumentNullException(nameof(duplexChannelFactory));
         _channelFactory = channelFactory ?? throw new ArgumentNullException(nameof(channelFactory));
@@ -87,6 +95,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(linkTimeout, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(linkTimeout.TotalMilliseconds, uint.MaxValue - 1);
         _linkTimeout = linkTimeout;
+        _unlinkTimeout = unlinkTimeout ?? DefaultUnlinkTimeout;
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_unlinkTimeout, TimeSpan.Zero);
         _scaleInStateCreatedTime = _timeProvider.GetUtcNow();
     }
 
@@ -114,10 +124,64 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
     }
 
+    WorkerRemovalAcknowledgementResult IHttpWorkerScaleInManager.AcknowledgeWorkerRemoval(
+        FunctionsSplitWorkerRemovalAction action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        if (!action.IsValid())
+        {
+            throw new ArgumentException("The worker-removal action is incomplete or invalid.", nameof(action));
+        }
+
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_outstandingWorkerRemovalSet.Remove(action))
+            {
+                _outstandingWorkerRemovals.Remove(action);
+                AddCompletedWorkerRemovalLocked(action);
+                SignalScaleInStateChangedLocked();
+
+                return WorkerRemovalAcknowledgementResult.Accepted;
+            }
+
+            return _completedWorkerRemovals.Contains(action)
+                ? WorkerRemovalAcknowledgementResult.Duplicate
+                : WorkerRemovalAcknowledgementResult.NotFound;
+        }
+    }
+
     public Task<WorkerLinkResult> LinkAsync(
         string workerId,
         Uri grpcEndpoint,
         CancellationToken cancellationToken = default)
+        => LinkAsyncCore(workerId, grpcEndpoint, worker: null, cancellationToken);
+
+    public Task<WorkerLinkResult> LinkAsync(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity worker,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(worker);
+        if (!worker.IsValid())
+        {
+            throw new ArgumentException("The worker identity is incomplete or invalid.", nameof(worker));
+        }
+
+        if (!string.Equals(workerId, worker.PodName, StringComparison.Ordinal))
+        {
+            throw new ArgumentException("The route worker ID must exactly match the worker pod name.", nameof(worker));
+        }
+
+        return LinkAsyncCore(workerId, grpcEndpoint, worker, cancellationToken);
+    }
+
+    private Task<WorkerLinkResult> LinkAsyncCore(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity worker,
+        CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerId);
         RpcClientFactory.ValidateEndpoint(grpcEndpoint);
@@ -136,6 +200,15 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                         "The worker is already associated with a different gRPC endpoint.");
                 }
 
+                if (worker is not null)
+                {
+                    if (existing.Worker is null || existing.Worker != worker)
+                    {
+                        throw new WorkerLinkException(WorkerLinkFailureReason.Conflict,
+                            "The worker is already associated with a different physical identity.");
+                    }
+                }
+
                 if (existing.Terminal || existing.Channel is { IsTerminated: true })
                 {
                     throw new WorkerLinkException(WorkerLinkFailureReason.WorkerTerminated,
@@ -146,7 +219,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             }
 
             linkCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            slot = new() { Endpoint = grpcEndpoint, LinkTask = linkCompletion.Task };
+            slot = new() { Endpoint = grpcEndpoint, LinkTask = linkCompletion.Task, Worker = worker };
             _slots.Add(workerId, slot);
             _linkAttempts.Add(workerId, slot);
         }
@@ -380,6 +453,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
 
         bool channelDetached = false;
+        bool primaryHandoffConfirmed = false;
         try
         {
             using CancellationTokenSource operationSource =
@@ -415,7 +489,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                         channel.FailCommittedInvocations(exception: null);
                         channel.CompleteRequests();
                         // Wait for peer termination without treating its final gRPC status as an unlink failure.
-                        await Task.WhenAny(channel.Completion).WaitAsync(UnlinkTimeout, operationSource.Token);
+                        await Task.WhenAny(channel.Completion).WaitAsync(_unlinkTimeout, operationSource.Token);
+                        primaryHandoffConfirmed = true;
                         if (channel.Completion.IsFaulted)
                         {
                             Log.ChannelFailed(_logger, channel.Completion.Exception, workerId);
@@ -429,6 +504,11 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                     failure = await channel.DisposeAndCaptureExceptionAsync(failure);
                     if (failure is not null)
                     {
+                        if (!primaryHandoffConfirmed && !_shutdownSource.IsCancellationRequested)
+                        {
+                            AddOutstandingWorkerRemoval(slot);
+                        }
+
                         ExceptionDispatchInfo.Capture(failure).Throw();
                     }
 
@@ -953,7 +1033,47 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             _scaleInStateCreatedTime,
             _scaleInHttpCapacity,
             _scaleInLinkedWorkerCount,
-            _scaleInStateVersion);
+            _scaleInStateVersion)
+        {
+            OutstandingWorkerRemovals = [.. _outstandingWorkerRemovals],
+        };
+    }
+
+    private void AddOutstandingWorkerRemoval(WorkerSlot slot)
+    {
+        if (slot.Worker is null)
+        {
+            Log.WorkerRemovalFallbackUnavailable(_logger, slot.Endpoint);
+            return;
+        }
+
+        FunctionsSplitWorkerRemovalAction action = new(slot.Worker, UnlinkRemovalReason);
+        lock (_stateLock)
+        {
+            if (_completedWorkerRemovals.Contains(action) || !_outstandingWorkerRemovalSet.Add(action))
+            {
+                return;
+            }
+
+            _outstandingWorkerRemovals.Add(action);
+            SignalScaleInStateChangedLocked();
+        }
+
+        Log.WorkerRemovalFallbackAdded(_logger, slot.Worker.PodName, slot.Worker.PodGuid);
+    }
+
+    private void AddCompletedWorkerRemovalLocked(FunctionsSplitWorkerRemovalAction action)
+    {
+        if (!_completedWorkerRemovals.Add(action))
+        {
+            return;
+        }
+
+        _completedWorkerRemovalOrder.Enqueue(action);
+        while (_completedWorkerRemovalOrder.Count > CompletedWorkerRemovalCapacity)
+        {
+            _completedWorkerRemovals.Remove(_completedWorkerRemovalOrder.Dequeue());
+        }
     }
 
     private (long HttpCapacity, int LinkedWorkerCount) ComputeScaleInStateLocked()
@@ -1073,6 +1193,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         // Indicates that a previously accepted link has terminated and cannot be replayed.
         public bool Terminal { get; set; }
+
+        // The authoritative physical identity is set at most once and retained after channel withdrawal.
+        public FunctionsSplitPodIdentity Worker { get; set; }
     }
 
     private sealed record ChannelSetupContext(
@@ -1099,5 +1222,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         [LoggerMessage(5, LogLevel.Warning, "Failed to configure client-backed worker {WorkerId} for the active ScriptHost.")]
         public static partial void ChannelSetupFailed(ILogger logger, Exception exception, string workerId);
+
+        [LoggerMessage(6, LogLevel.Warning,
+            "Published fallback removal for worker {WorkerId} incarnation {WorkerPodGuid} after an uncertain graceful unlink.")]
+        public static partial void WorkerRemovalFallbackAdded(ILogger logger, string workerId, Guid workerPodGuid);
+
+        [LoggerMessage(7, LogLevel.Warning,
+            "Cannot publish fallback removal after an uncertain graceful unlink for endpoint {WorkerEndpoint} because the link omitted exact worker identity.")]
+        public static partial void WorkerRemovalFallbackUnavailable(ILogger logger, Uri workerEndpoint);
     }
 }

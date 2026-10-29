@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -51,6 +52,13 @@ public interface IHttpWorkerScaleInManager
     /// <param name="reservation">The reservation to cancel.</param>
     /// <returns><see langword="true"/> when the reservation was canceled.</returns>
     bool CancelReservation(HttpWorkerScaleInReservation reservation);
+
+    /// <summary>
+    /// Atomically acknowledges one exact outstanding worker-removal action.
+    /// </summary>
+    /// <param name="action">The exact immutable action published by this Runtime process.</param>
+    /// <returns>The exact-match or bounded duplicate-replay result.</returns>
+    WorkerRemovalAcknowledgementResult AcknowledgeWorkerRemoval(FunctionsSplitWorkerRemovalAction action);
 }
 
 /// <summary>
@@ -64,7 +72,13 @@ public sealed record HttpWorkerScaleInState(
     DateTimeOffset CreatedTime,
     long HttpCapacity,
     int LinkedWorkerCount,
-    long Version);
+    long Version)
+{
+    /// <summary>
+    /// Gets the exact worker-removal actions still awaiting Legion acknowledgement.
+    /// </summary>
+    public IReadOnlyList<FunctionsSplitWorkerRemovalAction> OutstandingWorkerRemovals { get; init; } = [];
+}
 
 /// <summary>
 /// Represents one reversible Host-local reservation made before AppServer accepts the capacity reduction.

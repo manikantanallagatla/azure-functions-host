@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -55,7 +56,11 @@ internal sealed class AppServerHostStateClient(
         using HttpRequestMessage request = new(HttpMethod.Put, GetHostStateUri())
         {
             Content = JsonContent.Create(
-                new HostStateRequest(state.CreatedTime, state.LinkedWorkerCount, state.HttpCapacity),
+                new HostStateRequest(
+                    state.CreatedTime,
+                    state.LinkedWorkerCount,
+                    state.HttpCapacity,
+                    state.OutstandingWorkerRemovals),
                 AppServerHostStateJsonContext.Default.HostStateRequest),
         };
         request.Headers.Add(ScriptConstants.ContainerInstanceHeader, _containerName);
@@ -98,7 +103,8 @@ internal sealed class AppServerHostStateClient(
     internal sealed record HostStateRequest(
         DateTimeOffset CreatedTime,
         int LinkedWorkerCount,
-        long HttpCapacity);
+        long HttpCapacity,
+        IReadOnlyList<FunctionsSplitWorkerRemovalAction> OutstandingWorkerRemovals);
 }
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]

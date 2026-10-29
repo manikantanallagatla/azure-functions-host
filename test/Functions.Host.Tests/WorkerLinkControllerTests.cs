@@ -50,12 +50,18 @@ public class WorkerLinkControllerTests
         using CancellationTokenSource cancellation = new();
         TaskCompletionSource<WorkerLinkResult> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         CancellationToken registryToken = default;
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(grpcEndpoint), It.IsAny<CancellationToken>()))
-            .Callback<string, Uri, CancellationToken>((_, _, token) => registryToken = token)
+        FunctionsSplitPodIdentity worker = CreateWorkerIdentity(WorkerId);
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(grpcEndpoint),
+                worker,
+                It.IsAny<CancellationToken>()))
+            .Callback<string, Uri, FunctionsSplitPodIdentity, CancellationToken>((_, _, _, token) => registryToken = token)
             .Returns(completion.Task);
         WorkerLinkRequest request = ValidRequest();
         request.WorkerGrpcEndpoint = grpcEndpoint;
         request.WorkerContainerEncryptionKey = "reserved-test-value";
+        request.Worker = worker;
 
         Task<IActionResult> link = CreateController().LinkWorker(WorkerId, request, cancellation.Token);
         Assert.True(registryToken.CanBeCanceled);
@@ -65,7 +71,12 @@ public class WorkerLinkControllerTests
         completion.SetResult(new(null!, IsNewLink: true));
         StatusCodeResult result = Assert.IsType<StatusCodeResult>(await link);
         Assert.Equal(StatusCodes.Status201Created, result.StatusCode);
-        VerifyOnlyLinkCall();
+        _registry.Verify(registry => registry.LinkAsync(
+            WorkerId,
+            new Uri(grpcEndpoint),
+            worker,
+            cancellation.Token), Times.Once);
+        _registry.VerifyNoOtherCalls();
     }
 
     [Theory]
@@ -445,6 +456,15 @@ public class WorkerLinkControllerTests
     private static WorkerLinkRequest ValidRequest()
         => new() { WorkerGrpcEndpoint = ValidGrpcEndpoint };
 
+    private static FunctionsSplitPodIdentity CreateWorkerIdentity(string workerId)
+        => new(
+            "resource-namespace",
+            workerId,
+            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191e7"),
+            "legion-stamp",
+            FunctionsSplitPodIdentity.WorkerPodType,
+            new("app-name", 123, "antares-stamp"));
+
     private static IReadOnlyList<RequestValidationError> AssertBadRequest(IActionResult result)
     {
         var badRequest = Assert.IsType<BadRequestObjectResult>(result);
@@ -455,7 +475,14 @@ public class WorkerLinkControllerTests
         Assert.All(errors, error =>
         {
             Assert.False(string.IsNullOrWhiteSpace(error.Target));
-            Assert.Contains(error.Code, new[] { "Required", "InvalidEndpoint", "InvalidBody" });
+            Assert.Contains(error.Code, new[]
+            {
+                "Required",
+                "InvalidEndpoint",
+                "InvalidBody",
+                "InvalidWorkerIdentity",
+                "WorkerIdentityMismatch",
+            });
         });
 
         return errors;

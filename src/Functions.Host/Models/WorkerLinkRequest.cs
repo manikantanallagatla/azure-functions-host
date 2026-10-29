@@ -1,6 +1,7 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using Azure.Functions.Rpc.Client;
 using Newtonsoft.Json;
 
 namespace Azure.Functions.Host.WorkerLink;
@@ -23,4 +24,11 @@ public sealed class WorkerLinkRequest
     /// </summary>
     [JsonProperty("workerContainerEncryptionKey")]
     public string? WorkerContainerEncryptionKey { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional authoritative exact worker identity supplied by Legion.
+    /// Older callers may omit this field; those links remain primary-removal only.
+    /// </summary>
+    [JsonProperty("worker")]
+    public FunctionsSplitPodIdentity? Worker { get; set; }
 }

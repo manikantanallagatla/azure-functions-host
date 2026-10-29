@@ -7,7 +7,10 @@ using System.Reflection;
 using Azure.Functions.Host.Controllers;
 using Azure.Functions.Host.Models;
 using Azure.Functions.Host.WorkerLink;
+using Azure.Functions.Rpc.Client;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
@@ -49,7 +52,7 @@ public class WorkerLinkContractTests
     }
 
     [Fact]
-    public void WorkerLinkController_MapsPutAdminWorkersWithRouteIdentity()
+    public void ComputeManagementControllers_MapExpectedRoutesAndAuthorization()
     {
         MethodInfo link = typeof(WorkerLinkController).GetMethod(nameof(WorkerLinkController.LinkWorker))!;
 
@@ -59,9 +62,40 @@ public class WorkerLinkContractTests
         Assert.NotNull(httpPut);
         Assert.NotNull(route);
         Assert.Equal("admin/workers/{workerId}", route!.Template);
+        Assert.Equal(PolicyNames.AdminAuthLevel, link.GetCustomAttribute<AuthorizeAttribute>()!.Policy);
         ParameterInfo workerId = Assert.Single(link.GetParameters().Where(parameter =>
             string.Equals(parameter.Name, "workerId", StringComparison.Ordinal)));
         Assert.NotNull(workerId.GetCustomAttribute<Microsoft.AspNetCore.Mvc.FromRouteAttribute>());
+
+        MethodInfo acknowledge = typeof(WorkerRemovalAcknowledgementController).GetMethod(
+            nameof(WorkerRemovalAcknowledgementController.AcknowledgeWorkerRemoval))!;
+        Assert.Equal("admin/functions/split/acknowledgeWorkerRemoval",
+            acknowledge.GetCustomAttribute<Microsoft.AspNetCore.Mvc.RouteAttribute>()!.Template);
+        Assert.Equal(PolicyNames.AdminAuthLevel,
+            acknowledge.GetCustomAttribute<AuthorizeAttribute>()!.Policy);
+        FunctionsSplitWorkerRemovalAcknowledgement acknowledgement =
+            Assert.IsType<FunctionsSplitWorkerRemovalAcknowledgement>(
+                JsonConvert.DeserializeObject<FunctionsSplitWorkerRemovalAcknowledgement>(
+                    """
+                    {
+                      "action": {
+                        "worker": {
+                          "resourceNamespace": "resource-namespace",
+                          "podName": "worker-pod-abc123",
+                          "podGuid": "47bf3a08-900a-48b3-a0f1-f6baa87191e7",
+                          "legionStampName": "legion-stamp",
+                          "podType": "FunctionsSplitWorkerPod",
+                          "app": {
+                            "functionAppName": "app-name",
+                            "functionAppSiteId": 123,
+                            "antaresStampName": "antares-stamp"
+                          }
+                        },
+                        "reason": "RuntimeUnlink"
+                      }
+                    }
+                    """));
+        Assert.True(acknowledgement.Action.IsValid());
     }
 
     [Fact]
@@ -77,14 +111,36 @@ public class WorkerLinkContractTests
     [Theory]
     [InlineData("workerId")]
     [InlineData("workerPodName")]
-    public void WorkerLinkRequest_Serialization_DoesNotIncludeBodyIdentity(string propertyName)
+    public void WorkerLinkRequest_Serialization_UsesExactWorkerObjectNotLegacyBodyIdentity(string propertyName)
     {
         WorkerLinkRequest request = Assert.IsType<WorkerLinkRequest>(JsonConvert.DeserializeObject<WorkerLinkRequest>(
-            $$"""{"workerGrpcEndpoint":"http://worker-pod-abc123:5001","{{propertyName}}":null}"""));
+            $$"""
+            {
+              "workerGrpcEndpoint": "http://worker-pod-abc123:5001",
+              "{{propertyName}}": null,
+              "worker": {
+                "resourceNamespace": "resource-namespace",
+                "podName": "worker-pod-abc123",
+                "podGuid": "47bf3a08-900a-48b3-a0f1-f6baa87191e7",
+                "legionStampName": "legion-stamp",
+                "podType": "FunctionsSplitWorkerPod",
+                "app": {
+                  "functionAppName": "app-name",
+                  "functionAppSiteId": 123,
+                  "antaresStampName": "antares-stamp"
+                }
+              }
+            }
+            """));
 
-        JObject body = JObject.Parse(JsonConvert.SerializeObject(request));
+        string json = JsonConvert.SerializeObject(request);
+        JObject body = JObject.Parse(json);
+        WorkerLinkRequest roundTrip = Assert.IsType<WorkerLinkRequest>(
+            JsonConvert.DeserializeObject<WorkerLinkRequest>(json));
 
         Assert.Equal("http://worker-pod-abc123:5001", request.WorkerGrpcEndpoint);
+        Assert.True(request.Worker!.IsValid());
+        Assert.Equal(request.Worker, roundTrip.Worker);
         Assert.Null(body.Property(propertyName));
     }
 
@@ -96,7 +152,7 @@ public class WorkerLinkContractTests
 
         JObject body = JObject.Parse(JsonConvert.SerializeObject(request));
 
-        Assert.Equal(new[] { "workerContainerEncryptionKey", "workerGrpcEndpoint" },
+        Assert.Equal(new[] { "worker", "workerContainerEncryptionKey", "workerGrpcEndpoint" },
             body.Properties().Select(property => property.Name).Order(StringComparer.Ordinal));
     }
 }
