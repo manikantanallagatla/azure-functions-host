@@ -377,10 +377,9 @@ internal sealed partial class FunctionRpcRelay
                 }
 
                 _terminalState = terminalState;
-                bool runtimeCompleted = terminalState.Side == FunctionRpcRelaySide.Runtime &&
-                    terminalState.Reason == FunctionRpcRelayTerminationReason.PeerClosed;
+                bool peerCompleted = terminalState.Reason == FunctionRpcRelayTerminationReason.PeerClosed;
                 // Withdraw readiness before completing stream tasks or starting potentially slow teardown/logging.
-                stateManager.OnSessionTerminated(id, runtimeCompleted);
+                stateManager.OnSessionTerminated(id, peerCompleted);
                 _completion.SetResult(terminalState);
             }
 

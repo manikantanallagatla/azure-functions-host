@@ -38,20 +38,20 @@ assignment and Link/stream admission. Management readiness
 and instance-state polling remain alive to report `RemovalRequested`; Legion performs deletion.
 There is no forced process exit or new drain behavior here.
 
-### Explicit Runtime connection completion
+### Explicit connection completion
 
-A Proxy with successfully initialized linked history also requests sticky removal when Runtime explicitly
-completes its gRPC request stream. This uses the relay's
-existing runtime-side `PeerClosed` classification, not a new inference of Runtime death.
+A Proxy with successfully initialized linked history also requests sticky removal when Runtime or the
+customer worker explicitly completes its gRPC request stream. This uses the relay's existing
+`PeerClosed` classification, not a new inference of process death. An initialized attachment cannot be
+replaced in the same Proxy, so customer-worker completion retires that otherwise unusable pod.
 Readiness withdrawal and removal publication share one state update. Existing removal
 handling closes new assignment, Link/stream and HTTP admission while management stays alive.
 
 A close before successful initialization retains the existing retry behavior and original never-linked
-deadline. Worker-side completion, canceled or faulted calls, and Proxy shutdown do not
-activate this new removal path. Their terminal-loss/recovery policy remains deferred; this
-is only the explicit Runtime-completion slice of W2, not general network-loss detection or
-W3/W4 draining. Local linked history stays retained; full published Runtime identity is
-still deferred.
+deadline. Canceled or faulted calls and Proxy shutdown do not activate this removal path.
+Their terminal-loss/recovery policy remains deferred; explicit completion does not implement general
+network-loss detection, customer-worker health classification, invocation draining or physical deletion.
+Local linked history stays retained; full published Runtime identity is still deferred.
 
 Runtime's `IWorkerChannelRegistry.UnlinkAsync` withdraws the channel locally, completes its
 request stream, and waits up to ten seconds for peer termination before disposing it.

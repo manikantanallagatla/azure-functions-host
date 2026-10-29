@@ -153,7 +153,7 @@ public partial class FunctionRpcRelayTests
         SplitWorkerOriginState disconnected = await ReadSplitManagementStateAsync(management, timeout.Token);
         clock.Advance(TimeSpan.FromHours(1));
         Assert.Equal(disconnected, await ReadSplitManagementStateAsync(management, timeout.Token));
-        Assert.Equal(SplitWorkerStatus.Starting, disconnected.Status);
+        Assert.Equal(SplitWorkerStatus.RemovalRequested, disconnected.Status);
     }
 
     [Fact]
