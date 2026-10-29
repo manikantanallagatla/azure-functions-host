@@ -43,7 +43,8 @@ public class WorkerEndpointReadinessProbeOptionsTests
 
     private static WorkerEndpointReadinessProbeOptions GetOptions(params string[] args)
     {
-        using WebApplication app = WorkerProxyApplication.Build(["--WEBSITE_POD_NAME", "test-worker-pod", .. args]);
+        using WebApplication app = WorkerProxyApplication.Build(
+            ["--WEBSITE_POD_NAME", "test-worker-pod", .. args], DateTimeOffset.UnixEpoch);
 
         return app.Services.GetRequiredService<IOptions<WorkerEndpointReadinessProbeOptions>>().Value;
     }

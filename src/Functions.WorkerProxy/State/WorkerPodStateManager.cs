@@ -33,7 +33,8 @@ internal sealed class WorkerPodStateManager
 
     public WorkerPodStateManager(
         IOptions<WorkerProxyOptions> options,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        DateTimeOffset startupTime)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(timeProvider);
@@ -42,7 +43,7 @@ internal sealed class WorkerPodStateManager
         ArgumentException.ThrowIfNullOrWhiteSpace(podName);
 
         _timeProvider = timeProvider;
-        _state = WorkerPodState.CreateUnassigned(podName, _timeProvider.GetUtcNow());
+        _state = WorkerPodState.CreateUnassigned(podName, startupTime);
     }
 
     /// <summary>

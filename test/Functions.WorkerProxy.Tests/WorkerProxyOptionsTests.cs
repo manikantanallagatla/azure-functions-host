@@ -127,7 +127,8 @@ public class WorkerProxyOptionsTests
 
     private static WorkerProxyOptions GetOptions(params string[] args)
     {
-        using WebApplication app = WorkerProxyApplication.Build(["--WEBSITE_POD_NAME", "test-worker-pod", .. args]);
+        using WebApplication app = WorkerProxyApplication.Build(
+            ["--WEBSITE_POD_NAME", "test-worker-pod", .. args], DateTimeOffset.UnixEpoch);
 
         return app.Services.GetRequiredService<IOptions<WorkerProxyOptions>>().Value;
     }

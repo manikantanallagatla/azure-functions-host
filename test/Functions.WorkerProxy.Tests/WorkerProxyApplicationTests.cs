@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure.Functions.WorkerProxy.Http;
@@ -43,6 +44,31 @@ public class WorkerProxyApplicationTests
         Assert.Same(manager, scope.ServiceProvider.GetRequiredService<WorkerPodStateManager>());
         Assert.Equal("configured-worker-pod", manager.State.PodName);
         Assert.Equal(0, manager.State.Revision);
+    }
+
+    [Fact]
+    public async Task StartupTime_IsPublishedFromBeforeHostConstruction()
+    {
+        DateTimeOffset beforeStartup = TimeProvider.System.GetUtcNow();
+        DateTimeOffset configurationTime = default;
+        Mock<TimeProvider> provider = new();
+        provider.Setup(clock => clock.GetUtcNow()).Returns(() => configurationTime.AddDays(1));
+        await using WorkerProxyWebApplicationFactory factory = new(configureServices: services =>
+        {
+            configurationTime = TimeProvider.System.GetUtcNow();
+            services.Replace(ServiceDescriptor.Singleton<TimeProvider>(provider.Object));
+        });
+        using HttpClient client = factory.CreateWorkerProxyClient();
+        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(30));
+
+        using HttpResponseMessage response = await client.PostAsync(
+            "/admin/infra/instanceState", content: null, timeout.Token);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using JsonDocument state = JsonDocument.Parse(await response.Content.ReadAsStringAsync(timeout.Token));
+        DateTimeOffset startupTime = state.RootElement.GetProperty("startupTime").GetDateTimeOffset();
+        Assert.InRange(startupTime, beforeStartup, configurationTime);
+        Assert.Equal(startupTime, factory.Services.GetRequiredService<WorkerPodStateManager>().State.StartupTime);
     }
 
     [Fact]

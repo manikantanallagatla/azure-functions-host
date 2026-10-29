@@ -30,8 +30,9 @@ internal static class WorkerProxyApplication
     /// Creates the configured WorkerProxy application.
     /// </summary>
     /// <param name="args">The command-line arguments supplied to WorkerProxy.</param>
+    /// <param name="startupTime">The startup time captured at process entry, before host construction.</param>
     /// <returns>The application ready to be started.</returns>
-    public static WebApplication Build(string[] args)
+    public static WebApplication Build(string[] args, DateTimeOffset startupTime)
     {
         ArgumentNullException.ThrowIfNull(args);
 
@@ -47,7 +48,10 @@ internal static class WorkerProxyApplication
         builder.Services.ConfigureOptions<WorkerProxyOptionsSetup>();
         builder.Services.AddSingleton<IValidateOptions<WorkerProxyOptions>, WorkerProxyOptionsValidator>();
         builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
-        builder.Services.AddSingleton<WorkerPodStateManager>();
+        builder.Services.AddSingleton(services => new WorkerPodStateManager(
+            services.GetRequiredService<IOptions<WorkerProxyOptions>>(),
+            services.GetRequiredService<TimeProvider>(),
+            startupTime));
         builder.Services.ConfigureHttpJsonOptions(options =>
             options.SerializerOptions.TypeInfoResolverChain.Insert(0, WorkerProxyJsonContext.Default));
         builder.Services.AddSingleton<WorkerProxyEndpointConfiguration>();
