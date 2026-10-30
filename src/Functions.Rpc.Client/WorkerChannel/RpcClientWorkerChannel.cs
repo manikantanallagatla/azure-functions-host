@@ -110,9 +110,25 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
 
     internal bool IsTerminated => Completion.IsCompleted || FunctionLoadFailure.IsCompleted;
 
-    internal bool IsWorkerRemovalHandoffConfirmed =>
-        Completion.IsCompleted &&
-        _workerRemovalHandoffChannel?.IsWorkerRemovalHandoffConfirmed == true;
+    internal bool IsWorkerRemovalHandoffConfirmed
+    {
+        get
+        {
+            if (!Completion.IsCompleted)
+            {
+                return false;
+            }
+
+            try
+            {
+                return _workerRemovalHandoffChannel?.IsWorkerRemovalHandoffConfirmed == true;
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }
+    }
 
     internal bool ContributesHttpCapacity
     {

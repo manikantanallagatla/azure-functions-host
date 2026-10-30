@@ -30,6 +30,18 @@ public sealed class RuntimeRetirementManagerTests
     }
 
     [Fact]
+    public void RuntimeRetirementStatePublisher_DisposeIsIdempotent()
+    {
+        TestRetirementWorkerManager workerManager = new();
+        using RetirementHostStateHandler handler = new();
+        AppServerHostStateClient client = CreateClient(workerManager, handler);
+        RuntimeRetirementStatePublisher publisher = CreatePublisher(workerManager, client);
+
+        publisher.Dispose();
+        publisher.Dispose();
+    }
+
+    [Fact]
     public async Task RequestRetirementAsync_RejectsStaleThenOrdersAcknowledgedRetirementOnce()
     {
         TestRetirementWorkerManager workerManager = new();
@@ -418,8 +430,7 @@ public sealed class RuntimeRetirementManagerTests
                 _drainingRequestCount++;
             }
 
-            if (string.Equals(state.Status, AppServerHostStateClient.DrainingStatus, StringComparison.Ordinal) &&
-                state.OutstandingWorkerRemovals.Count != 0)
+            if (state.OutstandingWorkerRemovals.Count != 0)
             {
                 FallbackRequestObserved.TrySetResult();
             }

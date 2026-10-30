@@ -22,6 +22,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.WebJobs.Script;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
+using Microsoft.Azure.WebJobs.Script.ManagedDependencies;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies;
 using Microsoft.Extensions.Configuration;
@@ -37,6 +38,21 @@ namespace Azure.Functions.Rpc.Client.Tests;
 public sealed partial class WorkerChannelRegistryTests
 {
     private static readonly TimeSpan AppVersionUnlinkTimeout = TimeSpan.FromMilliseconds(100);
+
+    [Fact]
+    public async Task AppVersionDrainApiHost_DisposeAsyncCompletes()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        using AppVersionDrainHostStateHandler handler = new();
+        AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+
+        await host.DisposeAsync();
+    }
 
     [Fact]
     public async Task PostRuntimeDrain_PhasedCommitsFenceReturnsStateReceiptAndValidatesKnownFields()
@@ -224,7 +240,11 @@ public sealed partial class WorkerChannelRegistryTests
             worker.Id,
             CreateEndpoint(worker.Id),
             CreateWorkerIdentity(worker.Id));
-        await MakeWorkersReadyAsync(registry, function, worker);
+        await registry.ActivateAsync(
+            [function],
+            new ManagedDependencyOptions(),
+            functionTimeout: null);
+        await worker.ReadRequestAsync(StreamingMessage.ContentOneofCase.FunctionLoadRequest);
 
         using AppVersionDrainHostStateHandler handler = new(blockFirstDrainFence: true);
         await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
@@ -254,6 +274,128 @@ public sealed partial class WorkerChannelRegistryTests
             WorkerRemovalAcknowledgementResult.Accepted,
             scaleInManager.AcknowledgeWorkerRemoval(fallback));
         await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
+    }
+
+    [Fact]
+    public async Task RuntimeDrainSnapshotRecordsFallbackForTerminalChannelDetachedImmediatelyBeforeSnapshot()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        ChannelControl worker = new(
+            "worker",
+            blockDisposal: true,
+            workerRemovalHandoffException: new InvalidOperationException("trailers unavailable"));
+        harness.Enqueue(worker);
+        await registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+
+        worker.Complete(new IOException("request pump failed before response completion"));
+        await worker.DisposeStarted.WaitAsync(TestTimeout);
+        try
+        {
+            IAppVersionRuntimeDrainWorkerManager drainManager = registry;
+            Assert.True(drainManager.TryStartAppVersionDrain(out _));
+
+            IHttpWorkerScaleInManager scaleInManager = registry;
+            HttpWorkerScaleInState snapshot = scaleInManager.Current;
+            Assert.Equal(0, snapshot.LinkedWorkerCount);
+            FunctionsSplitWorkerRemovalAction fallback =
+                Assert.Single(snapshot.OutstandingWorkerRemovals);
+            Assert.Equal(worker.Id, fallback.Worker.PodName);
+            Assert.Equal("RuntimeUnlink", fallback.Reason);
+        }
+        finally
+        {
+            worker.AllowDispose();
+        }
+    }
+
+    [Fact]
+    public async Task RuntimeDrainUnlinkRetainsPendingOwnershipUntilPrimaryHandoffIsRecorded()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        ChannelControl worker = new(
+            "worker",
+            blockDisposal: true,
+            completeResponsesOnRequestCompletion: false);
+        harness.Enqueue(worker);
+        await registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        IAppVersionRuntimeDrainWorkerManager drainManager = registry;
+        Assert.True(drainManager.TryStartAppVersionDrain(out _));
+
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        Task<bool> unlink = registry.UnlinkAsync(worker.Id);
+        await worker.Transport.Requests.Completion.WaitAsync(TestTimeout);
+        HttpWorkerScaleInState pending = scaleInManager.Current;
+        Assert.Equal(1, pending.LinkedWorkerCount);
+        Assert.Empty(pending.OutstandingWorkerRemovals);
+        Task<long> ownershipChanged = scaleInManager.WaitForChangeAsync(pending.Version);
+
+        worker.Complete();
+        await ownershipChanged.WaitAsync(TestTimeout);
+        await worker.DisposeStarted.WaitAsync(TestTimeout);
+        try
+        {
+            HttpWorkerScaleInState confirmed = scaleInManager.Current;
+            Assert.Equal(0, confirmed.LinkedWorkerCount);
+            Assert.Empty(confirmed.OutstandingWorkerRemovals);
+        }
+        finally
+        {
+            worker.AllowDispose();
+        }
+
+        Assert.True(await unlink.WaitAsync(TestTimeout));
+    }
+
+    [Fact]
+    public async Task RuntimeDrainUnlinkTransitionsPendingOwnershipToExactFallback()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        ChannelControl worker = new(
+            "worker",
+            blockDisposal: true,
+            completeResponsesOnRequestCompletion: false,
+            workerRemovalHandoffConfirmed: false);
+        harness.Enqueue(worker);
+        await registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        IAppVersionRuntimeDrainWorkerManager drainManager = registry;
+        Assert.True(drainManager.TryStartAppVersionDrain(out _));
+
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        Task<bool> unlink = registry.UnlinkAsync(worker.Id);
+        await worker.Transport.Requests.Completion.WaitAsync(TestTimeout);
+        HttpWorkerScaleInState pending = scaleInManager.Current;
+        Assert.Equal(1, pending.LinkedWorkerCount);
+        Assert.Empty(pending.OutstandingWorkerRemovals);
+        Task<long> ownershipChanged = scaleInManager.WaitForChangeAsync(pending.Version);
+
+        worker.Complete();
+        await worker.DisposeStarted.WaitAsync(TestTimeout);
+        Assert.Equal(1, scaleInManager.Current.LinkedWorkerCount);
+        worker.AllowDispose();
+
+        Assert.True(await unlink.WaitAsync(TestTimeout));
+        await ownershipChanged.WaitAsync(TestTimeout);
+        HttpWorkerScaleInState fallbackState = scaleInManager.Current;
+        Assert.Equal(0, fallbackState.LinkedWorkerCount);
+        FunctionsSplitWorkerRemovalAction fallback =
+            Assert.Single(fallbackState.OutstandingWorkerRemovals);
+        Assert.Equal(worker.Id, fallback.Worker.PodName);
+        Assert.Equal("RuntimeUnlink", fallback.Reason);
     }
 
     [Fact]
@@ -689,6 +831,7 @@ public sealed partial class WorkerChannelRegistryTests
             "Phased",
             "ConfigurationChange"));
         phased.EnsureSuccessStatusCode();
+        timeProvider.Advance(TimeSpan.FromSeconds(40));
         await handler.DrainProgressFailureObserved.Task.WaitAsync(TestTimeout);
         timeProvider.Advance(TimeSpan.FromMinutes(60));
         await handler.FallbackRequestObserved.Task.WaitAsync(TestTimeout);
@@ -855,6 +998,79 @@ public sealed partial class WorkerChannelRegistryTests
         Assert.Equal(workerManager.FallbackAction, Assert.Single(fallback.OutstandingWorkerRemovals));
     }
 
+    [Fact]
+    public async Task RuntimeDrainScheduledSelectionFailureLatchesBeforeConcurrentRetryAndEscalation()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        SelectionFailureWorkerManager workerManager = new(
+            timeProvider.GetUtcNow(),
+            blockSelectionFailure: true);
+        using AppVersionDrainHostStateHandler handler = new();
+        using HttpClient httpClient = new(handler);
+        Mock<IHttpClientFactory> factory = new();
+        factory.Setup(value => value.CreateClient(AppServerHostStateClient.HttpClientName))
+            .Returns(httpClient);
+        IConfiguration configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string>
+            {
+                [EnvironmentSettingNames.ContainerName] = "test-container",
+                [EnvironmentSettingNames.MeshInitURI] = "http://appserver.test/",
+            })
+            .Build();
+        AppServerHostStateClient client = new(
+            factory.Object,
+            workerManager,
+            workerManager,
+            timeProvider,
+            configuration);
+        using RuntimeRetirementStatePublisher publisher = new(
+            workerManager,
+            client,
+            timeProvider,
+            NullLogger<RuntimeRetirementStatePublisher>.Instance);
+        AppVersionRuntimeDrainManager manager = new(
+            workerManager,
+            workerManager,
+            client,
+            publisher,
+            timeProvider,
+            NullLogger<AppVersionRuntimeDrainManager>.Instance);
+
+        await manager.AcceptAsync(
+            RuntimeDrainMode.Phased,
+            RuntimeDrainReason.ConfigurationChange);
+        Task advance = Task.Run(() => timeProvider.Advance(TimeSpan.FromSeconds(10)));
+        await workerManager.SelectionFailureEntered.Task.WaitAsync(TestTimeout);
+
+        TaskCompletionSource repeatedStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource escalationStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<RuntimeDrainReceipt> repeated = Task.Run(async () =>
+        {
+            repeatedStarted.TrySetResult();
+            return await manager.AcceptAsync(
+                RuntimeDrainMode.Phased,
+                RuntimeDrainReason.Restart);
+        });
+        Task<RuntimeDrainReceipt> escalation = Task.Run(async () =>
+        {
+            escalationStarted.TrySetResult();
+            return await manager.AcceptAsync(
+                RuntimeDrainMode.Immediate,
+                RuntimeDrainReason.Restart);
+        });
+        await Task.WhenAll(repeatedStarted.Task, escalationStarted.Task).WaitAsync(TestTimeout);
+        Assert.False(repeated.IsCompleted);
+        Assert.False(escalation.IsCompleted);
+
+        workerManager.AllowSelectionFailure.TrySetResult();
+
+        await advance.WaitAsync(TestTimeout);
+        await Assert.ThrowsAsync<RuntimeDrainAdmissionException>(() => repeated);
+        await Assert.ThrowsAsync<RuntimeDrainAdmissionException>(() => escalation);
+    }
+
     [Theory]
     [InlineData(RuntimeDrainMode.Phased, "a-worker", false)]
     [InlineData(RuntimeDrainMode.Immediate, null, true)]
@@ -997,6 +1213,7 @@ public sealed partial class WorkerChannelRegistryTests
         IHttpWorkerScaleInManager,
         IRuntimeRetirementWorkerManager
     {
+        private readonly bool _blockSelectionFailure;
         private readonly bool _failAllRemainingSelection;
         private readonly string _failingWorkerId;
         private readonly Lock _stateLock = new();
@@ -1008,8 +1225,10 @@ public sealed partial class WorkerChannelRegistryTests
         internal SelectionFailureWorkerManager(
             DateTimeOffset createdTime,
             string failingWorkerId = "b-worker",
-            bool failAllRemainingSelection = false)
+            bool failAllRemainingSelection = false,
+            bool blockSelectionFailure = false)
         {
+            _blockSelectionFailure = blockSelectionFailure;
             _failingWorkerId = failingWorkerId;
             _failAllRemainingSelection = failAllRemainingSelection;
             _state = new(createdTime, 0, 5, 0);
@@ -1022,6 +1241,12 @@ public sealed partial class WorkerChannelRegistryTests
         public RuntimeIncarnation Incarnation { get; } = RuntimeIncarnation.Create();
 
         public bool IsRetirementRequested { get; private set; }
+
+        public TaskCompletionSource AllowSelectionFailure { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource SelectionFailureEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource SelectionFailureTriggered { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1075,8 +1300,7 @@ public sealed partial class WorkerChannelRegistryTests
             Assert.Equal(Incarnation, incarnation);
             if (_failAllRemainingSelection)
             {
-                SelectionFailureTriggered.TrySetResult();
-                throw new InvalidOperationException("all remaining selection failed");
+                ThrowSelectionFailure("all remaining selection failed");
             }
 
             return new([]);
@@ -1091,11 +1315,22 @@ public sealed partial class WorkerChannelRegistryTests
             if (_failingWorkerId is not null &&
                 workerIds.Contains(_failingWorkerId, StringComparer.Ordinal))
             {
-                SelectionFailureTriggered.TrySetResult();
-                throw new InvalidOperationException("worker selection failed");
+                ThrowSelectionFailure("worker selection failed");
             }
 
             return new([]);
+        }
+
+        private void ThrowSelectionFailure(string message)
+        {
+            SelectionFailureTriggered.TrySetResult();
+            SelectionFailureEntered.TrySetResult();
+            if (_blockSelectionFailure)
+            {
+                AllowSelectionFailure.Task.GetAwaiter().GetResult();
+            }
+
+            throw new InvalidOperationException(message);
         }
 
         public bool TryCloseAdmission(SplitScriptHostActivationFaulted condition) => false;
@@ -1196,8 +1431,7 @@ public sealed partial class WorkerChannelRegistryTests
                             services.AddSingleton<TimeProvider>(timeProvider);
                             services.AddSingleton<AppServerHostStateClient>();
                             services.AddSingleton<RuntimeRetirementStatePublisher>();
-                            services.AddSingleton<IHostedService>(
-                                provider => provider.GetRequiredService<RuntimeRetirementStatePublisher>());
+                            services.AddSingleton<IHostedService, RuntimeRetirementStatePublisherHostedService>();
                             services.AddSingleton<AppVersionRuntimeDrainManager>();
                             services.AddSingleton<IAppVersionRuntimeDrainManager>(
                                 provider => provider.GetRequiredService<AppVersionRuntimeDrainManager>());

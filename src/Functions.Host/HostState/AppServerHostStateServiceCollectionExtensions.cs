@@ -2,6 +2,8 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 using Azure.Functions.Rpc.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -23,8 +25,7 @@ internal static class AppServerHostStateServiceCollectionExtensions
         services.AddSingleton<IWorkerScaleInStatePublisher>(
             provider => provider.GetRequiredService<AppServerHostStateClient>());
         services.AddSingleton<RuntimeRetirementStatePublisher>();
-        services.AddSingleton<IHostedService>(
-            provider => provider.GetRequiredService<RuntimeRetirementStatePublisher>());
+        services.AddSingleton<IHostedService, RuntimeRetirementStatePublisherHostedService>();
         services.AddSingleton<RuntimeRetirementManager>();
         services.AddSingleton<IRuntimeRetirementManager>(
             provider => provider.GetRequiredService<RuntimeRetirementManager>());
@@ -35,4 +36,17 @@ internal static class AppServerHostStateServiceCollectionExtensions
 
         return services;
     }
+}
+
+internal sealed class RuntimeRetirementStatePublisherHostedService(
+    RuntimeRetirementStatePublisher publisher) : IHostedService
+{
+    private readonly RuntimeRetirementStatePublisher _publisher =
+        publisher ?? throw new ArgumentNullException(nameof(publisher));
+
+    public Task StartAsync(CancellationToken cancellationToken) =>
+        _publisher.StartAsync(cancellationToken);
+
+    public Task StopAsync(CancellationToken cancellationToken) =>
+        _publisher.StopAsync(cancellationToken);
 }

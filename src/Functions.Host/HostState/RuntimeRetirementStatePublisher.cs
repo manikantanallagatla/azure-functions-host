@@ -33,6 +33,7 @@ internal sealed partial class RuntimeRetirementStatePublisher(
         timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
 
     private RuntimeLifecycleStatus? _status;
+    private bool _disposed;
     private Task? _publisherTask;
     private TaskCompletionSource _statusChanged =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -41,10 +42,15 @@ internal sealed partial class RuntimeRetirementStatePublisher(
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        await _shutdownSource.CancelAsync();
         Task? publisher;
         lock (_lifecycleLock)
         {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _shutdownSource.Cancel();
             publisher = _publisherTask;
         }
 
@@ -56,8 +62,17 @@ internal sealed partial class RuntimeRetirementStatePublisher(
 
     public void Dispose()
     {
-        _shutdownSource.Cancel();
-        _shutdownSource.Dispose();
+        lock (_lifecycleLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            _shutdownSource.Cancel();
+            _shutdownSource.Dispose();
+        }
     }
 
     internal void RetainOwnership(RuntimeLifecycleStatus? status)
@@ -69,6 +84,7 @@ internal sealed partial class RuntimeRetirementStatePublisher(
 
         lock (_lifecycleLock)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (status is RuntimeLifecycleStatus.Draining)
             {
                 _status = status;

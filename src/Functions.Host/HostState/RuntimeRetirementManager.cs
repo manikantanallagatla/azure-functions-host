@@ -146,9 +146,18 @@ internal sealed partial class RuntimeRetirementManager(
                 EnsureApplied(clearedFallbackResult, "publish cleared Runtime drain state");
             }
 
+            HttpWorkerScaleInState finalState = _scaleInManager.Current;
+            if (finalState.Version != state.Version ||
+                finalState.LinkedWorkerCount != 0 ||
+                finalState.OutstandingWorkerRemovals.Count != 0)
+            {
+                throw new InvalidOperationException(
+                    "Runtime retirement state changed before final removal publication.");
+            }
+
             AppServerHostStatePublishResult removalResult = await _appServerClient.PublishLifecycleAsync(
                 RuntimeLifecycleStatus.RemovalRequested,
-                state,
+                finalState,
                 CancellationToken.None);
             EnsureApplied(removalResult, "publish Runtime removal");
             Log.RemovalRequested(_logger, condition.Incarnation.Value);

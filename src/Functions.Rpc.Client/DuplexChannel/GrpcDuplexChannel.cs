@@ -30,6 +30,7 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
     private readonly Task _readPump;
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Task _writePump;
+    private bool _responseStreamCompleted;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="GrpcDuplexChannel{T}"/> class.
@@ -62,19 +63,31 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
     {
         get
         {
-            foreach (Metadata.Entry trailer in _call.GetTrailers())
+            if (!Volatile.Read(ref _responseStreamCompleted))
             {
-                if (string.Equals(
-                    trailer.Key,
-                    FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
-                    StringComparison.Ordinal) &&
-                    string.Equals(
-                        trailer.Value,
-                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue,
-                        StringComparison.Ordinal))
+                return false;
+            }
+
+            try
+            {
+                foreach (Metadata.Entry trailer in _call.GetTrailers())
                 {
-                    return true;
+                    if (string.Equals(
+                        trailer.Key,
+                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                        StringComparison.Ordinal) &&
+                        string.Equals(
+                            trailer.Value,
+                            FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue,
+                            StringComparison.Ordinal))
+                    {
+                        return true;
+                    }
                 }
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
             }
 
             return false;
@@ -117,6 +130,7 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
     private async Task PumpResponsesAsync()
     {
         Exception error = null;
+        bool responseStreamCompleted = false;
 
         try
         {
@@ -124,6 +138,8 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
             {
                 await _incoming.Writer.WriteAsync(_call.ResponseStream.Current, _shutdownSource.Token);
             }
+
+            responseStreamCompleted = true;
         }
         catch (Exception) when (_shutdownSource.IsCancellationRequested)
         {
@@ -131,9 +147,11 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
         catch (Exception exception)
         {
             error = exception;
+            responseStreamCompleted = true;
         }
         finally
         {
+            Volatile.Write(ref _responseStreamCompleted, responseStreamCompleted);
             _outgoing.Writer.TryComplete(error);
             _incoming.Writer.TryComplete(error);
 

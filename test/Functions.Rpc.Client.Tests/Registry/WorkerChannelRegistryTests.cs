@@ -1956,10 +1956,14 @@ public sealed partial class WorkerChannelRegistryTests
             string functionGroupName = null,
             bool? isAlwaysReady = null,
             bool completeResponsesOnRequestCompletion = true,
-            bool workerRemovalHandoffConfirmed = true)
+            bool workerRemovalHandoffConfirmed = true,
+            Exception workerRemovalHandoffException = null)
         {
             Id = id;
-            Transport = new(blockDisposal, workerRemovalHandoffConfirmed);
+            Transport = new(
+                blockDisposal,
+                workerRemovalHandoffConfirmed,
+                workerRemovalHandoffException);
             _completeResponsesOnRequestCompletion = completeResponsesOnRequestCompletion;
             _functionGroupName = functionGroupName;
             _isAlwaysReady = isAlwaysReady;

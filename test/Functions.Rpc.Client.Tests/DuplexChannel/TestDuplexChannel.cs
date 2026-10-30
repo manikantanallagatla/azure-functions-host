@@ -20,15 +20,18 @@ internal sealed class TestDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
     private readonly TaskCompletionSource _disposeStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Channel<T> _requests;
     private readonly Channel<T> _responses;
+    private readonly Exception _workerRemovalHandoffException;
     private readonly bool _workerRemovalHandoffConfirmed;
     private int _disposeCount;
 
     internal TestDuplexChannel(
         bool blockDisposal = false,
-        bool workerRemovalHandoffConfirmed = true)
+        bool workerRemovalHandoffConfirmed = true,
+        Exception workerRemovalHandoffException = null)
     {
         _requests = Channel.CreateUnbounded<T>();
         _responses = Channel.CreateUnbounded<T>();
+        _workerRemovalHandoffException = workerRemovalHandoffException;
         _workerRemovalHandoffConfirmed = workerRemovalHandoffConfirmed;
         Reader = _responses.Reader;
         Writer = _requests.Writer;
@@ -39,8 +42,18 @@ internal sealed class TestDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
         }
     }
 
-    bool IWorkerRemovalHandoffChannel.IsWorkerRemovalHandoffConfirmed =>
-        _workerRemovalHandoffConfirmed;
+    bool IWorkerRemovalHandoffChannel.IsWorkerRemovalHandoffConfirmed
+    {
+        get
+        {
+            if (_workerRemovalHandoffException is not null)
+            {
+                throw _workerRemovalHandoffException;
+            }
+
+            return _workerRemovalHandoffConfirmed;
+        }
+    }
 
     /// <summary>
     /// Gets the number of times this channel performed its disposal transition.

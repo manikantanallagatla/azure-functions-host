@@ -26,9 +26,12 @@ public partial class GrpcDuplexChannelTests
         private readonly Exception _disposeException;
         private readonly Channel<T> _responses = Channel.CreateUnbounded<T>();
         private readonly TaskCompletionSource _requestCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Metadata _trailers;
         private readonly Channel<T> _writeAttempts = Channel.CreateUnbounded<T>();
         private readonly SemaphoreSlim _writeGate = new(0);
         private int _disposeCount;
+        private bool _responseStreamCompleted;
+        private int _trailerReadCount;
         private Exception _writeException;
 
         /// <summary>
@@ -36,14 +39,18 @@ public partial class GrpcDuplexChannelTests
         /// </summary>
         /// <param name="blockWrites">Whether request writes should wait until the mocked call is cancelled.</param>
         /// <param name="disposeException">An optional failure reported when the SDK call is disposed.</param>
-        internal MockDuplexStream(bool blockWrites = false, Exception disposeException = null)
+        internal MockDuplexStream(
+            bool blockWrites = false,
+            Exception disposeException = null,
+            Metadata trailers = null)
         {
             _blockWrites = blockWrites;
             _disposeException = disposeException;
+            _trailers = trailers ?? [];
             MockClientStreamWriter requestStream = new(this);
             MockAsyncStreamReader responseStream = new(this);
             Call = new AsyncDuplexStreamingCall<T, T>(requestStream, responseStream, Task.FromResult(new Metadata()),
-                static () => Status.DefaultSuccess, static () => new Metadata(), DisposeCall);
+                static () => Status.DefaultSuccess, GetTrailers, DisposeCall);
         }
 
         /// <summary>
@@ -60,6 +67,8 @@ public partial class GrpcDuplexChannelTests
         /// Gets a task that completes when the adapter half-closes the SDK request stream.
         /// </summary>
         internal Task RequestCompleted => _requestCompleted.Task;
+
+        internal int TrailerReadCount => Interlocked.CompareExchange(ref _trailerReadCount, 0, 0);
 
         /// <summary>
         /// Gets the requests successfully written to the mock stream.
@@ -92,6 +101,17 @@ public partial class GrpcDuplexChannelTests
             ArgumentNullException.ThrowIfNull(exception);
             Interlocked.Exchange(ref _writeException, exception);
             _writeGate.Release();
+        }
+
+        private Metadata GetTrailers()
+        {
+            Interlocked.Increment(ref _trailerReadCount);
+            if (!Volatile.Read(ref _responseStreamCompleted))
+            {
+                throw new InvalidOperationException("Response stream is still open.");
+            }
+
+            return _trailers;
         }
 
         private void DisposeCall()
@@ -137,11 +157,13 @@ public partial class GrpcDuplexChannelTests
                 }
                 catch (ChannelClosedException exception) when (exception.InnerException is not null)
                 {
+                    Volatile.Write(ref _owner._responseStreamCompleted, true);
                     ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
                     throw;
                 }
                 catch (ChannelClosedException)
                 {
+                    Volatile.Write(ref _owner._responseStreamCompleted, true);
                     return false;
                 }
             }

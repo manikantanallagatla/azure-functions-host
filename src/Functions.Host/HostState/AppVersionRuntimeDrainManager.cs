@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure.Functions.Host.RuntimeDrain;
@@ -171,9 +172,10 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
         CancellationTokenSource? phasedScheduleSource = null;
         int phasedBatchSize = 0;
-        try
+        Exception? selectionFailure;
+        lock (_operationLock)
         {
-            lock (_operationLock)
+            selectionFailure = CaptureSelectionFailureLocked(() =>
             {
                 TrackDrainsLocked(start.ExistingDrains);
 
@@ -195,12 +197,12 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                     _selectionFinalized = true;
                     SignalOperationChangedLocked();
                 }
-            }
+            });
         }
-        catch (Exception exception)
+
+        if (selectionFailure is not null)
         {
-            LatchSelectionFailure(exception);
-            throw;
+            PublishSelectionFailureAndThrow(selectionFailure);
         }
 
         Task lifecycle = RunLifecycleWithFailureLatchAsync(fencedState);
@@ -232,36 +234,29 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         await initialAdmission;
         DateTimeOffset acceptedAtUtc = _timeProvider.GetUtcNow();
 
-        try
+        Exception? selectionFailure = null;
+        lock (_operationLock)
         {
-            lock (_operationLock)
+            ThrowIfDrainFailedLocked();
+            if (_finalizationStarted)
             {
-                ThrowIfDrainFailedLocked();
-                if (_finalizationStarted)
-                {
-                    throw new RuntimeDrainConflictException(
-                        "The phased Runtime drain has already entered final removal publication.");
-                }
+                throw new RuntimeDrainConflictException(
+                    "The phased Runtime drain has already entered final removal publication.");
+            }
 
-                _activeMode = RuntimeDrainMode.Immediate;
-                _phasedScheduleSource?.Cancel();
+            _activeMode = RuntimeDrainMode.Immediate;
+            _phasedScheduleSource?.Cancel();
+            selectionFailure = CaptureSelectionFailureLocked(() =>
+            {
                 SelectAllRemainingLocked(acceptedAtUtc);
                 _selectionFinalized = true;
                 SignalOperationChangedLocked();
-            }
+            });
         }
-        catch (RuntimeDrainConflictException)
+
+        if (selectionFailure is not null)
         {
-            throw;
-        }
-        catch (RuntimeDrainAdmissionException)
-        {
-            throw;
-        }
-        catch (Exception exception)
-        {
-            LatchSelectionFailure(exception);
-            throw;
+            PublishSelectionFailureAndThrow(selectionFailure);
         }
 
         Log.Escalated(
@@ -299,11 +294,13 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         DateTimeOffset acceptedAtUtc,
         CancellationToken cancellationToken)
     {
+        bool selectionFailureLatched = false;
         try
         {
             for (int batchIndex = 1; batchIndex < NonHttpBatchOffsets.Length - 1; batchIndex++)
             {
                 await DelayUntilAsync(acceptedAtUtc + NonHttpBatchOffsets[batchIndex], cancellationToken);
+                Exception? selectionFailure;
                 lock (_operationLock)
                 {
                     if (_activeMode is not RuntimeDrainMode.Phased)
@@ -311,11 +308,19 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                         return;
                     }
 
-                    SelectPhasedBatchLocked(start, batchSize, batchIndex);
+                    selectionFailure = CaptureSelectionFailureLocked(
+                        () => SelectPhasedBatchLocked(start, batchSize, batchIndex));
+                    selectionFailureLatched = selectionFailure is not null;
+                }
+
+                if (selectionFailure is not null)
+                {
+                    PublishSelectionFailureAndThrow(selectionFailure);
                 }
             }
 
             await DelayUntilAsync(acceptedAtUtc + HttpSelectionOffset, cancellationToken);
+            Exception? httpSelectionFailure;
             lock (_operationLock)
             {
                 if (_activeMode is not RuntimeDrainMode.Phased)
@@ -323,13 +328,21 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                     return;
                 }
 
-                TrackSelectionLocked(_workerManager.SelectWorkers(
-                    start.Incarnation,
-                    start.HttpWorkerIds,
-                    _timeProvider.GetUtcNow() + InvocationGracePeriod));
+                httpSelectionFailure = CaptureSelectionFailureLocked(() =>
+                    TrackSelectionLocked(_workerManager.SelectWorkers(
+                        start.Incarnation,
+                        start.HttpWorkerIds,
+                        _timeProvider.GetUtcNow() + InvocationGracePeriod)));
+                selectionFailureLatched = httpSelectionFailure is not null;
+            }
+
+            if (httpSelectionFailure is not null)
+            {
+                PublishSelectionFailureAndThrow(httpSelectionFailure);
             }
 
             await DelayUntilAsync(acceptedAtUtc + NonHttpBatchOffsets[^1], cancellationToken);
+            Exception? finalSelectionFailure;
             lock (_operationLock)
             {
                 if (_activeMode is not RuntimeDrainMode.Phased)
@@ -337,18 +350,41 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                     return;
                 }
 
-                SelectPhasedBatchLocked(start, batchSize, NonHttpBatchOffsets.Length - 1);
-                _selectionFinalized = true;
-                SignalOperationChangedLocked();
+                finalSelectionFailure = CaptureSelectionFailureLocked(() =>
+                {
+                    SelectPhasedBatchLocked(start, batchSize, NonHttpBatchOffsets.Length - 1);
+                    _selectionFinalized = true;
+                    SignalOperationChangedLocked();
+                });
+                selectionFailureLatched = finalSelectionFailure is not null;
+            }
+
+            if (finalSelectionFailure is not null)
+            {
+                PublishSelectionFailureAndThrow(finalSelectionFailure);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
-        catch (Exception exception)
+        catch (Exception exception) when (!selectionFailureLatched)
         {
             LatchSelectionFailure(exception);
             throw;
+        }
+    }
+
+    private Exception? CaptureSelectionFailureLocked(Action selection)
+    {
+        try
+        {
+            selection();
+            return null;
+        }
+        catch (Exception exception)
+        {
+            LatchSelectionFailureLocked(exception);
+            return exception;
         }
     }
 
@@ -356,12 +392,23 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     {
         lock (_operationLock)
         {
-            _selectionFailure ??= exception;
-            _selectionFinalized = true;
-            SignalOperationChangedLocked();
+            LatchSelectionFailureLocked(exception);
         }
 
         _retirementStatePublisher.RetainOwnership(RuntimeLifecycleStatus.Draining);
+    }
+
+    private void LatchSelectionFailureLocked(Exception exception)
+    {
+        _selectionFailure ??= exception;
+        _selectionFinalized = true;
+        SignalOperationChangedLocked();
+    }
+
+    private void PublishSelectionFailureAndThrow(Exception exception)
+    {
+        _retirementStatePublisher.RetainOwnership(RuntimeLifecycleStatus.Draining);
+        ExceptionDispatchInfo.Capture(exception).Throw();
     }
 
     private async Task RunLifecycleAsync(HttpWorkerScaleInState fencedState)
@@ -481,10 +528,27 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                         SignalOperationChangedLocked();
                     }
 
+                    HttpWorkerScaleInState finalState = _scaleInManager.Current;
+                    if (finalState.Version != state.Version ||
+                        finalState.LinkedWorkerCount != 0 ||
+                        finalState.OutstandingWorkerRemovals.Count != 0)
+                    {
+                        continue;
+                    }
+
+                    lock (_operationLock)
+                    {
+                        if (!_selectionFinalized || generation != _drainGeneration)
+                        {
+                            restart = true;
+                            break;
+                        }
+                    }
+
                     AppServerHostStatePublishResult removalResult =
                         await _appServerClient.PublishLifecycleAsync(
                             RuntimeLifecycleStatus.RemovalRequested,
-                            state,
+                            finalState,
                             CancellationToken.None);
                     EnsureApplied(removalResult, "publish Runtime removal");
                     Log.RemovalRequested(_logger, _workerManager.Incarnation.Value);

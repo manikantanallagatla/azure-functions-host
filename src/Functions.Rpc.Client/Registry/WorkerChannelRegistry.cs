@@ -518,6 +518,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
             _runtimeRetirementRequested = true;
             _runtimeRetirementOwner = RuntimeRetirementOwner.ActivationFault;
+            CaptureTerminalWorkerRemovalOwnershipLocked();
             foreach (WorkerSlot slot in _slots.Values)
             {
                 slot.Channel?.CloseRuntimeAdmission();
@@ -603,6 +604,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
             _runtimeRetirementRequested = true;
             _runtimeRetirementOwner = RuntimeRetirementOwner.AppVersion;
+            CaptureTerminalWorkerRemovalOwnershipLocked();
             List<string> nonHttpWorkerIds = [];
             List<string> httpWorkerIds = [];
             List<string> nonReadyWorkerIds = [];
@@ -877,6 +879,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                             return false;
                         }
 
+                        if (_runtimeRetirementRequested &&
+                            !slot.RemovalHandoffConfirmed &&
+                            !slot.RemovalFallbackRecorded)
+                        {
+                            slot.RemovalOwnershipPending = true;
+                        }
+
                         channel = DetachChannelLocked(slot, expectedChannel: null);
                     }
 
@@ -894,6 +903,14 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                         // Only WorkerProxy's application acknowledgement proves sticky primary removal ownership.
                         await Task.WhenAny(channel.Completion).WaitAsync(_unlinkTimeout, operationSource.Token);
                         primaryHandoffConfirmed = channel.IsWorkerRemovalHandoffConfirmed;
+                        if (primaryHandoffConfirmed)
+                        {
+                            lock (_stateLock)
+                            {
+                                RecordPrimaryWorkerRemovalHandoffLocked(slot);
+                            }
+                        }
+
                         if (channel.Completion.IsFaulted)
                         {
                             Log.ChannelFailed(_logger, channel.Completion.Exception, workerId);
@@ -1209,14 +1226,20 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                 bool fallbackAdded = false;
                 lock (_stateLock)
                 {
+                    bool primaryHandoffConfirmed = channel.IsWorkerRemovalHandoffConfirmed;
                     if (_runtimeRetirementRequested &&
-                        !channel.IsWorkerRemovalHandoffConfirmed &&
+                        !primaryHandoffConfirmed &&
                         !AddOutstandingWorkerRemovalLocked(slot, out fallbackAdded))
                     {
                         return;
                     }
 
                     // Only detach the channel associated with this completion signal.
+                    if (primaryHandoffConfirmed)
+                    {
+                        RecordPrimaryWorkerRemovalHandoffLocked(slot);
+                    }
+
                     removedChannel = DetachChannelLocked(slot, channel);
                 }
 
@@ -1575,15 +1598,65 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         if (_completedWorkerRemovals.Contains(action) || _outstandingWorkerRemovalSet.Contains(action))
         {
             slot.RemovalFallbackRecorded = true;
+            if (slot.RemovalOwnershipPending)
+            {
+                slot.RemovalOwnershipPending = false;
+                SignalScaleInStateChangedLocked();
+            }
+
             return true;
         }
 
         _outstandingWorkerRemovalSet.Add(action);
         _outstandingWorkerRemovals.Add(action);
         slot.RemovalFallbackRecorded = true;
+        slot.RemovalOwnershipPending = false;
         added = true;
         SignalScaleInStateChangedLocked();
         return true;
+    }
+
+    private void RecordPrimaryWorkerRemovalHandoffLocked(WorkerSlot slot)
+    {
+        if (slot.RemovalFallbackRecorded)
+        {
+            return;
+        }
+
+        slot.RemovalHandoffConfirmed = true;
+        if (slot.RemovalOwnershipPending)
+        {
+            slot.RemovalOwnershipPending = false;
+            SignalScaleInStateChangedLocked();
+        }
+    }
+
+    private void CaptureTerminalWorkerRemovalOwnershipLocked()
+    {
+        foreach (WorkerSlot slot in _linkAttempts.Values)
+        {
+            if (slot.RemovalHandoffConfirmed ||
+                slot.RemovalFallbackRecorded ||
+                (slot.Channel is null && !slot.Terminal) ||
+                slot.Channel is { IsTerminated: false })
+            {
+                continue;
+            }
+
+            if (!AddOutstandingWorkerRemovalLocked(slot, out bool added))
+            {
+                slot.RemovalOwnershipPending = true;
+                continue;
+            }
+
+            if (added)
+            {
+                Log.WorkerRemovalFallbackAdded(
+                    _logger,
+                    slot.Worker!.PodName,
+                    slot.Worker.ResourceNamespace);
+            }
+        }
     }
 
     private bool IsRuntimeRetirementFallbackOutstanding(WorkerSlot slot)
@@ -1620,17 +1693,17 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                 continue;
             }
 
-            if (channel.IsTerminated)
-            {
-                continue;
-            }
-
             linkedWorkerCount++;
-            if (channel.ContributesHttpCapacity)
+            if (!channel.IsTerminated &&
+                channel.ContributesHttpCapacity)
             {
                 httpCapacity += DefaultHttpWorkerCapacity;
             }
         }
+
+        linkedWorkerCount += _linkAttempts.Values.Count(slot =>
+            slot.Channel is null &&
+            slot.RemovalOwnershipPending);
 
         return (httpCapacity, linkedWorkerCount);
     }
@@ -1726,6 +1799,12 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         // Indicates that an uncertain unlink produced an exact fallback handoff.
         public bool RemovalFallbackRecorded { get; set; }
+
+        // Indicates that WorkerProxy confirmed sticky primary removal ownership.
+        public bool RemovalHandoffConfirmed { get; set; }
+
+        // Keeps final retirement fenced when no primary acknowledgement or exact fallback identity is available.
+        public bool RemovalOwnershipPending { get; set; }
 
         // Indicates that a previously accepted link has terminated and cannot be replayed.
         public bool Terminal { get; set; }
