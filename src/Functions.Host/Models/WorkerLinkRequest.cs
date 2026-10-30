@@ -1,6 +1,7 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
 using Azure.Functions.Rpc.Client;
 using Newtonsoft.Json;
 
@@ -31,4 +32,11 @@ public sealed class WorkerLinkRequest
     /// </summary>
     [JsonProperty("worker")]
     public FunctionsSplitPodIdentity? Worker { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional authoritative original WorkerProxy process startup time supplied beside
+    /// <see cref="Worker"/>. Older callers may omit this field.
+    /// </summary>
+    [JsonProperty("workerProxyStartupTime")]
+    public DateTimeOffset? WorkerProxyStartupTime { get; set; }
 }

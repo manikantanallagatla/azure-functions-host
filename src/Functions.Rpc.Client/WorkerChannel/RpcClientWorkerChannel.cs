@@ -450,6 +450,44 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
         }
     }
 
+    internal bool TryGetCountScaleInCandidate(
+        string functionGroup,
+        bool isAlwaysReady,
+        out bool isIdle)
+    {
+        lock (_invocationAdmissionLock)
+        {
+            if (!IsCountScaleInEligibleLocked(functionGroup, isAlwaysReady))
+            {
+                isIdle = false;
+                return false;
+            }
+
+            isIdle = _committedInvocations.Count == 0;
+            return true;
+        }
+    }
+
+    internal Task TryBeginCountScaleIn(
+        string functionGroup,
+        bool isAlwaysReady,
+        bool requireIdle)
+    {
+        lock (_invocationAdmissionLock)
+        {
+            if (!IsCountScaleInEligibleLocked(functionGroup, isAlwaysReady) ||
+                (requireIdle && _committedInvocations.Count != 0))
+            {
+                return null;
+            }
+
+            Volatile.Write(ref _draining, true);
+            _idleSinceTimestamp = null;
+            CompleteDrainIfReadyLocked();
+            return _drainCompletion.Task;
+        }
+    }
+
     internal Task CommitScaleInReservation(Guid reservationId)
     {
         lock (_invocationAdmissionLock)
@@ -465,6 +503,17 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
             return _drainCompletion.Task;
         }
     }
+
+    private bool IsCountScaleInEligibleLocked(string functionGroup, bool isAlwaysReady)
+        => string.Equals(_functionGroupName, functionGroup, StringComparison.Ordinal) &&
+            _isAlwaysReady == isAlwaysReady &&
+            _scaleInReady &&
+            !_runtimeAdmissionClosed &&
+            !_draining &&
+            _scaleInReservationId is null &&
+            !_terminalAdmissionClosed &&
+            !IsTerminated &&
+            IsChannelReadyForInvocations();
 
     internal void CloseRuntimeAdmission()
     {

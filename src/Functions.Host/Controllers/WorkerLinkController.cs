@@ -91,7 +91,13 @@ public sealed partial class WorkerLinkController : Controller
             return BadRequest(new RequestValidationResponse(errors));
         }
 
-        return await LinkValidatedWorkerAsync(workerId, grpcEndpoint, request!.Worker, started, cancellationToken);
+        return await LinkValidatedWorkerAsync(
+            workerId,
+            grpcEndpoint,
+            request!.Worker,
+            request.WorkerProxyStartupTime,
+            started,
+            cancellationToken);
     }
 
     private IReadOnlyList<RequestValidationError> ValidateRequest(string workerId, WorkerLinkRequest? request,
@@ -132,6 +138,10 @@ public sealed partial class WorkerLinkController : Controller
                 errors.Add(new(ErrorCodes.WorkerIdentityMismatch, "worker.podName"));
             }
         }
+        else if (request.WorkerProxyStartupTime is not null)
+        {
+            errors.Add(new(ErrorCodes.InvalidWorkerProxyStartupTime, "workerProxyStartupTime"));
+        }
 
         return errors;
     }
@@ -141,15 +151,20 @@ public sealed partial class WorkerLinkController : Controller
         string workerId,
         Uri grpcEndpoint,
         FunctionsSplitPodIdentity? worker,
+        DateTimeOffset? workerProxyStartupTime,
         long started,
         CancellationToken cancellationToken)
     {
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            WorkerLinkResult result = worker is null
-                ? await _registry.LinkAsync(workerId, grpcEndpoint, cancellationToken)
-                : await _registry.LinkAsync(workerId, grpcEndpoint, worker, cancellationToken);
+            WorkerLinkResult result = worker switch
+            {
+                null => await _registry.LinkAsync(workerId, grpcEndpoint, cancellationToken),
+                _ when workerProxyStartupTime is { } authoritativeStartupTime =>
+                    await _registry.LinkAsync(workerId, grpcEndpoint, worker, authoritativeStartupTime, cancellationToken),
+                _ => await _registry.LinkAsync(workerId, grpcEndpoint, worker, cancellationToken),
+            };
             Log.LinkAccepted(_logger, workerId, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
             return StatusCode(result.IsNewLink ? StatusCodes.Status201Created : StatusCodes.Status200OK);
@@ -185,7 +200,7 @@ public sealed partial class WorkerLinkController : Controller
         (int statusCode, string code, string detail) = reason switch
         {
             WorkerLinkFailureReason.Conflict => (StatusCodes.Status409Conflict, ErrorCodes.LinkConflict,
-                "The worker identity is already linked to another endpoint."),
+                "The worker link conflicts with the existing endpoint or authoritative metadata."),
             WorkerLinkFailureReason.WorkerTerminated => (StatusCodes.Status409Conflict, ErrorCodes.WorkerTerminated,
                 "The worker's initialized channel has terminated."),
             WorkerLinkFailureReason.RuntimeStopping => (StatusCodes.Status503ServiceUnavailable, ErrorCodes.RuntimeStopping,
@@ -218,6 +233,7 @@ public sealed partial class WorkerLinkController : Controller
     {
         public const string InvalidBody = nameof(InvalidBody);
         public const string InvalidEndpoint = nameof(InvalidEndpoint);
+        public const string InvalidWorkerProxyStartupTime = nameof(InvalidWorkerProxyStartupTime);
         public const string InvalidWorkerIdentity = nameof(InvalidWorkerIdentity);
         public const string LinkConflict = nameof(LinkConflict);
         public const string LinkTimeout = nameof(LinkTimeout);

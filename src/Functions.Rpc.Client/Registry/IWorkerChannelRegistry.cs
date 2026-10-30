@@ -66,6 +66,24 @@ public interface IWorkerChannelRegistry : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Atomically admits one worker while preserving its exact physical identity and original WorkerProxy startup time.
+    /// </summary>
+    /// <param name="workerId">The worker identifier, which must ordinally match <paramref name="worker"/>.</param>
+    /// <param name="grpcEndpoint">The absolute FunctionRpc endpoint.</param>
+    /// <param name="worker">The authoritative exact worker identity supplied by Legion.</param>
+    /// <param name="workerProxyStartupTime">The original authoritative WorkerProxy process startup time supplied by Legion.</param>
+    /// <param name="cancellationToken">Cancels a new link attempt, or only the caller's wait for an existing attempt.</param>
+    /// <returns>The initialized and registered channel and whether this caller started the successful attempt.</returns>
+    /// <exception cref="WorkerLinkException">The request conflicts with the registry's admission state.</exception>
+    /// <exception cref="TimeoutException">The new link attempt or this caller's retry wait exceeded its deadline.</exception>
+    Task<WorkerLinkResult> LinkAsync(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity worker,
+        DateTimeOffset workerProxyStartupTime,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Removes a linked worker, completes its request stream, and disposes it after peer termination.
     /// </summary>
     /// <remarks>Local withdrawal is immediate; every post-withdrawal outcome disposes the terminal channel.</remarks>

@@ -26,7 +26,7 @@ namespace Azure.Functions.Rpc.Client;
 /// ScriptHost function set is known; only ready channels are available for invocation dispatch.
 /// </remarks>
 internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager,
-    IRuntimeRetirementWorkerManager
+    IWorkerCountScaleInManager, IRuntimeRetirementWorkerManager
 {
     private const int CompletedWorkerRemovalCapacity = 128;
     private const int DefaultHttpWorkerCapacity = 16;
@@ -172,7 +172,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         string workerId,
         Uri grpcEndpoint,
         CancellationToken cancellationToken = default)
-        => LinkAsyncCore(workerId, grpcEndpoint, worker: null, cancellationToken);
+        => LinkAsyncCore(workerId, grpcEndpoint, worker: null, workerProxyStartupTime: null, cancellationToken);
 
     public Task<WorkerLinkResult> LinkAsync(
         string workerId,
@@ -191,13 +191,35 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             throw new ArgumentException("The route worker ID must exactly match the worker pod name.", nameof(worker));
         }
 
-        return LinkAsyncCore(workerId, grpcEndpoint, worker, cancellationToken);
+        return LinkAsyncCore(workerId, grpcEndpoint, worker, workerProxyStartupTime: null, cancellationToken);
+    }
+
+    public Task<WorkerLinkResult> LinkAsync(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity worker,
+        DateTimeOffset workerProxyStartupTime,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(worker);
+        if (!worker.IsValid())
+        {
+            throw new ArgumentException("The worker identity is incomplete or invalid.", nameof(worker));
+        }
+
+        if (!string.Equals(workerId, worker.PodName, StringComparison.Ordinal))
+        {
+            throw new ArgumentException("The route worker ID must exactly match the worker pod name.", nameof(worker));
+        }
+
+        return LinkAsyncCore(workerId, grpcEndpoint, worker, workerProxyStartupTime, cancellationToken);
     }
 
     private Task<WorkerLinkResult> LinkAsyncCore(
         string workerId,
         Uri grpcEndpoint,
         FunctionsSplitPodIdentity worker,
+        DateTimeOffset? workerProxyStartupTime,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerId);
@@ -233,6 +255,18 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                     }
                 }
 
+                if (workerProxyStartupTime is not null)
+                {
+                    if (existing.WorkerProxyStartupTime is not null &&
+                        existing.WorkerProxyStartupTime != workerProxyStartupTime)
+                    {
+                        throw new WorkerLinkException(WorkerLinkFailureReason.Conflict,
+                            "The worker is already associated with a different original startup time.");
+                    }
+
+                    existing.WorkerProxyStartupTime ??= workerProxyStartupTime;
+                }
+
                 if (existing.Terminal || existing.Channel is { IsTerminated: true })
                 {
                     throw new WorkerLinkException(WorkerLinkFailureReason.WorkerTerminated,
@@ -243,7 +277,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             }
 
             linkCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            slot = new() { Endpoint = grpcEndpoint, LinkTask = linkCompletion.Task, Worker = worker };
+            slot = new()
+            {
+                Endpoint = grpcEndpoint,
+                LinkTask = linkCompletion.Task,
+                Worker = worker,
+                WorkerProxyStartupTime = workerProxyStartupTime,
+            };
             _slots.Add(workerId, slot);
             _linkAttempts.Add(workerId, slot);
         }
@@ -358,6 +398,164 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             SignalScaleInStateChangedLocked();
             return true;
         }
+    }
+
+    public WorkerCountScaleInResult ScaleInWorkers(
+        string functionGroup,
+        bool isAlwaysReady,
+        int desiredWorkerCount)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(functionGroup);
+        ArgumentOutOfRangeException.ThrowIfNegative(desiredWorkerCount);
+
+        List<CountScaleInSelection> selections = [];
+        HttpWorkerScaleInState resultingState;
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            RefreshScaleInStateLocked();
+            if (_runtimeRetirementRequested)
+            {
+                Log.CountScaleInSkippedForRuntimeRetirement(_logger, functionGroup, isAlwaysReady);
+                return new(0, GetScaleInStateLocked());
+            }
+
+            List<CountScaleInCandidate> candidates = [];
+            foreach ((string workerId, WorkerSlot slot) in _slots)
+            {
+                if (slot.Channel is not { } channel ||
+                    slot.DrainTask is not null ||
+                    !channel.TryGetCountScaleInCandidate(functionGroup, isAlwaysReady, out bool isIdle))
+                {
+                    continue;
+                }
+
+                candidates.Add(new(workerId, slot, isIdle, slot.WorkerProxyStartupTime));
+            }
+
+            int excess = Math.Max(0, candidates.Count - desiredWorkerCount);
+            if (excess == 0)
+            {
+                return new(0, GetScaleInStateLocked());
+            }
+
+            string retainedWorkerId = null;
+            if (desiredWorkerCount > 0 &&
+                string.Equals(functionGroup, FunctionGroups.Durable, StringComparison.OrdinalIgnoreCase))
+            {
+                if (candidates.Any(static candidate => candidate.WorkerProxyStartupTime is null))
+                {
+                    Log.CountScaleInOrderingUnavailable(
+                        _logger,
+                        functionGroup,
+                        isAlwaysReady,
+                        candidates.Count);
+                    return new(0, GetScaleInStateLocked());
+                }
+
+                long newestStartupTicks = candidates.Max(
+                    static candidate => candidate.WorkerProxyStartupTime.Value.UtcTicks);
+                CountScaleInCandidate[] newestCandidates = [.. candidates.Where(
+                    candidate => candidate.WorkerProxyStartupTime.Value.UtcTicks == newestStartupTicks)];
+                if (newestCandidates.Length != 1)
+                {
+                    Log.CountScaleInOrderingAmbiguous(
+                        _logger,
+                        functionGroup,
+                        isAlwaysReady,
+                        newestCandidates.Length);
+                    return new(0, GetScaleInStateLocked());
+                }
+
+                retainedWorkerId = newestCandidates[0].WorkerId;
+            }
+
+            CountScaleInCandidate[] orderedCandidates = [.. candidates
+                .Where(candidate => !string.Equals(candidate.WorkerId, retainedWorkerId, StringComparison.Ordinal))
+                .OrderByDescending(static candidate => candidate.IsIdle)
+                .ThenBy(static candidate => candidate.WorkerProxyStartupTime?.UtcTicks ?? long.MinValue)
+                .ThenBy(static candidate => candidate.WorkerId, StringComparer.Ordinal)];
+            HashSet<string> selectedWorkerIds = new(StringComparer.Ordinal);
+
+            foreach (CountScaleInCandidate candidate in orderedCandidates.Where(static candidate => candidate.IsIdle))
+            {
+                if (selections.Count == excess)
+                {
+                    break;
+                }
+
+                TryCommitCountScaleInCandidateLocked(
+                    candidate,
+                    functionGroup,
+                    isAlwaysReady,
+                    requireIdle: true,
+                    selections,
+                    selectedWorkerIds);
+            }
+
+            foreach (CountScaleInCandidate candidate in orderedCandidates)
+            {
+                if (selections.Count == excess)
+                {
+                    break;
+                }
+
+                if (selectedWorkerIds.Contains(candidate.WorkerId))
+                {
+                    continue;
+                }
+
+                TryCommitCountScaleInCandidateLocked(
+                    candidate,
+                    functionGroup,
+                    isAlwaysReady,
+                    requireIdle: false,
+                    selections,
+                    selectedWorkerIds);
+            }
+
+            if (selections.Count > 0)
+            {
+                SignalReadyChannelsLocked();
+                SignalScaleInStateChangedLocked();
+            }
+
+            resultingState = GetScaleInStateLocked();
+        }
+
+        foreach (CountScaleInSelection selection in selections)
+        {
+            _ = CompleteDrainAsync(
+                selection.WorkerId,
+                selection.Slot,
+                selection.InvocationDrainTask,
+                selection.Completion);
+            _ = ObserveCountScaleInDrainAsync(selection.WorkerId, selection.Completion.Task);
+            Log.CountScaleInWorkerSelected(_logger, selection.WorkerId, functionGroup, isAlwaysReady);
+        }
+
+        return new(selections.Count, resultingState);
+    }
+
+    private static void TryCommitCountScaleInCandidateLocked(
+        CountScaleInCandidate candidate,
+        string functionGroup,
+        bool isAlwaysReady,
+        bool requireIdle,
+        List<CountScaleInSelection> selections,
+        HashSet<string> selectedWorkerIds)
+    {
+        if (candidate.Slot.DrainTask is not null ||
+            candidate.Slot.Channel is not { } channel ||
+            channel.TryBeginCountScaleIn(functionGroup, isAlwaysReady, requireIdle) is not { } invocationDrainTask)
+        {
+            return;
+        }
+
+        TaskCompletionSource<bool> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        candidate.Slot.DrainTask = completion.Task;
+        selections.Add(new(candidate.WorkerId, candidate.Slot, invocationDrainTask, completion));
+        selectedWorkerIds.Add(candidate.WorkerId);
     }
 
     bool IRuntimeRetirementWorkerManager.TryCloseAdmission(SplitScriptHostActivationFaulted condition)
@@ -1009,6 +1207,21 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
     }
 
+    private async Task ObserveCountScaleInDrainAsync(string workerId, Task<bool> drainCompletion)
+    {
+        try
+        {
+            if (!await drainCompletion)
+            {
+                Log.CountScaleInDrainIncomplete(_logger, workerId);
+            }
+        }
+        catch (Exception exception)
+        {
+            Log.CountScaleInDrainFailed(_logger, exception, workerId);
+        }
+    }
+
     private async Task CompleteRuntimeRetirementDrainAsync(
         IReadOnlyList<Task<bool>> existingDrains,
         IReadOnlyList<(string WorkerId, WorkerSlot Slot, Task InvocationDrainTask, TaskCompletionSource<bool> Completion)> selections,
@@ -1366,7 +1579,22 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         // The authoritative physical identity is set at most once and retained after channel withdrawal.
         public FunctionsSplitPodIdentity Worker { get; set; }
+
+        // The authoritative original WorkerProxy startup time is retained beside exact identity.
+        public DateTimeOffset? WorkerProxyStartupTime { get; set; }
     }
+
+    private sealed record CountScaleInCandidate(
+        string WorkerId,
+        WorkerSlot Slot,
+        bool IsIdle,
+        DateTimeOffset? WorkerProxyStartupTime);
+
+    private sealed record CountScaleInSelection(
+        string WorkerId,
+        WorkerSlot Slot,
+        Task InvocationDrainTask,
+        TaskCompletionSource<bool> Completion);
 
     private sealed record ChannelSetupContext(
         IReadOnlyList<FunctionMetadata> Functions,
@@ -1400,5 +1628,44 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         [LoggerMessage(7, LogLevel.Warning,
             "Cannot publish fallback removal after an uncertain graceful unlink for endpoint {WorkerEndpoint} because the link omitted exact worker identity.")]
         public static partial void WorkerRemovalFallbackUnavailable(ILogger logger, Uri workerEndpoint);
+
+        [LoggerMessage(8, LogLevel.Information,
+            "Selected worker {WorkerId} for authoritative count scale-in of function group {FunctionGroup} and always-ready class {IsAlwaysReady}.")]
+        public static partial void CountScaleInWorkerSelected(
+            ILogger logger,
+            string workerId,
+            string functionGroup,
+            bool isAlwaysReady);
+
+        [LoggerMessage(9, LogLevel.Warning,
+            "The committed authoritative count scale-in drain for worker {WorkerId} did not complete locally.")]
+        public static partial void CountScaleInDrainIncomplete(ILogger logger, string workerId);
+
+        [LoggerMessage(10, LogLevel.Error,
+            "The committed authoritative count scale-in drain for worker {WorkerId} failed.")]
+        public static partial void CountScaleInDrainFailed(ILogger logger, Exception exception, string workerId);
+
+        [LoggerMessage(11, LogLevel.Debug,
+            "Skipped authoritative count scale-in for function group {FunctionGroup} and always-ready class {IsAlwaysReady} because Runtime retirement is active.")]
+        public static partial void CountScaleInSkippedForRuntimeRetirement(
+            ILogger logger,
+            string functionGroup,
+            bool isAlwaysReady);
+
+        [LoggerMessage(12, LogLevel.Warning,
+            "Skipped positive Durable count scale-in for function group {FunctionGroup} and always-ready class {IsAlwaysReady} because authoritative startup time is unavailable for one or more of {CandidateCount} eligible Workers.")]
+        public static partial void CountScaleInOrderingUnavailable(
+            ILogger logger,
+            string functionGroup,
+            bool isAlwaysReady,
+            int candidateCount);
+
+        [LoggerMessage(13, LogLevel.Warning,
+            "Skipped positive Durable count scale-in for function group {FunctionGroup} and always-ready class {IsAlwaysReady} because {NewestCandidateCount} eligible Workers share the newest authoritative startup time.")]
+        public static partial void CountScaleInOrderingAmbiguous(
+            ILogger logger,
+            string functionGroup,
+            bool isAlwaysReady,
+            int newestCandidateCount);
     }
 }

@@ -11,17 +11,17 @@ namespace Azure.Functions.Host.HostState;
 
 internal static class AppServerHostStateServiceCollectionExtensions
 {
-    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
-
     public static IServiceCollection AddHttpOnDemandWorkerScaleIn(this IServiceCollection services)
     {
         ArgumentNullException.ThrowIfNull(services);
 
         services.AddHttpClient(
             AppServerHostStateClient.HttpClientName,
-            client => client.Timeout = RequestTimeout);
+            client => client.Timeout = AppServerHostStateClient.RequestTimeout);
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<AppServerHostStateClient>();
+        services.AddSingleton<IWorkerScaleInStatePublisher>(
+            provider => provider.GetRequiredService<AppServerHostStateClient>());
         services.AddSingleton<RuntimeRetirementManager>();
         services.AddSingleton<IRuntimeRetirementManager>(
             provider => provider.GetRequiredService<RuntimeRetirementManager>());

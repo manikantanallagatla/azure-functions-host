@@ -39,7 +39,7 @@ internal sealed class AppServerHostStateClient(
     IHttpWorkerScaleInManager scaleInManager,
     IRuntimeRetirementWorkerManager retirementWorkerManager,
     TimeProvider timeProvider,
-    IConfiguration configuration)
+    IConfiguration configuration) : IWorkerScaleInStatePublisher
 {
     internal const string CapacityFenceHeader = "x-ms-functions-host-state-capacity-fence";
     internal const string CapacityFenceApplied = "applied";
@@ -50,6 +50,7 @@ internal sealed class AppServerHostStateClient(
     internal const string HttpClientName = "AppServerHostState";
     internal const string LifecycleCapacityFenceRequired = "lifecycle-required";
     internal const string RemovalRequestedStatus = "RemovalRequested";
+    internal static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
 
     private readonly IConfiguration _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
     private readonly string? _containerName = configuration[EnvironmentSettingNames.ContainerName];
@@ -74,8 +75,40 @@ internal sealed class AppServerHostStateClient(
             status: null,
             acquireClosed: null,
             allowDuringRetirement: false,
+            capacityFence: CapacityFenceRequired,
             cancellationToken);
     }
+
+    internal async Task<AppServerHostStatePublishResult> PublishAuthoritativeScaleInAsync(
+        HttpWorkerScaleInState state,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        using CancellationTokenSource timeoutSource =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutSource.CancelAfter(RequestTimeout);
+        try
+        {
+            return await PublishAsync(
+                state,
+                status: null,
+                acquireClosed: null,
+                allowDuringRetirement: false,
+                capacityFence: null,
+                timeoutSource.Token);
+        }
+        catch (OperationCanceledException) when (
+            timeoutSource.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            return AppServerHostStatePublishResult.TransientFailure;
+        }
+    }
+
+    async Task<bool> IWorkerScaleInStatePublisher.PublishAuthoritativeScaleInAsync(
+        HttpWorkerScaleInState state,
+        CancellationToken cancellationToken)
+        => await PublishAuthoritativeScaleInAsync(state, cancellationToken) is AppServerHostStatePublishResult.Applied;
 
     internal Task<AppServerHostStatePublishResult> BindRuntimeIncarnationAsync(
         CancellationToken cancellationToken)
@@ -84,6 +117,7 @@ internal sealed class AppServerHostStateClient(
             status: null,
             acquireClosed: null,
             allowDuringRetirement: true,
+            capacityFence: CapacityFenceRequired,
             cancellationToken);
 
     internal Task<AppServerHostStatePublishResult> PublishLifecycleAsync(
@@ -97,6 +131,7 @@ internal sealed class AppServerHostStateClient(
             status,
             acquireClosed: true,
             allowDuringRetirement: true,
+            capacityFence: LifecycleCapacityFenceRequired,
             cancellationToken);
     }
 
@@ -105,6 +140,7 @@ internal sealed class AppServerHostStateClient(
         RuntimeLifecycleStatus? status,
         bool? acquireClosed,
         bool allowDuringRetirement,
+        string? capacityFence,
         CancellationToken cancellationToken)
     {
         await _publicationGate.WaitAsync(cancellationToken);
@@ -139,9 +175,10 @@ internal sealed class AppServerHostStateClient(
                     AppServerHostStateJsonContext.Default.HostStateRequest),
             };
             request.Headers.Add(ScriptConstants.ContainerInstanceHeader, _containerName);
-            request.Headers.Add(
-                CapacityFenceHeader,
-                status is null ? CapacityFenceRequired : LifecycleCapacityFenceRequired);
+            if (capacityFence is not null)
+            {
+                request.Headers.Add(CapacityFenceHeader, capacityFence);
+            }
 
             using HttpResponseMessage response = await _httpClientFactory.CreateClient(HttpClientName).SendAsync(
                 request,
@@ -154,8 +191,9 @@ internal sealed class AppServerHostStateClient(
 
             if (response.IsSuccessStatusCode)
             {
-                return response.Headers.TryGetValues(CapacityFenceHeader, out var values) &&
-                    values.Any(value => string.Equals(value, CapacityFenceApplied, StringComparison.OrdinalIgnoreCase))
+                return capacityFence is null ||
+                    (response.Headers.TryGetValues(CapacityFenceHeader, out var values) &&
+                    values.Any(value => string.Equals(value, CapacityFenceApplied, StringComparison.OrdinalIgnoreCase)))
                         ? AppServerHostStatePublishResult.Applied
                         : AppServerHostStatePublishResult.Unsupported;
             }
