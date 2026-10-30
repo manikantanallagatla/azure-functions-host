@@ -23,10 +23,15 @@ namespace Azure.Functions.Rpc.Client;
 internal sealed partial class RpcClientScriptHostStartupCoordinator(
     IWorkerChannelRegistry channelRegistry,
     IHostedService scriptHost,
+    IRuntimeRetirementManager retirementManager,
     IHostApplicationLifetime applicationLifetime,
     ILogger<RpcClientScriptHostStartupCoordinator> logger) : IHostedService, IAsyncDisposable
 {
     private readonly IWorkerChannelRegistry _channelRegistry = channelRegistry ?? throw new ArgumentNullException(nameof(channelRegistry));
+    private readonly RuntimeIncarnation _incarnation =
+        (retirementManager ?? throw new ArgumentNullException(nameof(retirementManager))).Incarnation;
+
+    private readonly IRuntimeRetirementManager _retirementManager = retirementManager;
     private readonly IHostedService _scriptHost = scriptHost ?? throw new ArgumentNullException(nameof(scriptHost));
     private readonly ILogger<RpcClientScriptHostStartupCoordinator> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     private readonly CancellationTokenSource _shutdown =
@@ -121,10 +126,33 @@ internal sealed partial class RpcClientScriptHostStartupCoordinator(
             Log.StartCanceled(_logger);
             throw;
         }
+        catch (OperationCanceledException exception)
+        {
+            Log.ActivationFailed(_logger, exception);
+            throw;
+        }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            Log.ActivationFailed(_logger, exception);
+            _ = ObserveRetirementAsync(new(_incarnation, exception));
+            throw;
+        }
         catch (Exception exception)
         {
             Log.ActivationFailed(_logger, exception);
             throw;
+        }
+    }
+
+    private async Task ObserveRetirementAsync(SplitScriptHostActivationFaulted condition)
+    {
+        try
+        {
+            await _retirementManager.RequestRetirementAsync(condition);
+        }
+        catch (Exception exception)
+        {
+            Log.RetirementFailed(_logger, exception);
         }
     }
 
@@ -214,5 +242,8 @@ internal sealed partial class RpcClientScriptHostStartupCoordinator(
 
         [LoggerMessage(5, LogLevel.Error, "Client ScriptHost shutdown failed.")]
         public static partial void StopFailed(ILogger logger, Exception exception);
+
+        [LoggerMessage(6, LogLevel.Error, "Runtime retirement after first-link ScriptHost activation failure did not complete.")]
+        public static partial void RetirementFailed(ILogger logger, Exception exception);
     }
 }

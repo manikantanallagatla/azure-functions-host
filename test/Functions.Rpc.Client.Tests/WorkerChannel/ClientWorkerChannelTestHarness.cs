@@ -36,11 +36,17 @@ internal sealed class ClientWorkerChannelTestHarness : IAsyncDisposable
 
     internal TestDuplexChannel<StreamingMessage> Transport { get; }
 
-    internal static async Task<ClientWorkerChannelTestHarness> CreateAsync(string workerId, IScriptEventManager eventManager = null,
-        string advertisedHttpUri = null, IHttpProxyService httpProxyService = null)
+    internal static async Task<ClientWorkerChannelTestHarness> CreateAsync(
+        string workerId,
+        IScriptEventManager eventManager = null,
+        string advertisedHttpUri = null,
+        IHttpProxyService httpProxyService = null,
+        string functionGroupName = null,
+        bool? isAlwaysReady = null,
+        TimeProvider timeProvider = null)
     {
         TestDuplexChannel<StreamingMessage> transport = new();
-        RpcClientWorkerChannel channel = CreateFactory(eventManager ?? new ScriptEventManager(), httpProxyService)
+        RpcClientWorkerChannel channel = CreateFactory(eventManager ?? new ScriptEventManager(), httpProxyService, timeProvider)
             .Create(workerId, transport);
         Task start = channel.StartAsync(CancellationToken.None);
 
@@ -64,8 +70,19 @@ internal sealed class ClientWorkerChannelTestHarness : IAsyncDisposable
             initResponse.Capabilities.Add(RpcWorkerConstants.HttpUri, advertisedHttpUri);
         }
 
+        if (functionGroupName is not null)
+        {
+            initResponse.Capabilities.Add(RpcClientWorkerChannel.FunctionGroupNameCapability, functionGroupName);
+        }
+
+        if (isAlwaysReady.HasValue)
+        {
+            initResponse.Capabilities.Add(RpcClientWorkerChannel.IsAlwaysReadyCapability, isAlwaysReady.Value.ToString());
+        }
+
         await transport.SendResponseAsync(new() { WorkerInitResponse = initResponse });
         await start.WaitAsync(TestTimeout);
+        channel.SetScaleInReady(true);
 
         return new(channel, transport);
     }
@@ -125,7 +142,10 @@ internal sealed class ClientWorkerChannelTestHarness : IAsyncDisposable
 
     public ValueTask DisposeAsync() => Channel.DisposeAsync();
 
-    private static RpcClientWorkerChannelFactory CreateFactory(IScriptEventManager eventManager, IHttpProxyService httpProxyService)
+    private static RpcClientWorkerChannelFactory CreateFactory(
+        IScriptEventManager eventManager,
+        IHttpProxyService httpProxyService,
+        TimeProvider timeProvider)
     {
         Mock<IScriptHostManager> hostManager = new();
         hostManager.As<IServiceProvider>()
@@ -149,6 +169,7 @@ internal sealed class ClientWorkerChannelTestHarness : IAsyncDisposable
             Options.Create(new FunctionsHostingConfigOptions()),
             appCapabilitiesStore.Object,
             httpProxyService ?? Mock.Of<IHttpProxyService>(),
-            Mock.Of<IMetricsLogger>());
+            Mock.Of<IMetricsLogger>(),
+            timeProvider);
     }
 }

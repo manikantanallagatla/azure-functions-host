@@ -20,6 +20,7 @@ internal sealed class RpcClientStartupTestHost : IAsyncDisposable
 
     public RpcClientStartupTestHost()
     {
+        RuntimeIncarnation = RuntimeIncarnation.Create();
         ScriptHostManager = ScriptHost.As<IScriptHostManager>();
         ScriptHostManager.SetupGet(manager => manager.State).Returns(ScriptHostState.Running);
         ScriptHost.Setup(host => host.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -31,6 +32,10 @@ internal sealed class RpcClientStartupTestHost : IAsyncDisposable
                 WaitEntered.TrySetResult();
                 return _firstLink.Task.WaitAsync(token);
             });
+        RetirementManager.SetupGet(manager => manager.Incarnation).Returns(RuntimeIncarnation);
+        RetirementManager.Setup(manager => manager.RequestRetirementAsync(It.IsAny<SplitScriptHostActivationFaulted>()))
+            .Callback<SplitScriptHostActivationFaulted>(condition => RetirementRequested.TrySetResult(condition))
+            .Returns(Task.CompletedTask);
         Logger.Setup(logger => logger.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
         var loggerProvider = new Mock<ILoggerProvider>();
         loggerProvider.Setup(provider => provider.CreateLogger(It.IsAny<string>())).Returns(Logger.Object);
@@ -40,6 +45,7 @@ internal sealed class RpcClientStartupTestHost : IAsyncDisposable
             services.AddRpcClientWebHostServices(_ => ScriptHost.Object);
             services.AddLogging(logging => logging.AddProvider(loggerProvider.Object));
             services.Replace(ServiceDescriptor.Singleton<IWorkerChannelRegistry>(_ => Registry.Object));
+            services.AddSingleton(RetirementManager.Object);
         }).Build();
     }
 
@@ -48,6 +54,13 @@ internal sealed class RpcClientStartupTestHost : IAsyncDisposable
     public Mock<IScriptHostManager> ScriptHostManager { get; }
 
     public Mock<IWorkerChannelRegistry> Registry { get; } = new(MockBehavior.Strict);
+
+    public Mock<IRuntimeRetirementManager> RetirementManager { get; } = new(MockBehavior.Strict);
+
+    public RuntimeIncarnation RuntimeIncarnation { get; }
+
+    public TaskCompletionSource<SplitScriptHostActivationFaulted> RetirementRequested { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public Mock<ILogger> Logger { get; } = new();
 

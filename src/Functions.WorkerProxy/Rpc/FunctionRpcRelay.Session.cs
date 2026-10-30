@@ -27,6 +27,7 @@ internal sealed partial class FunctionRpcRelay
         WorkerPodStateManager stateManager)
     {
         private const string FunctionGroupNameCapability = "FunctionGroupName";
+        private const string IsAlwaysReadyCapability = "IsAlwaysReady";
         private readonly Lock _stateLock = new();
         private readonly Channel<StreamingMessage> _toRuntime = CreateChannel();
         private readonly Channel<StreamingMessage> _toWorker = CreateChannel();
@@ -99,13 +100,13 @@ internal sealed partial class FunctionRpcRelay
                     return FunctionRpcRelayAttachResult.Duplicate;
                 }
 
-                SetAttachedLocked(side, value: true);
-                if (side == FunctionRpcRelaySide.Worker)
+                if (side == FunctionRpcRelaySide.Worker &&
+                    !stateManager.OnWorkerAttached(id) && stateManager.State.RemovalRequested)
                 {
-                    // Observe admission without changing relay replacement policy; a failed assignment stays terminal.
-                    stateManager.OnWorkerAttached(id);
+                    return FunctionRpcRelayAttachResult.Terminated;
                 }
 
+                SetAttachedLocked(side, value: true);
                 return FunctionRpcRelayAttachResult.Attached;
             }
         }
@@ -196,7 +197,12 @@ internal sealed partial class FunctionRpcRelay
         /// </summary>
         public void RequestShutdown()
         {
-            TryTerminate(new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Shutdown, Side: null, Exception: null));
+            TryTerminate(new FunctionRpcRelayTerminalState(
+                id,
+                FunctionRpcRelayTerminationReason.Shutdown,
+                Side: null,
+                Exception: null,
+                RemovalRequested: false));
         }
 
         private static Channel<StreamingMessage> CreateChannel()
@@ -275,11 +281,12 @@ internal sealed partial class FunctionRpcRelay
             if (capabilities is null)
             {
                 Uri? destination = capabilityFinalizer.FinalizeCapabilities(finalized.WorkerInitResponse.Capabilities);
-                ApplyFunctionGroupCapability(finalized.WorkerInitResponse.Capabilities);
+                ApplyWorkerClassificationCapabilities(finalized.WorkerInitResponse.Capabilities);
                 capabilities = finalized.WorkerInitResponse.Capabilities.ToFrozenDictionary(StringComparer.Ordinal);
                 lock (_stateLock)
                 {
-                    if (_terminalState is not null)
+                    if (_terminalState is not null || !_runtimeAttached || !_workerAttached ||
+                        !stateManager.OnWorkerInitialized(id))
                     {
                         return null;
                     }
@@ -299,23 +306,29 @@ internal sealed partial class FunctionRpcRelay
         }
 
         /// <summary>
-        /// Advertises the function group assigned to this session's worker, replacing any worker-supplied value.
+        /// Advertises the platform-assigned function group and capacity class, replacing worker-supplied values.
         /// </summary>
         /// <remarks>
-        /// Only WorkerProxy sets this capability, so any worker-supplied value is always discarded.
+        /// Only WorkerProxy sets these capabilities, so worker-supplied values are always discarded.
         /// The platform assigns the worker before the runtime initializes it. Without a live assignment for this session,
-        /// the capability is omitted so the runtime never receives an unassigned or stale group.
+        /// the capabilities are omitted so the runtime never receives stale classification.
         /// </remarks>
-        private void ApplyFunctionGroupCapability(IDictionary<string, string> capabilities)
+        private void ApplyWorkerClassificationCapabilities(IDictionary<string, string> capabilities)
         {
-            // Only WorkerProxy sets this capability; discard any worker-supplied value.
             capabilities.Remove(FunctionGroupNameCapability);
+            capabilities.Remove(IsAlwaysReadyCapability);
 
             WorkerPodState state = stateManager.State;
-            if (state is { AssignmentState: WorkerAssignmentState.Ready, FunctionGroupName: { } functionGroupName }
+            if (state is
+                {
+                    AssignmentState: WorkerAssignmentState.Ready,
+                    FunctionGroupName: { } functionGroupName,
+                    IsAlwaysReady: { } isAlwaysReady,
+                }
                 && state.SessionId == id)
             {
                 capabilities[FunctionGroupNameCapability] = functionGroupName;
+                capabilities[IsAlwaysReadyCapability] = isAlwaysReady ? bool.TrueString : bool.FalseString;
                 return;
             }
 
@@ -345,7 +358,12 @@ internal sealed partial class FunctionRpcRelay
             {
                 await completedTask;
 
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.PeerClosed, side, Exception: null);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.PeerClosed,
+                    side,
+                    Exception: null,
+                    RemovalRequested: false);
             }
             catch (OperationCanceledException exception)
             {
@@ -354,15 +372,30 @@ internal sealed partial class FunctionRpcRelay
                     return await _completion.Task;
                 }
 
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Canceled, side, exception);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.Canceled,
+                    side,
+                    exception,
+                    RemovalRequested: false);
             }
             catch (Exception exception) when (callCancellationToken.IsCancellationRequested)
             {
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Canceled, side, exception);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.Canceled,
+                    side,
+                    exception,
+                    RemovalRequested: false);
             }
             catch (Exception exception)
             {
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Faulted, side, exception);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.Faulted,
+                    side,
+                    exception,
+                    RemovalRequested: false);
             }
         }
 
@@ -375,9 +408,16 @@ internal sealed partial class FunctionRpcRelay
                     return false;
                 }
 
-                _terminalState = terminalState;
+                bool peerTerminated = terminalState.Reason is FunctionRpcRelayTerminationReason.PeerClosed
+                    or FunctionRpcRelayTerminationReason.Canceled
+                    or FunctionRpcRelayTerminationReason.Faulted;
                 // Withdraw readiness before completing stream tasks or starting potentially slow teardown/logging.
-                stateManager.OnSessionTerminated(id);
+                stateManager.OnSessionTerminated(id, peerTerminated);
+                terminalState = terminalState with
+                {
+                    RemovalRequested = stateManager.State.RemovalRequested,
+                };
+                _terminalState = terminalState;
                 _completion.SetResult(terminalState);
             }
 

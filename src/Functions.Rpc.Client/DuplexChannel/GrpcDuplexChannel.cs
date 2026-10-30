@@ -21,7 +21,7 @@ namespace Azure.Functions.Rpc.Client;
 /// The channel supports one response reader and multiple concurrent request writers.
 /// </remarks>
 /// <typeparam name="T">The message type used in both directions.</typeparam>
-internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
+internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHandoffChannel
     where T : class
 {
     private readonly AsyncDuplexStreamingCall<T, T> _call;
@@ -30,6 +30,7 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
     private readonly Task _readPump;
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Task _writePump;
+    private bool _responseStreamCompleted;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="GrpcDuplexChannel{T}"/> class.
@@ -56,6 +57,41 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
 
         _readPump = PumpResponsesAsync();
         _writePump = PumpRequestsAsync();
+    }
+
+    bool IWorkerRemovalHandoffChannel.IsWorkerRemovalHandoffConfirmed
+    {
+        get
+        {
+            if (!Volatile.Read(ref _responseStreamCompleted))
+            {
+                return false;
+            }
+
+            try
+            {
+                foreach (Metadata.Entry trailer in _call.GetTrailers())
+                {
+                    if (string.Equals(
+                        trailer.Key,
+                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                        StringComparison.Ordinal) &&
+                        string.Equals(
+                            trailer.Value,
+                            FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue,
+                            StringComparison.Ordinal))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+
+            return false;
+        }
     }
 
     protected override async ValueTask DisposeAsyncCore()
@@ -94,6 +130,7 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
     private async Task PumpResponsesAsync()
     {
         Exception error = null;
+        bool responseStreamCompleted = false;
 
         try
         {
@@ -101,6 +138,8 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
             {
                 await _incoming.Writer.WriteAsync(_call.ResponseStream.Current, _shutdownSource.Token);
             }
+
+            responseStreamCompleted = true;
         }
         catch (Exception) when (_shutdownSource.IsCancellationRequested)
         {
@@ -108,9 +147,11 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
         catch (Exception exception)
         {
             error = exception;
+            responseStreamCompleted = true;
         }
         finally
         {
+            Volatile.Write(ref _responseStreamCompleted, responseStreamCompleted);
             _outgoing.Writer.TryComplete(error);
             _incoming.Writer.TryComplete(error);
 

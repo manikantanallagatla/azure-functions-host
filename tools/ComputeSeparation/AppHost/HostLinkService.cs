@@ -68,6 +68,8 @@ internal sealed partial class HostLinkService(
         using HttpResponseMessage response = await client.PutAsJsonAsync($"/admin/workers/{Uri.EscapeDataString(workerId)}", new
         {
             workerGrpcEndpoint = grpcEndpoint,
+            workerNamespace = "local-resource-namespace",
+            workerPodName = workerId,
         }, cancellationToken);
 
         await EnsureSuccessAsync("The Host rejected", response, cancellationToken);

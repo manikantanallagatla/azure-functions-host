@@ -1,6 +1,7 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using Azure.Functions.Rpc.Client;
 using Newtonsoft.Json;
 
 namespace Azure.Functions.Host.WorkerLink;
@@ -23,4 +24,16 @@ public sealed class WorkerLinkRequest
     /// </summary>
     [JsonProperty("workerContainerEncryptionKey")]
     public string? WorkerContainerEncryptionKey { get; set; }
+
+    /// <summary>
+    /// Gets or sets the required Legion resource namespace containing the Worker pod.
+    /// </summary>
+    [JsonProperty("workerNamespace")]
+    public string? WorkerNamespace { get; set; }
+
+    /// <summary>
+    /// Gets or sets the required Worker pod name, which must match the route worker ID.
+    /// </summary>
+    [JsonProperty("workerPodName")]
+    public string? WorkerPodName { get; set; }
 }

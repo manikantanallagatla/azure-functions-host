@@ -15,6 +15,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
 using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
@@ -104,13 +105,32 @@ internal sealed class FakeWorkerProxyGrpcServer : IAsyncDisposable
     {
         private readonly TaskCompletionSource _initializationStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _disconnected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _requestsCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource<WorkerInitResponse> _initializationResponse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<CloseResponse>? _closeResponse;
 
         internal string WorkerId { get; } = workerId;
 
         internal Task InitializationStarted => _initializationStarted.Task;
 
         internal Task Disconnected => _disconnected.Task;
+
+        internal Task RequestsCompleted => _requestsCompleted.Task;
+
+        internal void HoldCloseResponse() => _closeResponse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal void CompleteClose(Status status) =>
+            _closeResponse!.SetResult(new(status, WorkerRemovalRequested: true));
+
+        internal void CompleteUnacknowledgedClose(Status status) =>
+            _closeResponse!.SetResult(new(status, WorkerRemovalRequested: false));
+
+        internal Task<CloseResponse> GetCloseResponseAsync(CancellationToken cancellationToken)
+        {
+            _requestsCompleted.TrySetResult();
+            return _closeResponse?.Task.WaitAsync(cancellationToken) ??
+                Task.FromResult(new CloseResponse(Status.DefaultSuccess, WorkerRemovalRequested: true));
+        }
 
         internal void CompleteInitialization(string? httpUri = null)
         {
@@ -140,6 +160,8 @@ internal sealed class FakeWorkerProxyGrpcServer : IAsyncDisposable
         }
 
         internal void MarkDisconnected() => _disconnected.TrySetResult();
+
+        internal sealed record CloseResponse(Status Status, bool WorkerRemovalRequested);
     }
 
     private sealed class TestFunctionRpcService : FunctionRpc.FunctionRpcBase
@@ -179,6 +201,17 @@ internal sealed class FakeWorkerProxyGrpcServer : IAsyncDisposable
                         });
                     }
                 }
+
+                TestWorker.CloseResponse closeResponse =
+                    await worker.GetCloseResponseAsync(context.CancellationToken);
+                if (closeResponse.WorkerRemovalRequested)
+                {
+                    context.ResponseTrailers.Add(
+                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue);
+                }
+
+                context.Status = closeResponse.Status;
             }
             catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
             {

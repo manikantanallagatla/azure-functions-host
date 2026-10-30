@@ -94,13 +94,20 @@ public class RpcClientScriptHostStartupCoordinatorTests
         await testHost.Coordinator.StartAsync(CancellationToken.None);
         Task activation = testHost.Coordinator.ActivationTask;
         Assert.Same(failure, await Assert.ThrowsAsync<InvalidOperationException>(() => activation.WaitAsync(TestTimeout)));
+        SplitScriptHostActivationFaulted retirement =
+            await testHost.RetirementRequested.Task.WaitAsync(TestTimeout);
         await testHost.Coordinator.StartAsync(CancellationToken.None);
         testHost.CompleteLink();
 
         Assert.Same(activation, testHost.Coordinator.ActivationTask);
+        Assert.Equal(testHost.RuntimeIncarnation, retirement.Incarnation);
+        Assert.Same(failure, retirement.Exception);
         Assert.False(testHost.Host.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping.IsCancellationRequested);
         testHost.ScriptHost.Verify(host => host.StartAsync(It.IsAny<CancellationToken>()), Times.Once);
         testHost.Registry.Verify(registry => registry.DisposeAsync(), Times.Never);
+        testHost.RetirementManager.Verify(
+            manager => manager.RequestRetirementAsync(It.IsAny<SplitScriptHostActivationFaulted>()),
+            Times.Once);
     }
 
     [Fact]
@@ -120,6 +127,9 @@ public class RpcClientScriptHostStartupCoordinatorTests
         Assert.Equal(ScriptHostState.Error, testHost.ScriptHostManager.Object.State);
         Assert.Same(failure, testHost.ScriptHostManager.Object.LastError);
         testHost.ScriptHost.Verify(host => host.StartAsync(It.IsAny<CancellationToken>()), Times.Once);
+        testHost.RetirementManager.Verify(
+            manager => manager.RequestRetirementAsync(It.IsAny<SplitScriptHostActivationFaulted>()),
+            Times.Never);
     }
 
     [Fact]
@@ -188,6 +198,9 @@ public class RpcClientScriptHostStartupCoordinatorTests
 
         Assert.True(testHost.Coordinator.ActivationTask.IsCanceled);
         testHost.ScriptHost.Verify(host => host.StopAsync(It.IsAny<CancellationToken>()), Times.Once);
+        testHost.RetirementManager.Verify(
+            manager => manager.RequestRetirementAsync(It.IsAny<SplitScriptHostActivationFaulted>()),
+            Times.Never);
     }
 
     [Fact]
@@ -305,6 +318,27 @@ public class RpcClientScriptHostStartupCoordinatorTests
         testHost.CompleteLink();
 
         testHost.ScriptHost.Verify(host => host.StartAsync(It.IsAny<CancellationToken>()), Times.Never);
+        testHost.RetirementManager.Verify(
+            manager => manager.RequestRetirementAsync(It.IsAny<SplitScriptHostActivationFaulted>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task StartAsync_UnexpectedActivationCancellation_DoesNotRequestRetirement()
+    {
+        await using RpcClientStartupTestHost testHost = new();
+        testHost.ScriptHost
+            .Setup(host => host.StartAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new OperationCanceledException("Activation canceled unexpectedly."));
+        testHost.CompleteLink();
+
+        await testHost.Coordinator.StartAsync(CancellationToken.None);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => testHost.Coordinator.ActivationTask.WaitAsync(TestTimeout));
+
+        testHost.RetirementManager.Verify(
+            manager => manager.RequestRetirementAsync(It.IsAny<SplitScriptHostActivationFaulted>()),
+            Times.Never);
     }
 
     private static async Task AssertRootDisposalAfterStopFailureAsync(Exception failure, bool stopBeforeDispose)

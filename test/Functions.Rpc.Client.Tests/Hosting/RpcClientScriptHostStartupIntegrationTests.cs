@@ -316,6 +316,7 @@ public class RpcClientScriptHostStartupIntegrationTests
             composition.Setup(value => value.ConfigureWebHostServices(It.IsAny<IServiceCollection>(), It.IsAny<IMvcBuilder>()))
                 .Callback<IServiceCollection, IMvcBuilder>((services, _) =>
                 {
+                    services.AddSingleton<IRuntimeRetirementManager, TestRuntimeRetirementManager>();
                     services.AddRpcClientWebHostServices(static provider => provider.GetRequiredService<WebJobsScriptHostService>());
                     services.AddSingleton(Mock.Of<IWebHostWorkerManager>());
                 });
@@ -357,6 +358,14 @@ public class RpcClientScriptHostStartupIntegrationTests
                 Directory.Delete(_directory, recursive: true);
             }
         }
+    }
+
+    private sealed class TestRuntimeRetirementManager : IRuntimeRetirementManager
+    {
+        public RuntimeIncarnation Incarnation { get; } = RuntimeIncarnation.Create();
+
+        public Task RequestRetirementAsync(SplitScriptHostActivationFaulted condition)
+            => Task.CompletedTask;
     }
 
     private sealed class TestLogging(ILoggerProvider loggerProvider) : IConfigureBuilder<ILoggingBuilder>

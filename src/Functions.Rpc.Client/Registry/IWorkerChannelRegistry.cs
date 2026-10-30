@@ -50,12 +50,30 @@ public interface IWorkerChannelRegistry : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Removes and disposes a linked worker when present.
+    /// Atomically admits one worker while preserving its exact physical identity for fallback removal.
     /// </summary>
-    /// <remarks>The accepted worker ID remains terminal and cannot be linked again in this registry.</remarks>
+    /// <param name="workerId">The worker identifier, which must ordinally match <paramref name="worker"/>.</param>
+    /// <param name="grpcEndpoint">The absolute FunctionRpc endpoint.</param>
+    /// <param name="worker">The authoritative exact worker identity supplied by Legion.</param>
+    /// <param name="cancellationToken">Cancels a new link attempt, or only the caller's wait for an existing attempt.</param>
+    /// <returns>The initialized and registered channel and whether this caller started the successful attempt.</returns>
+    /// <exception cref="WorkerLinkException">The request conflicts with the registry's admission state.</exception>
+    /// <exception cref="TimeoutException">The new link attempt or this caller's retry wait exceeded its deadline.</exception>
+    Task<WorkerLinkResult> LinkAsync(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity worker,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Removes a linked worker, completes its request stream, and disposes it after peer termination.
+    /// </summary>
+    /// <remarks>Local withdrawal is immediate; every post-withdrawal outcome disposes the terminal channel.</remarks>
     /// <param name="workerId">The worker identifier.</param>
-    /// <param name="cancellationToken">A token that cancels waiting to begin the unlink.</param>
+    /// <param name="cancellationToken">A token that cancels admission or waiting for peer termination.</param>
     /// <returns><see langword="true"/> when a channel was removed; otherwise, <see langword="false"/>.</returns>
+    /// <exception cref="TimeoutException">The peer did not terminate within ten seconds. Local cleanup has completed.</exception>
+    /// <exception cref="OperationCanceledException">The caller canceled the operation.</exception>
     Task<bool> UnlinkAsync(string workerId, CancellationToken cancellationToken = default);
 
     /// <summary>

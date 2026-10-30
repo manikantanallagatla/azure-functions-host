@@ -942,6 +942,12 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
 
         internal async Task SendInvocationRequest(ScriptInvocationContext context)
         {
+            if (!TryBeginInvocationDispatch(context))
+            {
+                return;
+            }
+
+            Task httpForwardingTask = null;
             try
             {
                 string invocationId = context.ExecutionContext.InvocationId.ToString();
@@ -982,15 +988,27 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
 
                 var invocationRequest = await context.ToRpcInvocationRequest(_workerChannelLogger, _workerCapabilities, _isSharedMemoryDataTransferEnabled, _sharedMemoryManager);
                 AddAdditionalTraceContext(invocationRequest, context);
+                bool usesHttpProxy = IsHttpProxyingWorker && context.FunctionMetadata.IsHttpTriggerFunction();
                 _executingInvocations.TryAdd(invocationRequest.InvocationId, new(context, _messageDispatcherFactory.Create(invocationRequest.InvocationId)));
+                if (!TryBeginInvocationSend(context, usesHttpProxy))
+                {
+                    RemoveExecutingInvocation(invocationRequest.InvocationId);
+                    return;
+                }
+
                 _metricsLogger.LogEvent(string.Format(MetricEventNames.WorkerInvoked, Id), functionName: Sanitizer.Sanitize(context.FunctionMetadata.Name));
 
                 // If the worker supports HTTP proxying, ensure this request is forwarded prior
                 // to sending the invocation request to the worker, as this will ensure the context
                 // is properly set up.
-                if (IsHttpProxyingWorker && context.FunctionMetadata.IsHttpTriggerFunction())
+                if (usesHttpProxy)
                 {
                     _httpProxyService.StartForwarding(context, _httpProxyEndpoint);
+                    if (context.Properties.TryGetValue(ScriptConstants.HttpProxyTask, out object task) &&
+                        task is Task forwardingTask)
+                    {
+                        httpForwardingTask = forwardingTask;
+                    }
                 }
 
                 await SendStreamingMessageAsync(new StreamingMessage
@@ -1008,6 +1026,18 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc
             {
                 context.SetException(invokeEx);
             }
+            finally
+            {
+                OnInvocationDispatchCompleted(context, httpForwardingTask);
+            }
+        }
+
+        internal virtual bool TryBeginInvocationDispatch(ScriptInvocationContext context) => true;
+
+        internal virtual bool TryBeginInvocationSend(ScriptInvocationContext context, bool usesHttpProxy) => true;
+
+        internal virtual void OnInvocationDispatchCompleted(ScriptInvocationContext context, Task httpForwardingTask)
+        {
         }
 
         internal void SendInvocationCancel(string invocationId)

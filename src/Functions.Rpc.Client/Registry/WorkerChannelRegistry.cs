@@ -25,24 +25,45 @@ namespace Azure.Functions.Rpc.Client;
 /// context, and retains terminal identities. Initialized channels remain available for metadata bootstrap before a
 /// ScriptHost function set is known; only ready channels are available for invocation dispatch.
 /// </remarks>
-internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
+internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager,
+    IWorkerCountScaleInManager, IRuntimeRetirementWorkerManager, IAppVersionRuntimeDrainWorkerManager
 {
+    private const int CompletedWorkerRemovalCapacity = 128;
+    private const int DefaultHttpWorkerCapacity = 16;
+    private const string UnlinkRemovalReason = "RuntimeUnlink";
+
     private static readonly TimeSpan DefaultLinkTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DefaultUnlinkTimeout = TimeSpan.FromSeconds(10);
 
     private readonly IRpcClientWorkerChannelFactory _channelFactory;
+    private readonly HashSet<FunctionsSplitWorkerRemovalAction> _completedWorkerRemovals = [];
+    private readonly Queue<FunctionsSplitWorkerRemovalAction> _completedWorkerRemovalOrder = [];
     private readonly Lock _disposeLock = new();
     private readonly IDuplexChannelFactory<StreamingMessage> _duplexChannelFactory;
     private readonly ILogger<WorkerChannelRegistry> _logger;
     private readonly Dictionary<string, WorkerSlot> _linkAttempts = new(StringComparer.Ordinal);
     private readonly TimeSpan _linkTimeout;
     private readonly HashSet<Task> _monitorTasks = [];
+    private readonly List<FunctionsSplitWorkerRemovalAction> _outstandingWorkerRemovals = [];
+    private readonly HashSet<FunctionsSplitWorkerRemovalAction> _outstandingWorkerRemovalSet = [];
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Dictionary<string, WorkerSlot> _slots = new(StringComparer.Ordinal);
     private readonly Lock _stateLock = new();
+    private readonly RuntimeIncarnation _runtimeIncarnation = RuntimeIncarnation.Create();
+    private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _unlinkTimeout;
     private ChannelSetupContext _activeSetupContext;
     private Task _disposeTask;
     private bool _disposed;
     private TaskCompletionSource _initializedChannelAvailable = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _scaleInHttpCapacity;
+    private int _scaleInLinkedWorkerCount;
+    private DateTimeOffset _scaleInStateCreatedTime;
+    private TaskCompletionSource<long> _scaleInStateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _scaleInStateVersion;
+    private Task<RuntimeRetirementDrainResult> _runtimeRetirementDrainTask;
+    private RuntimeRetirementOwner _runtimeRetirementOwner;
+    private bool _runtimeRetirementRequested;
 
     // Setup writers hold _stateLock; ready-channel readers observe this published signal without taking that lock.
     private TaskCompletionSource<IReadOnlyList<WorkerChannel>> _readyChannelsAvailable = CreateReadyChannelsSignal();
@@ -51,7 +72,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
         IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger)
-        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout)
+        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout, TimeProvider.System)
+    {
+    }
+
+    public WorkerChannelRegistry(
+        IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
+        IRpcClientWorkerChannelFactory channelFactory,
+        ILogger<WorkerChannelRegistry> logger,
+        TimeProvider timeProvider)
+        : this(duplexChannelFactory, channelFactory, logger, DefaultLinkTimeout, timeProvider)
     {
     }
 
@@ -59,20 +89,126 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         IDuplexChannelFactory<StreamingMessage> duplexChannelFactory,
         IRpcClientWorkerChannelFactory channelFactory,
         ILogger<WorkerChannelRegistry> logger,
-        TimeSpan linkTimeout)
+        TimeSpan linkTimeout,
+        TimeProvider timeProvider = null,
+        TimeSpan? unlinkTimeout = null)
     {
         _duplexChannelFactory = duplexChannelFactory ?? throw new ArgumentNullException(nameof(duplexChannelFactory));
         _channelFactory = channelFactory ?? throw new ArgumentNullException(nameof(channelFactory));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _timeProvider = timeProvider ?? TimeProvider.System;
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(linkTimeout, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(linkTimeout.TotalMilliseconds, uint.MaxValue - 1);
         _linkTimeout = linkTimeout;
+        _unlinkTimeout = unlinkTimeout ?? DefaultUnlinkTimeout;
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_unlinkTimeout, TimeSpan.Zero);
+        _scaleInStateCreatedTime = _timeProvider.GetUtcNow();
+    }
+
+    private enum RuntimeRetirementOwner
+    {
+        None,
+        ActivationFault,
+        AppVersion,
+    }
+
+    HttpWorkerScaleInState IHttpWorkerScaleInManager.Current
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                RefreshScaleInStateLocked();
+                return GetScaleInStateLocked();
+            }
+        }
+    }
+
+    long IHttpWorkerScaleInManager.Version
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                RefreshScaleInStateLocked();
+                return _scaleInStateVersion;
+            }
+        }
+    }
+
+    RuntimeIncarnation IRuntimeRetirementWorkerManager.Incarnation => _runtimeIncarnation;
+
+    RuntimeIncarnation IAppVersionRuntimeDrainWorkerManager.Incarnation => _runtimeIncarnation;
+
+    bool IRuntimeRetirementWorkerManager.IsRetirementRequested
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _runtimeRetirementRequested;
+            }
+        }
+    }
+
+    WorkerRemovalAcknowledgementResult IHttpWorkerScaleInManager.AcknowledgeWorkerRemoval(
+        FunctionsSplitWorkerRemovalAction action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        if (!action.IsValid())
+        {
+            throw new ArgumentException("The worker-removal action is incomplete or invalid.", nameof(action));
+        }
+
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_outstandingWorkerRemovalSet.Remove(action))
+            {
+                _outstandingWorkerRemovals.Remove(action);
+                AddCompletedWorkerRemovalLocked(action);
+                SignalScaleInStateChangedLocked();
+
+                return WorkerRemovalAcknowledgementResult.Accepted;
+            }
+
+            return _completedWorkerRemovals.Contains(action)
+                ? WorkerRemovalAcknowledgementResult.Duplicate
+                : WorkerRemovalAcknowledgementResult.NotFound;
+        }
     }
 
     public Task<WorkerLinkResult> LinkAsync(
         string workerId,
         Uri grpcEndpoint,
         CancellationToken cancellationToken = default)
+        => LinkAsyncCore(workerId, grpcEndpoint, worker: null, cancellationToken);
+
+    public Task<WorkerLinkResult> LinkAsync(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity worker,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(worker);
+        if (!worker.IsValid())
+        {
+            throw new ArgumentException("The worker identity is incomplete or invalid.", nameof(worker));
+        }
+
+        if (!string.Equals(workerId, worker.PodName, StringComparison.Ordinal))
+        {
+            throw new ArgumentException("The route worker ID must exactly match the worker pod name.", nameof(worker));
+        }
+
+        return LinkAsyncCore(workerId, grpcEndpoint, worker, cancellationToken);
+    }
+
+    private Task<WorkerLinkResult> LinkAsyncCore(
+        string workerId,
+        Uri grpcEndpoint,
+        FunctionsSplitPodIdentity worker,
+        CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerId);
         RpcClientFactory.ValidateEndpoint(grpcEndpoint);
@@ -83,12 +219,28 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         lock (_stateLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_runtimeRetirementRequested)
+            {
+                throw new WorkerLinkException(
+                    WorkerLinkFailureReason.RuntimeStopping,
+                    "The Runtime is retiring and no longer accepts Worker Links.");
+            }
+
             if (_linkAttempts.TryGetValue(workerId, out WorkerSlot existing))
             {
                 if (!string.Equals(existing.Endpoint.AbsoluteUri, grpcEndpoint.AbsoluteUri, StringComparison.Ordinal))
                 {
                     throw new WorkerLinkException(WorkerLinkFailureReason.Conflict,
                         "The worker is already associated with a different gRPC endpoint.");
+                }
+
+                if (worker is not null)
+                {
+                    if (existing.Worker is null || existing.Worker != worker)
+                    {
+                        throw new WorkerLinkException(WorkerLinkFailureReason.Conflict,
+                            "The worker is already associated with a different physical identity.");
+                    }
                 }
 
                 if (existing.Terminal || existing.Channel is { IsTerminated: true })
@@ -101,7 +253,12 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             }
 
             linkCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            slot = new() { Endpoint = grpcEndpoint, LinkTask = linkCompletion.Task };
+            slot = new()
+            {
+                Endpoint = grpcEndpoint,
+                LinkTask = linkCompletion.Task,
+                Worker = worker,
+            };
             _slots.Add(workerId, slot);
             _linkAttempts.Add(workerId, slot);
         }
@@ -114,6 +271,483 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
 
     private static async Task<WorkerLinkResult> CompleteLinkAsync(Task<WorkerChannel> link, bool isNewLink)
         => new(await link.ConfigureAwait(false), isNewLink);
+
+    public Task<long> WaitForChangeAsync(long version, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            RefreshScaleInStateLocked();
+            if (_scaleInStateVersion != version)
+            {
+                return Task.FromResult(_scaleInStateVersion);
+            }
+
+            return _scaleInStateChanged.Task.WaitAsync(cancellationToken);
+        }
+    }
+
+    public HttpWorkerScaleInReservation TryReserveIdleWorker(TimeSpan minimumIdleDuration)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(minimumIdleDuration, TimeSpan.Zero);
+
+        lock (_stateLock)
+        {
+            if (_disposed || _runtimeRetirementRequested)
+            {
+                return null;
+            }
+
+            foreach ((string workerId, WorkerSlot slot) in _slots)
+            {
+                if (slot.Channel is not { } channel ||
+                    slot.DrainTask is not null ||
+                    !channel.TryReserveIdleScaleIn(minimumIdleDuration, out Guid reservationId))
+                {
+                    continue;
+                }
+
+                SignalReadyChannelsLocked();
+                SignalScaleInStateChangedLocked();
+                return new(workerId, reservationId, GetScaleInStateLocked());
+            }
+
+            return null;
+        }
+    }
+
+    public bool TryCommitReservation(
+        HttpWorkerScaleInReservation reservation,
+        out Task<bool> drainCompletion)
+    {
+        ArgumentNullException.ThrowIfNull(reservation);
+
+        Task invocationDrainTask;
+        TaskCompletionSource<bool> completion;
+        WorkerSlot slot;
+        lock (_stateLock)
+        {
+            RefreshScaleInStateLocked();
+            if (_disposed ||
+                _runtimeRetirementRequested ||
+                _scaleInStateVersion != reservation.ProjectedState.Version ||
+                _scaleInHttpCapacity != reservation.ProjectedState.HttpCapacity ||
+                _scaleInLinkedWorkerCount != reservation.ProjectedState.LinkedWorkerCount ||
+                !_slots.TryGetValue(reservation.WorkerId, out slot) ||
+                slot.Channel is not { } channel ||
+                slot.DrainTask is not null ||
+                channel.CommitScaleInReservation(reservation.ReservationId) is not { } committedInvocations)
+            {
+                drainCompletion = null;
+                return false;
+            }
+
+            invocationDrainTask = committedInvocations;
+            completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            drainCompletion = completion.Task;
+            slot.DrainTask = drainCompletion;
+            SignalReadyChannelsLocked();
+        }
+
+        _ = CompleteDrainAsync(reservation.WorkerId, slot, invocationDrainTask, completion);
+        return true;
+    }
+
+    public bool CancelReservation(HttpWorkerScaleInReservation reservation)
+    {
+        ArgumentNullException.ThrowIfNull(reservation);
+
+        lock (_stateLock)
+        {
+            if (_disposed ||
+                !_slots.TryGetValue(reservation.WorkerId, out WorkerSlot slot) ||
+                slot.Channel is not { } channel ||
+                !channel.CancelScaleInReservation(reservation.ReservationId))
+            {
+                return false;
+            }
+
+            SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
+            return true;
+        }
+    }
+
+    public WorkerCountScaleInResult ScaleInWorkers(
+        string functionGroup,
+        bool isAlwaysReady,
+        int desiredWorkerCount)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(functionGroup);
+        ArgumentOutOfRangeException.ThrowIfNegative(desiredWorkerCount);
+
+        List<CountScaleInSelection> selections = [];
+        HttpWorkerScaleInState resultingState;
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            RefreshScaleInStateLocked();
+            if (_runtimeRetirementRequested)
+            {
+                Log.CountScaleInSkippedForRuntimeRetirement(_logger, functionGroup, isAlwaysReady);
+                return new(0, GetScaleInStateLocked());
+            }
+
+            List<CountScaleInCandidate> candidates = [];
+            foreach ((string workerId, WorkerSlot slot) in _slots)
+            {
+                if (slot.Channel is not { } channel ||
+                    slot.DrainTask is not null ||
+                    !channel.TryGetCountScaleInCandidate(functionGroup, isAlwaysReady, out bool isIdle))
+                {
+                    continue;
+                }
+
+                candidates.Add(new(workerId, slot, isIdle));
+            }
+
+            int excess = Math.Max(0, candidates.Count - desiredWorkerCount);
+            if (excess == 0)
+            {
+                return new(0, GetScaleInStateLocked());
+            }
+
+            CountScaleInCandidate[] orderedCandidates = [.. candidates
+                .OrderByDescending(static candidate => candidate.IsIdle)
+                .ThenBy(static candidate => candidate.WorkerId, StringComparer.Ordinal)];
+            HashSet<string> selectedWorkerIds = new(StringComparer.Ordinal);
+
+            foreach (CountScaleInCandidate candidate in orderedCandidates.Where(static candidate => candidate.IsIdle))
+            {
+                if (selections.Count == excess)
+                {
+                    break;
+                }
+
+                TryCommitCountScaleInCandidateLocked(
+                    candidate,
+                    functionGroup,
+                    isAlwaysReady,
+                    requireIdle: true,
+                    selections,
+                    selectedWorkerIds);
+            }
+
+            foreach (CountScaleInCandidate candidate in orderedCandidates)
+            {
+                if (selections.Count == excess)
+                {
+                    break;
+                }
+
+                if (selectedWorkerIds.Contains(candidate.WorkerId))
+                {
+                    continue;
+                }
+
+                TryCommitCountScaleInCandidateLocked(
+                    candidate,
+                    functionGroup,
+                    isAlwaysReady,
+                    requireIdle: false,
+                    selections,
+                    selectedWorkerIds);
+            }
+
+            if (selections.Count > 0)
+            {
+                SignalReadyChannelsLocked();
+                SignalScaleInStateChangedLocked();
+            }
+
+            resultingState = GetScaleInStateLocked();
+        }
+
+        foreach (CountScaleInSelection selection in selections)
+        {
+            _ = CompleteDrainAsync(
+                selection.WorkerId,
+                selection.Slot,
+                selection.InvocationDrainTask,
+                selection.Completion);
+            _ = ObserveCountScaleInDrainAsync(selection.WorkerId, selection.Completion.Task);
+            Log.CountScaleInWorkerSelected(_logger, selection.WorkerId, functionGroup, isAlwaysReady);
+        }
+
+        return new(selections.Count, resultingState);
+    }
+
+    private static void TryCommitCountScaleInCandidateLocked(
+        CountScaleInCandidate candidate,
+        string functionGroup,
+        bool isAlwaysReady,
+        bool requireIdle,
+        List<CountScaleInSelection> selections,
+        HashSet<string> selectedWorkerIds)
+    {
+        if (candidate.Slot.DrainTask is not null ||
+            candidate.Slot.Channel is not { } channel ||
+            channel.TryBeginCountScaleIn(functionGroup, isAlwaysReady, requireIdle) is not { } invocationDrainTask)
+        {
+            return;
+        }
+
+        TaskCompletionSource<bool> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        candidate.Slot.DrainTask = completion.Task;
+        selections.Add(new(candidate.WorkerId, candidate.Slot, invocationDrainTask, completion));
+        selectedWorkerIds.Add(candidate.WorkerId);
+    }
+
+    bool IRuntimeRetirementWorkerManager.TryCloseAdmission(SplitScriptHostActivationFaulted condition)
+    {
+        ArgumentNullException.ThrowIfNull(condition);
+
+        lock (_stateLock)
+        {
+            if (_disposed || condition.Incarnation != _runtimeIncarnation)
+            {
+                return false;
+            }
+
+            if (_runtimeRetirementRequested)
+            {
+                return _runtimeRetirementOwner is RuntimeRetirementOwner.ActivationFault;
+            }
+
+            _runtimeRetirementRequested = true;
+            _runtimeRetirementOwner = RuntimeRetirementOwner.ActivationFault;
+            CaptureTerminalWorkerRemovalOwnershipLocked();
+            foreach (WorkerSlot slot in _slots.Values)
+            {
+                slot.Channel?.CloseRuntimeAdmission();
+            }
+
+            SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
+            return true;
+        }
+    }
+
+    Task<RuntimeRetirementDrainResult> IRuntimeRetirementWorkerManager.DrainAllWorkersAsync(
+        RuntimeIncarnation incarnation,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        List<Task<bool>> existingDrains = null;
+        List<(string WorkerId, WorkerSlot Slot, Task InvocationDrainTask, TaskCompletionSource<bool> Completion)> selections = null;
+        TaskCompletionSource<RuntimeRetirementDrainResult> retirementCompletion = null;
+        Task<RuntimeRetirementDrainResult> drainTask;
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_runtimeRetirementRequested ||
+                _runtimeRetirementOwner is not RuntimeRetirementOwner.ActivationFault ||
+                incarnation != _runtimeIncarnation)
+            {
+                throw new InvalidOperationException("Runtime retirement drain does not match the active retiring incarnation.");
+            }
+
+            if (_runtimeRetirementDrainTask is null)
+            {
+                existingDrains = [];
+                selections = [];
+                foreach ((string workerId, WorkerSlot slot) in _slots)
+                {
+                    if (slot.DrainTask is not null)
+                    {
+                        existingDrains.Add(slot.DrainTask);
+                        continue;
+                    }
+
+                    if (slot.RemovalOwnershipCompletion is not null)
+                    {
+                        existingDrains.Add(slot.RemovalOwnershipCompletion.Task);
+                        continue;
+                    }
+
+                    if (slot.Channel is not { } channel)
+                    {
+                        continue;
+                    }
+
+                    Task invocationDrainTask = channel.BeginRuntimeRetirementDrain();
+                    TaskCompletionSource<bool> completion =
+                        new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    slot.DrainTask = completion.Task;
+                    selections.Add((workerId, slot, invocationDrainTask, completion));
+                }
+
+                SignalReadyChannelsLocked();
+                retirementCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                _runtimeRetirementDrainTask = retirementCompletion.Task;
+            }
+
+            drainTask = _runtimeRetirementDrainTask;
+        }
+
+        if (retirementCompletion is not null)
+        {
+            _ = CompleteRuntimeRetirementDrainAsync(existingDrains, selections, retirementCompletion);
+        }
+
+        return drainTask.WaitAsync(cancellationToken);
+    }
+
+    bool IAppVersionRuntimeDrainWorkerManager.TryStartAppVersionDrain(
+        out AppVersionRuntimeDrainStart start)
+    {
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_runtimeRetirementRequested)
+            {
+                start = null;
+                return false;
+            }
+
+            _runtimeRetirementRequested = true;
+            _runtimeRetirementOwner = RuntimeRetirementOwner.AppVersion;
+            CaptureTerminalWorkerRemovalOwnershipLocked();
+            List<string> nonHttpWorkerIds = [];
+            List<string> httpWorkerIds = [];
+            List<string> nonReadyWorkerIds = [];
+            List<Task<bool>> existingDrains = [];
+            foreach ((string workerId, WorkerSlot slot) in _slots)
+            {
+                if (slot.DrainTask is not null)
+                {
+                    existingDrains.Add(slot.DrainTask);
+                }
+                else if (slot.RemovalOwnershipCompletion is not null)
+                {
+                    existingDrains.Add(slot.RemovalOwnershipCompletion.Task);
+                }
+
+                if (slot.Channel is not { } channel ||
+                    !channel.CloseRuntimeAdmissionForAppVersionDrain(
+                        out bool isInvocationReady,
+                        out bool isHttp))
+                {
+                    continue;
+                }
+
+                if (isInvocationReady)
+                {
+                    (isHttp ? httpWorkerIds : nonHttpWorkerIds).Add(workerId);
+                }
+                else
+                {
+                    nonReadyWorkerIds.Add(workerId);
+                }
+            }
+
+            nonHttpWorkerIds.Sort(StringComparer.Ordinal);
+            httpWorkerIds.Sort(StringComparer.Ordinal);
+            nonReadyWorkerIds.Sort(StringComparer.Ordinal);
+            SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
+            start = new(
+                _runtimeIncarnation,
+                nonHttpWorkerIds,
+                httpWorkerIds,
+                nonReadyWorkerIds,
+                existingDrains);
+            return true;
+        }
+    }
+
+    AppVersionRuntimeDrainSelection IAppVersionRuntimeDrainWorkerManager.SelectWorkers(
+        RuntimeIncarnation incarnation,
+        IReadOnlyList<string> workerIds,
+        DateTimeOffset invocationGraceDeadline)
+    {
+        ArgumentNullException.ThrowIfNull(workerIds);
+        return SelectAppVersionDrainWorkers(
+            incarnation,
+            workerIds,
+            invocationGraceDeadline);
+    }
+
+    AppVersionRuntimeDrainSelection IAppVersionRuntimeDrainWorkerManager.SelectAllRemainingWorkers(
+        RuntimeIncarnation incarnation,
+        DateTimeOffset invocationGraceDeadline)
+    {
+        string[] workerIds;
+        lock (_stateLock)
+        {
+            ValidateAppVersionDrainLocked(incarnation);
+            workerIds = [.. _slots.Keys.Order(StringComparer.Ordinal)];
+        }
+
+        return SelectAppVersionDrainWorkers(
+            incarnation,
+            workerIds,
+            invocationGraceDeadline);
+    }
+
+    private AppVersionRuntimeDrainSelection SelectAppVersionDrainWorkers(
+        RuntimeIncarnation incarnation,
+        IReadOnlyList<string> workerIds,
+        DateTimeOffset invocationGraceDeadline)
+    {
+        List<(string WorkerId, WorkerSlot Slot, Task InvocationDrainTask, TaskCompletionSource<bool> Completion)> selections = [];
+        lock (_stateLock)
+        {
+            ValidateAppVersionDrainLocked(incarnation);
+            foreach (string workerId in workerIds)
+            {
+                if (!_slots.TryGetValue(workerId, out WorkerSlot slot) ||
+                    slot.DrainTask is not null ||
+                    slot.Channel is not { } channel ||
+                    channel.BeginAppVersionRuntimeDrain() is not { } invocationDrainTask)
+                {
+                    continue;
+                }
+
+                TaskCompletionSource<bool> completion =
+                    new(TaskCreationOptions.RunContinuationsAsynchronously);
+                slot.DrainTask = completion.Task;
+                selections.Add((workerId, slot, invocationDrainTask, completion));
+            }
+
+            if (selections.Count > 0)
+            {
+                SignalReadyChannelsLocked();
+                SignalScaleInStateChangedLocked();
+            }
+        }
+
+        foreach (var selection in selections)
+        {
+            _ = CompleteDrainAsync(
+                selection.WorkerId,
+                selection.Slot,
+                selection.InvocationDrainTask,
+                selection.Completion,
+                invocationGraceDeadline);
+            Log.AppVersionDrainWorkerSelected(
+                _logger,
+                selection.WorkerId,
+                invocationGraceDeadline);
+        }
+
+        return new([.. selections.Select(static selection => selection.Completion.Task)]);
+    }
+
+    private void ValidateAppVersionDrainLocked(RuntimeIncarnation incarnation)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_runtimeRetirementRequested ||
+            _runtimeRetirementOwner is not RuntimeRetirementOwner.AppVersion ||
+            incarnation != _runtimeIncarnation)
+        {
+            throw new InvalidOperationException(
+                "The Runtime drain does not match the active retiring incarnation.");
+        }
+    }
 
     private async Task LinkAndCompleteAsync(string workerId, Uri grpcEndpoint, WorkerSlot slot, TaskCompletionSource<WorkerChannel> linkCompletion,
         CancellationToken cancellationToken)
@@ -194,6 +828,26 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                         => new TimeoutException("The worker link initialization deadline expired.", exception),
                     _ => exception,
                 };
+                bool removalOwnershipPending;
+                lock (_stateLock)
+                {
+                    if (_runtimeRetirementRequested &&
+                        slot.Worker is not null &&
+                        !slot.RemovalHandoffConfirmed &&
+                        !slot.RemovalFallbackRecorded)
+                    {
+                        EnsureRemovalOwnershipPendingLocked(slot);
+                    }
+
+                    removalOwnershipPending = slot.RemovalOwnershipPending;
+                }
+
+                if (removalOwnershipPending && candidate is not null)
+                {
+                    failure = await SettleRejectedLinkOwnershipAsync(workerId, slot, candidate, failure);
+                    candidate = null;
+                }
+
                 failure = await candidate.DisposeAndCaptureExceptionAsync(failure);
                 failure = await ownedChannel.DisposeAndCaptureExceptionAsync(failure);
                 ExceptionDispatchInfo.Capture(failure).Throw();
@@ -209,12 +863,89 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             // Accepted links are cleaned up by monitor/unlink; completing Link must not wait for deferred setup.
             if (!initialized)
             {
-                RemoveEmptySlot(workerId, slot);
-                lock (_stateLock)
-                {
-                    _linkAttempts.Remove(workerId);
-                }
+                CompleteFailedLinkAttempt(workerId, slot);
             }
+        }
+    }
+
+    private async Task<Exception> SettleRejectedLinkOwnershipAsync(
+        string workerId,
+        WorkerSlot slot,
+        RpcClientWorkerChannel channel,
+        Exception failure)
+    {
+        bool primaryHandoffConfirmed = false;
+        try
+        {
+            channel.FailCommittedInvocations(exception: null);
+            channel.CompleteRequests();
+            await Task.WhenAny(channel.Completion).WaitAsync(_unlinkTimeout, _shutdownSource.Token);
+            primaryHandoffConfirmed = channel.IsWorkerRemovalHandoffConfirmed;
+            if (channel.Completion.IsFaulted)
+            {
+                Log.ChannelFailed(_logger, channel.Completion.Exception, workerId);
+            }
+        }
+        catch (Exception exception)
+        {
+            failure = AggregateException.Combine(failure, exception);
+        }
+
+        if (primaryHandoffConfirmed)
+        {
+            lock (_stateLock)
+            {
+                RecordPrimaryWorkerRemovalHandoffLocked(slot);
+            }
+        }
+        else if (!_shutdownSource.IsCancellationRequested)
+        {
+            AddOutstandingWorkerRemoval(slot);
+        }
+
+        return await channel.DisposeAndCaptureExceptionAsync(failure);
+    }
+
+    private void CompleteFailedLinkAttempt(string workerId, WorkerSlot slot)
+    {
+        bool fallbackAdded = false;
+        lock (_stateLock)
+        {
+            if (!_disposed &&
+                _runtimeRetirementRequested &&
+                slot.Worker is not null &&
+                !slot.RemovalHandoffConfirmed &&
+                !slot.RemovalFallbackRecorded)
+            {
+                EnsureRemovalOwnershipPendingLocked(slot);
+                AddOutstandingWorkerRemovalLocked(slot, out fallbackAdded);
+            }
+
+            if (slot.RemovalOwnershipPending)
+            {
+                return;
+            }
+
+            if (slot.Channel is null &&
+                _slots.TryGetValue(workerId, out WorkerSlot currentSlot) &&
+                ReferenceEquals(currentSlot, slot))
+            {
+                _slots.Remove(workerId);
+            }
+
+            if (_linkAttempts.TryGetValue(workerId, out currentSlot) &&
+                ReferenceEquals(currentSlot, slot))
+            {
+                _linkAttempts.Remove(workerId);
+            }
+        }
+
+        if (fallbackAdded)
+        {
+            Log.WorkerRemovalFallbackAdded(
+                _logger,
+                slot.Worker!.PodName,
+                slot.Worker.ResourceNamespace);
         }
     }
 
@@ -232,6 +963,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             }
         }
 
+        bool channelDetached = false;
+        bool primaryHandoffConfirmed = false;
+        bool fallbackHandoffOwned = false;
         try
         {
             using CancellationTokenSource operationSource =
@@ -252,6 +986,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                             return false;
                         }
 
+                        if (_runtimeRetirementRequested &&
+                            !slot.RemovalHandoffConfirmed &&
+                            !slot.RemovalFallbackRecorded)
+                        {
+                            EnsureRemovalOwnershipPendingLocked(slot);
+                        }
+
                         channel = DetachChannelLocked(slot, expectedChannel: null);
                     }
 
@@ -260,8 +1001,45 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                         return false;
                     }
 
-                    await channel.DisposeAsync();
-                    return true;
+                    channelDetached = true;
+                    Exception failure = null;
+                    try
+                    {
+                        channel.FailCommittedInvocations(exception: null);
+                        channel.CompleteRequests();
+                        // Only WorkerProxy's application acknowledgement proves sticky primary removal ownership.
+                        await Task.WhenAny(channel.Completion).WaitAsync(_unlinkTimeout, operationSource.Token);
+                        primaryHandoffConfirmed = channel.IsWorkerRemovalHandoffConfirmed;
+                        if (primaryHandoffConfirmed)
+                        {
+                            lock (_stateLock)
+                            {
+                                RecordPrimaryWorkerRemovalHandoffLocked(slot);
+                            }
+                        }
+
+                        if (channel.Completion.IsFaulted)
+                        {
+                            Log.ChannelFailed(_logger, channel.Completion.Exception, workerId);
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        failure = exception;
+                    }
+
+                    failure = await channel.DisposeAndCaptureExceptionAsync(failure);
+                    if (!primaryHandoffConfirmed && !_shutdownSource.IsCancellationRequested)
+                    {
+                        fallbackHandoffOwned = AddOutstandingWorkerRemoval(slot);
+                    }
+
+                    if (failure is not null)
+                    {
+                        ExceptionDispatchInfo.Capture(failure).Throw();
+                    }
+
+                    return primaryHandoffConfirmed || fallbackHandoffOwned;
                 }
             }
             finally
@@ -271,7 +1049,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && _shutdownSource.IsCancellationRequested)
         {
-            return false;
+            return channelDetached;
         }
     }
 
@@ -334,6 +1112,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                     continue;
                 }
 
+                slot.Channel.SetScaleInReady(false);
                 attemptedChannels++;
                 ConfigureSlotLocked(slot);
                 if (slot.SetupException is null)
@@ -438,7 +1217,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             _disposed = true;
             slots = [.. _slots];
             monitorTasks = [.. _monitorTasks];
+            foreach (WorkerSlot slot in _linkAttempts.Values)
+            {
+                if (slot.RemovalOwnershipPending)
+                {
+                    slot.RemovalOwnershipCompletion?.TrySetResult(false);
+                }
+            }
+
             _initializedChannelAvailable.TrySetResult();
+            _scaleInStateChanged.TrySetException(new ObjectDisposedException(GetType().FullName));
 
             // Publish disposal for new readers and release callers awaiting the previous shared signal.
             ObjectDisposedException exception = new(GetType().FullName);
@@ -496,6 +1284,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         {
             // Remove the detached channel from the published snapshot before channel disposal begins.
             SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
             if (!_slots.Values.Any(slot => slot.Channel is not null))
             {
                 _initializedChannelAvailable = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -549,15 +1338,37 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                 // LinkAsync holds this gate until the monitor is tracked and publication completes. It also serializes this
                 // cleanup with unlink and shutdown.
                 RpcClientWorkerChannel removedChannel;
+                bool fallbackAdded = false;
                 lock (_stateLock)
                 {
+                    bool primaryHandoffConfirmed = channel.IsWorkerRemovalHandoffConfirmed;
+                    if (_runtimeRetirementRequested &&
+                        !primaryHandoffConfirmed &&
+                        !AddOutstandingWorkerRemovalLocked(slot, out fallbackAdded))
+                    {
+                        return;
+                    }
+
                     // Only detach the channel associated with this completion signal.
+                    if (primaryHandoffConfirmed)
+                    {
+                        RecordPrimaryWorkerRemovalHandoffLocked(slot);
+                    }
+
                     removedChannel = DetachChannelLocked(slot, channel);
                 }
 
                 if (removedChannel is null)
                 {
                     return;
+                }
+
+                if (fallbackAdded)
+                {
+                    Log.WorkerRemovalFallbackAdded(
+                        _logger,
+                        slot.Worker!.PodName,
+                        slot.Worker.ResourceNamespace);
                 }
 
                 if (terminalException is null)
@@ -571,6 +1382,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
 
                 try
                 {
+                    removedChannel.FailCommittedInvocations(terminalException);
                     removedChannel.Shutdown(terminalException);
                 }
                 catch (Exception exception)
@@ -606,6 +1418,113 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         }
     }
 
+    private async Task CompleteDrainAsync(
+        string workerId,
+        WorkerSlot slot,
+        Task invocationDrainTask,
+        TaskCompletionSource<bool> drainCompletion,
+        DateTimeOffset? invocationGraceDeadline = null)
+    {
+        try
+        {
+            if (invocationGraceDeadline is null)
+            {
+                await invocationDrainTask.WaitAsync(_shutdownSource.Token);
+            }
+            else
+            {
+                TimeSpan remaining = invocationGraceDeadline.Value - _timeProvider.GetUtcNow();
+                if (remaining > TimeSpan.Zero)
+                {
+                    Task deadline = Task.Delay(remaining, _timeProvider, _shutdownSource.Token);
+                    Task completed = await Task.WhenAny(invocationDrainTask, deadline);
+                    if (ReferenceEquals(completed, invocationDrainTask))
+                    {
+                        await invocationDrainTask.WaitAsync(_shutdownSource.Token);
+                    }
+                    else
+                    {
+                        await deadline;
+                        Log.AppVersionDrainGraceExpired(
+                            _logger,
+                            workerId,
+                            invocationGraceDeadline.Value);
+                    }
+                }
+                else
+                {
+                    Log.AppVersionDrainGraceExpired(
+                        _logger,
+                        workerId,
+                        invocationGraceDeadline.Value);
+                }
+            }
+
+            bool unlinked = await UnlinkAsync(workerId, _shutdownSource.Token);
+            drainCompletion.TrySetResult(unlinked);
+        }
+        catch (OperationCanceledException) when (_shutdownSource.IsCancellationRequested)
+        {
+            drainCompletion.TrySetResult(false);
+        }
+        catch (Exception exception)
+        {
+            if (IsRuntimeRetirementFallbackOutstanding(slot))
+            {
+                drainCompletion.TrySetResult(true);
+            }
+            else
+            {
+                drainCompletion.TrySetException(exception);
+            }
+        }
+    }
+
+    private async Task ObserveCountScaleInDrainAsync(string workerId, Task<bool> drainCompletion)
+    {
+        try
+        {
+            if (!await drainCompletion)
+            {
+                Log.CountScaleInDrainIncomplete(_logger, workerId);
+            }
+        }
+        catch (Exception exception)
+        {
+            Log.CountScaleInDrainFailed(_logger, exception, workerId);
+        }
+    }
+
+    private async Task CompleteRuntimeRetirementDrainAsync(
+        IReadOnlyList<Task<bool>> existingDrains,
+        IReadOnlyList<(string WorkerId, WorkerSlot Slot, Task InvocationDrainTask, TaskCompletionSource<bool> Completion)> selections,
+        TaskCompletionSource<RuntimeRetirementDrainResult> retirementCompletion)
+    {
+        try
+        {
+            foreach (var selection in selections)
+            {
+                _ = CompleteDrainAsync(
+                    selection.WorkerId,
+                    selection.Slot,
+                    selection.InvocationDrainTask,
+                    selection.Completion);
+            }
+
+            IEnumerable<Task<bool>> workerDrains = existingDrains.Concat(
+                selections.Select(static selection => selection.Completion.Task));
+            bool[] results = await Task.WhenAll(workerDrains);
+            RuntimeRetirementDrainResult result = results.All(static workerDrained => workerDrained)
+                ? new(true, null)
+                : new(false, "At least one Worker could not complete its drain and unlink.");
+            retirementCompletion.TrySetResult(result);
+        }
+        catch (Exception exception)
+        {
+            retirementCompletion.TrySetException(exception);
+        }
+    }
+
     private void RegisterInitializedChannel(string workerId, WorkerSlot slot, RpcClientWorkerChannel channel, CancellationToken cancellationToken)
     {
         Task monitorTask;
@@ -613,6 +1532,23 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         lock (_stateLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_runtimeRetirementRequested)
+            {
+                if (slot.Worker is not null &&
+                    !slot.RemovalHandoffConfirmed &&
+                    !slot.RemovalFallbackRecorded)
+                {
+                    if (EnsureRemovalOwnershipPendingLocked(slot))
+                    {
+                        SignalScaleInStateChangedLocked();
+                    }
+                }
+
+                throw new WorkerLinkException(
+                    WorkerLinkFailureReason.RuntimeStopping,
+                    "The Runtime started retiring before the Worker Link was registered.");
+            }
+
             // Setup can hold this lock past the link deadline or transport lifetime.
             cancellationToken.ThrowIfCancellationRequested();
             if (channel.IsTerminated)
@@ -624,6 +1560,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
             }
 
             slot.Channel = channel;
+            SignalScaleInStateChangedLocked();
             monitorTask = MonitorChannelCompletionAsync(workerId, slot, channel);
             _monitorTasks.Add(monitorTask);
 
@@ -671,12 +1608,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         {
             channel.SetupFunctionInvocationBuffers(setupContext.Functions);
             channel.SendFunctionLoadRequests(setupContext.ManagedDependencyOptions, setupContext.FunctionTimeout);
+            channel.SetScaleInReady(true);
             SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
         }
         catch (Exception exception)
         {
+            channel.SetScaleInReady(false);
             slot.SetupException = exception;
             Log.ChannelSetupFailed(_logger, exception, channel.Id);
+            SignalScaleInStateChangedLocked();
         }
     }
 
@@ -737,6 +1678,229 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
     private static TaskCompletionSource<IReadOnlyList<WorkerChannel>> CreateReadyChannelsSignal()
         => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private HttpWorkerScaleInState GetScaleInStateLocked()
+    {
+        return new(
+            _scaleInStateCreatedTime,
+            _scaleInHttpCapacity,
+            _scaleInLinkedWorkerCount,
+            _scaleInStateVersion)
+        {
+            OutstandingWorkerRemovals = [.. _outstandingWorkerRemovals],
+        };
+    }
+
+    private bool AddOutstandingWorkerRemoval(WorkerSlot slot)
+    {
+        bool added;
+        bool owned;
+        lock (_stateLock)
+        {
+            owned = AddOutstandingWorkerRemovalLocked(slot, out added);
+        }
+
+        if (added)
+        {
+            Log.WorkerRemovalFallbackAdded(
+                _logger,
+                slot.Worker!.PodName,
+                slot.Worker.ResourceNamespace);
+        }
+
+        return owned;
+    }
+
+    private bool AddOutstandingWorkerRemovalLocked(WorkerSlot slot, out bool added)
+    {
+        added = false;
+        if (slot.Worker is null)
+        {
+            Log.WorkerRemovalFallbackUnavailable(_logger, slot.Endpoint);
+            return false;
+        }
+
+        FunctionsSplitWorkerRemovalAction action = new(slot.Worker, UnlinkRemovalReason);
+        if (_completedWorkerRemovals.Contains(action) || _outstandingWorkerRemovalSet.Contains(action))
+        {
+            slot.RemovalFallbackRecorded = true;
+            if (CompleteRemovalOwnershipLocked(slot))
+            {
+                SignalScaleInStateChangedLocked();
+            }
+
+            return true;
+        }
+
+        _outstandingWorkerRemovalSet.Add(action);
+        _outstandingWorkerRemovals.Add(action);
+        slot.RemovalFallbackRecorded = true;
+        CompleteRemovalOwnershipLocked(slot);
+        added = true;
+        SignalScaleInStateChangedLocked();
+        return true;
+    }
+
+    private void RecordPrimaryWorkerRemovalHandoffLocked(WorkerSlot slot)
+    {
+        if (slot.RemovalFallbackRecorded)
+        {
+            return;
+        }
+
+        slot.RemovalHandoffConfirmed = true;
+        if (CompleteRemovalOwnershipLocked(slot))
+        {
+            SignalScaleInStateChangedLocked();
+        }
+    }
+
+    private void CaptureTerminalWorkerRemovalOwnershipLocked()
+    {
+        foreach (WorkerSlot slot in _linkAttempts.Values)
+        {
+            if (slot.RemovalHandoffConfirmed ||
+                slot.RemovalFallbackRecorded)
+            {
+                continue;
+            }
+
+            if (slot.Channel is null && !slot.Terminal)
+            {
+                if (slot.Worker is not null && slot.LinkTask is not null)
+                {
+                    EnsureRemovalOwnershipPendingLocked(slot);
+                }
+
+                continue;
+            }
+
+            if (slot.Channel is { IsTerminated: false })
+            {
+                continue;
+            }
+
+            if (!AddOutstandingWorkerRemovalLocked(slot, out bool added))
+            {
+                EnsureRemovalOwnershipPendingLocked(slot);
+                continue;
+            }
+
+            if (added)
+            {
+                Log.WorkerRemovalFallbackAdded(
+                    _logger,
+                    slot.Worker!.PodName,
+                    slot.Worker.ResourceNamespace);
+            }
+        }
+    }
+
+    private static bool EnsureRemovalOwnershipPendingLocked(WorkerSlot slot)
+    {
+        if (slot.RemovalOwnershipPending)
+        {
+            return false;
+        }
+
+        slot.RemovalOwnershipPending = true;
+        slot.RemovalOwnershipCompletion ??=
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        return true;
+    }
+
+    private static bool CompleteRemovalOwnershipLocked(WorkerSlot slot)
+    {
+        if (!slot.RemovalOwnershipPending)
+        {
+            return false;
+        }
+
+        slot.RemovalOwnershipPending = false;
+        slot.RemovalOwnershipCompletion?.TrySetResult(true);
+        return true;
+    }
+
+    private bool IsRuntimeRetirementFallbackOutstanding(WorkerSlot slot)
+    {
+        lock (_stateLock)
+        {
+            return _runtimeRetirementRequested &&
+                slot.RemovalFallbackRecorded;
+        }
+    }
+
+    private void AddCompletedWorkerRemovalLocked(FunctionsSplitWorkerRemovalAction action)
+    {
+        if (!_completedWorkerRemovals.Add(action))
+        {
+            return;
+        }
+
+        _completedWorkerRemovalOrder.Enqueue(action);
+        while (_completedWorkerRemovalOrder.Count > CompletedWorkerRemovalCapacity)
+        {
+            _completedWorkerRemovals.Remove(_completedWorkerRemovalOrder.Dequeue());
+        }
+    }
+
+    private (long HttpCapacity, int LinkedWorkerCount) ComputeScaleInStateLocked()
+    {
+        long httpCapacity = 0;
+        int linkedWorkerCount = 0;
+        foreach (WorkerSlot slot in _slots.Values)
+        {
+            if (slot.Channel is not { } channel)
+            {
+                continue;
+            }
+
+            linkedWorkerCount++;
+            if (!channel.IsTerminated &&
+                channel.ContributesHttpCapacity)
+            {
+                httpCapacity += DefaultHttpWorkerCapacity;
+            }
+        }
+
+        linkedWorkerCount += _linkAttempts.Values.Count(slot =>
+            slot.Channel is null &&
+            slot.RemovalOwnershipPending);
+
+        return (httpCapacity, linkedWorkerCount);
+    }
+
+    private void RefreshScaleInStateLocked()
+    {
+        (long httpCapacity, int linkedWorkerCount) = ComputeScaleInStateLocked();
+        if (_scaleInHttpCapacity == httpCapacity &&
+            _scaleInLinkedWorkerCount == linkedWorkerCount)
+        {
+            return;
+        }
+
+        _scaleInHttpCapacity = httpCapacity;
+        _scaleInLinkedWorkerCount = linkedWorkerCount;
+        AdvanceScaleInStateVersionLocked();
+    }
+
+    private void SignalScaleInStateChangedLocked()
+    {
+        (_scaleInHttpCapacity, _scaleInLinkedWorkerCount) = ComputeScaleInStateLocked();
+        AdvanceScaleInStateVersionLocked();
+    }
+
+    private void AdvanceScaleInStateVersionLocked()
+    {
+        DateTimeOffset createdTime = _timeProvider.GetUtcNow();
+        _scaleInStateCreatedTime = createdTime > _scaleInStateCreatedTime
+            ? createdTime
+            : _scaleInStateCreatedTime.AddTicks(1);
+        long version = ++_scaleInStateVersion;
+        TaskCompletionSource<long> changed = _scaleInStateChanged;
+        _scaleInStateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        changed.TrySetResult(version);
+    }
+
     private async Task<Exception> ShutdownSlotAsync(string workerId, WorkerSlot slot)
     {
         Exception disposalException = null;
@@ -750,6 +1914,11 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
                 lock (_stateLock)
                 {
                     channel = DetachChannelLocked(slot, expectedChannel: null);
+                }
+
+                if (channel is not null)
+                {
+                    channel.FailCommittedInvocations(new ObjectDisposedException(channel.GetType().FullName));
                 }
 
                 disposalException = await channel.DisposeAndCaptureExceptionAsync(disposalException);
@@ -777,6 +1946,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         // The initial link owns this gate before its slot is published.
         public SemaphoreSlim Gate { get; } = new(0, 1);
 
+        // The committed scale-in drain for this worker.
+        public Task<bool> DrainTask { get; set; }
+
         // The recorded gRPC endpoint distinguishes exact retries from conflicting requests.
         public Uri Endpoint { get; init; }
 
@@ -786,9 +1958,35 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
         // The original failure from the attempted setup context, or null after successful setup.
         public Exception SetupException { get; set; }
 
+        // Indicates that an uncertain unlink produced an exact fallback handoff.
+        public bool RemovalFallbackRecorded { get; set; }
+
+        // Indicates that WorkerProxy confirmed sticky primary removal ownership.
+        public bool RemovalHandoffConfirmed { get; set; }
+
+        // Keeps final retirement fenced when no primary acknowledgement or exact fallback identity is available.
+        public bool RemovalOwnershipPending { get; set; }
+
+        // Completes when an in-flight Link transfers deletion ownership to WorkerProxy or the exact fallback outbox.
+        public TaskCompletionSource<bool> RemovalOwnershipCompletion { get; set; }
+
         // Indicates that a previously accepted link has terminated and cannot be replayed.
         public bool Terminal { get; set; }
+
+        // The authoritative physical identity is set at most once and retained after channel withdrawal.
+        public FunctionsSplitPodIdentity Worker { get; set; }
     }
+
+    private sealed record CountScaleInCandidate(
+        string WorkerId,
+        WorkerSlot Slot,
+        bool IsIdle);
+
+    private sealed record CountScaleInSelection(
+        string WorkerId,
+        WorkerSlot Slot,
+        Task InvocationDrainTask,
+        TaskCompletionSource<bool> Completion);
 
     private sealed record ChannelSetupContext(
         IReadOnlyList<FunctionMetadata> Functions,
@@ -814,5 +2012,53 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry
 
         [LoggerMessage(5, LogLevel.Warning, "Failed to configure client-backed worker {WorkerId} for the active ScriptHost.")]
         public static partial void ChannelSetupFailed(ILogger logger, Exception exception, string workerId);
+
+        [LoggerMessage(6, LogLevel.Warning,
+            "Published fallback removal for worker {WorkerId} in namespace {WorkerNamespace} after an uncertain graceful unlink.")]
+        public static partial void WorkerRemovalFallbackAdded(
+            ILogger logger,
+            string workerId,
+            string workerNamespace);
+
+        [LoggerMessage(7, LogLevel.Warning,
+            "Cannot publish fallback removal after an uncertain graceful unlink for endpoint {WorkerEndpoint} because the link has no worker identity.")]
+        public static partial void WorkerRemovalFallbackUnavailable(ILogger logger, Uri workerEndpoint);
+
+        [LoggerMessage(8, LogLevel.Information,
+            "Selected worker {WorkerId} for authoritative count scale-in of function group {FunctionGroup} and always-ready class {IsAlwaysReady}.")]
+        public static partial void CountScaleInWorkerSelected(
+            ILogger logger,
+            string workerId,
+            string functionGroup,
+            bool isAlwaysReady);
+
+        [LoggerMessage(9, LogLevel.Warning,
+            "The committed authoritative count scale-in drain for worker {WorkerId} did not complete locally.")]
+        public static partial void CountScaleInDrainIncomplete(ILogger logger, string workerId);
+
+        [LoggerMessage(10, LogLevel.Error,
+            "The committed authoritative count scale-in drain for worker {WorkerId} failed.")]
+        public static partial void CountScaleInDrainFailed(ILogger logger, Exception exception, string workerId);
+
+        [LoggerMessage(11, LogLevel.Debug,
+            "Skipped authoritative count scale-in for function group {FunctionGroup} and always-ready class {IsAlwaysReady} because Runtime retirement is active.")]
+        public static partial void CountScaleInSkippedForRuntimeRetirement(
+            ILogger logger,
+            string functionGroup,
+            bool isAlwaysReady);
+
+        [LoggerMessage(14, LogLevel.Information,
+            "Selected worker {WorkerId} for Runtime drain with committed-invocation grace deadline {InvocationGraceDeadline}.")]
+        public static partial void AppVersionDrainWorkerSelected(
+            ILogger logger,
+            string workerId,
+            DateTimeOffset invocationGraceDeadline);
+
+        [LoggerMessage(15, LogLevel.Warning,
+            "Committed-invocation grace expired for Runtime draining worker {WorkerId} at {InvocationGraceDeadline}; closing its channel.")]
+        public static partial void AppVersionDrainGraceExpired(
+            ILogger logger,
+            string workerId,
+            DateTimeOffset invocationGraceDeadline);
     }
 }

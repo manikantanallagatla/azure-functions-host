@@ -6,6 +6,8 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Grpc.Core;
+using Microsoft.Azure.WebJobs.Script.Grpc;
 using Xunit;
 
 namespace Azure.Functions.Rpc.Client.Tests;
@@ -105,6 +107,29 @@ public partial class GrpcDuplexChannelTests
 
         Assert.Same(expected, readFailure);
         Assert.Same(expected, writeFailure.InnerException);
+    }
+
+    [Fact]
+    public async Task RequestFailureBeforeResponseCompletionDoesNotInspectEarlyTrailers()
+    {
+        Metadata trailers =
+        [
+            new(
+                FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue),
+        ];
+        InvalidOperationException expected = new("request failure");
+        MockDuplexStream<string> streams = new(blockWrites: true, trailers: trailers);
+        GrpcDuplexChannel<string> channel = streams.Call.AsChannel();
+        await channel.Writer.WriteAsync("request");
+        await streams.WriteAttempts.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        streams.FailWrites(expected);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => channel.Reader.Completion);
+        Assert.False(((IWorkerRemovalHandoffChannel)channel).IsWorkerRemovalHandoffConfirmed);
+        Assert.Equal(0, streams.TrailerReadCount);
+        await channel.DisposeAsync();
     }
 
     [Fact]

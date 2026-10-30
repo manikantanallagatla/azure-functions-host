@@ -201,7 +201,10 @@ public partial class FunctionRpcRelayTests
             Assert.Equal(WorkerPodStatus.None, failed.PodStatus);
             Assert.Equal(WorkerAssignmentState.Failed, failed.AssignmentState);
             Assert.Equal(assigned.Revision + 1, failed.Revision);
-            Assert.Equal(WorkerAssignmentResult.WorkerTerminated, manager.Assign(assignment));
+            bool shuttingDown = string.Equals(trigger, "shutdown", StringComparison.Ordinal);
+            Assert.Equal(!shuttingDown, failed.RemovalRequested);
+            Assert.Equal(shuttingDown ? WorkerAssignmentResult.WorkerTerminated : WorkerAssignmentResult.RemovalRequested,
+                manager.Assign(assignment));
             Assert.False(runtimeTask.IsCompleted);
             Assert.True(relay.IsAttached(FunctionRpcRelaySide.Runtime));
         }
@@ -244,15 +247,22 @@ public partial class FunctionRpcRelayTests
 
         await using RelayClient replacementRuntime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         await using RelayClient replacementWorker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
-        await ExchangeAsync(replacementRuntime, replacementWorker, "replacement", timeout.Token);
 
         if (assigned)
         {
+            Grpc.Core.RpcException runtimeRejected = await replacementRuntime.WriteAndReadRejectionAsync(
+                CreateMessage("replacement"), timeout.Token);
+            Grpc.Core.RpcException workerRejected = await replacementWorker.WriteAndReadRejectionAsync(
+                CreateStartStream(), timeout.Token);
+            Assert.Equal(StatusCode.Unavailable, runtimeRejected.StatusCode);
+            Assert.Equal(StatusCode.Unavailable, workerRejected.StatusCode);
             Assert.Same(terminated, manager.State);
-            Assert.Equal(WorkerAssignmentResult.WorkerTerminated, manager.Assign(assignment));
+            Assert.True(terminated.RemovalRequested);
+            Assert.Equal(WorkerAssignmentResult.RemovalRequested, manager.Assign(assignment));
         }
         else
         {
+            await ExchangeAsync(replacementRuntime, replacementWorker, "replacement", timeout.Token);
             Assert.True(manager.State.IsWorkerReady);
             Assert.True(manager.State.SessionId > terminated.SessionId);
             Assert.Equal(terminated.Revision + 2, manager.State.Revision);

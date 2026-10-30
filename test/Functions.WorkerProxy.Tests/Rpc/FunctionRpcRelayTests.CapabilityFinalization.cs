@@ -18,6 +18,7 @@ namespace Azure.Functions.WorkerProxy.Tests;
 public partial class FunctionRpcRelayTests
 {
     private const string FunctionGroupNameCapability = "FunctionGroupName";
+    private const string IsAlwaysReadyCapability = "IsAlwaysReady";
 
     [Theory]
     [InlineData(true)]
@@ -102,7 +103,8 @@ public partial class FunctionRpcRelayTests
         WorkerPodState failed = Assert.IsType<WorkerPodState>((await poll).State);
         Assert.False(failed.IsWorkerReady);
         Assert.Equal(WorkerAssignmentState.Failed, failed.AssignmentState);
-        Assert.Equal(WorkerAssignmentResult.WorkerTerminated, manager.Assign(assignment));
+        Assert.True(failed.RemovalRequested);
+        Assert.Equal(WorkerAssignmentResult.RemovalRequested, manager.Assign(assignment));
         Assert.Null(relay.WorkerHttpDestination);
         Assert.Equal(FunctionRpcRelayTerminationReason.Faulted, relay.LastTerminalState?.Reason);
         Assert.Same(failure, relay.LastTerminalState?.Exception);
@@ -160,7 +162,7 @@ public partial class FunctionRpcRelayTests
     [InlineData("worker-group", "assigned-group", "assigned-group")]
     [InlineData(null, null, null)]
     [InlineData("worker-group", null, null)]
-    public async Task Relay_Initialization_AdvertisesOnlyAssignedFunctionGroup(string? workerSuppliedGroup,
+    public async Task Relay_Initialization_AdvertisesOnlyAssignedWorkerClassification(string? workerSuppliedGroup,
         string? platformSuppliedGroup, string? expectedAdvertisedGroup)
     {
         await using WorkerProxyWebApplicationFactory factory = CreateFactory();
@@ -184,6 +186,7 @@ public partial class FunctionRpcRelayTests
         if (expectedAdvertisedGroup is not null)
         {
             expected.WorkerInitResponse.Capabilities[FunctionGroupNameCapability] = expectedAdvertisedGroup;
+            expected.WorkerInitResponse.Capabilities[IsAlwaysReadyCapability] = bool.FalseString;
         }
 
         await worker.WriteAsync(response, timeout.Token);
@@ -192,7 +195,7 @@ public partial class FunctionRpcRelayTests
     }
 
     [Fact]
-    public async Task Relay_RepeatedInitialization_KeepsAssignedFunctionGroup()
+    public async Task Relay_RepeatedInitialization_KeepsAssignedWorkerClassification()
     {
         await using WorkerProxyWebApplicationFactory factory = CreateFactory();
         WorkerPodStateManager manager = factory.Services.GetRequiredService<WorkerPodStateManager>();
@@ -208,6 +211,7 @@ public partial class FunctionRpcRelayTests
         repeated.WorkerInitResponse.Capabilities[FunctionGroupNameCapability] = "changed-group";
         StreamingMessage expected = repeated.Clone();
         expected.WorkerInitResponse.Capabilities[FunctionGroupNameCapability] = assignment.FunctionGroupName;
+        expected.WorkerInitResponse.Capabilities[IsAlwaysReadyCapability] = assignment.IsAlwaysReady.ToString();
 
         await worker.WriteAsync(repeated, timeout.Token);
 
@@ -215,7 +219,7 @@ public partial class FunctionRpcRelayTests
     }
 
     [Fact]
-    public async Task Relay_ReplacementSessionAfterFailedAssignment_DoesNotReuseFunctionGroup()
+    public async Task Relay_ReplacementSessionAfterFailedAssignment_IsRejectedBeforeInitialization()
     {
         await using WorkerProxyWebApplicationFactory factory = CreateFactory();
         WorkerPodStateManager manager = factory.Services.GetRequiredService<WorkerPodStateManager>();
@@ -225,13 +229,14 @@ public partial class FunctionRpcRelayTests
         Assert.Equal(failedAssignment.FunctionGroupName, manager.State.FunctionGroupName);
         await using RelayClient runtime = CreateClient(factory, FunctionRpcRelaySide.Runtime, timeout.Token);
         await using RelayClient worker = CreateClient(factory, FunctionRpcRelaySide.Worker, timeout.Token);
-        await ExchangeAsync(runtime, worker, "replacement", timeout.Token);
-        StreamingMessage response = CreateInitResponse("init", null);
-        StreamingMessage expected = response.Clone();
-
-        await worker.WriteAsync(response, timeout.Token);
-
-        Assert.Equal(expected, await runtime.ReadAsync(timeout.Token));
+        Grpc.Core.RpcException runtimeRejected = await runtime.WriteAndReadRejectionAsync(
+            CreateMessage("replacement"), timeout.Token);
+        Grpc.Core.RpcException workerRejected = await worker.WriteAndReadRejectionAsync(
+            CreateStartStream(), timeout.Token);
+        Assert.Equal(StatusCode.Unavailable, runtimeRejected.StatusCode);
+        Assert.Equal(StatusCode.Unavailable, workerRejected.StatusCode);
+        Assert.True(manager.State.RemovalRequested);
+        Assert.False(manager.State.HasAcceptedLink);
     }
 
     private static async Task<WorkerAssignment> FailAssignedSessionAsync(WorkerProxyWebApplicationFactory factory,

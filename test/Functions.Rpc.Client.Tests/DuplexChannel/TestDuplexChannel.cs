@@ -5,6 +5,7 @@ using System;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Azure.Functions.Rpc.Client;
 using Microsoft.Azure.WebJobs.Script.Grpc;
 
 namespace Azure.Functions.Rpc.Client.Tests;
@@ -12,25 +13,45 @@ namespace Azure.Functions.Rpc.Client.Tests;
 /// <summary>
 /// Provides a replaceable duplex channel without creating network or gRPC resources.
 /// </summary>
-internal sealed class TestDuplexChannel<T> : DuplexChannel<T>
+internal sealed class TestDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHandoffChannel
     where T : class
 {
     private readonly TaskCompletionSource _allowDispose = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _disposeStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Channel<T> _requests;
     private readonly Channel<T> _responses;
+    private readonly Exception _workerRemovalHandoffException;
+    private readonly bool _workerRemovalHandoffConfirmed;
     private int _disposeCount;
 
-    internal TestDuplexChannel(bool blockDisposal = false)
+    internal TestDuplexChannel(
+        bool blockDisposal = false,
+        bool workerRemovalHandoffConfirmed = true,
+        Exception workerRemovalHandoffException = null)
     {
         _requests = Channel.CreateUnbounded<T>();
         _responses = Channel.CreateUnbounded<T>();
+        _workerRemovalHandoffException = workerRemovalHandoffException;
+        _workerRemovalHandoffConfirmed = workerRemovalHandoffConfirmed;
         Reader = _responses.Reader;
         Writer = _requests.Writer;
 
         if (!blockDisposal)
         {
             _allowDispose.TrySetResult();
+        }
+    }
+
+    bool IWorkerRemovalHandoffChannel.IsWorkerRemovalHandoffConfirmed
+    {
+        get
+        {
+            if (_workerRemovalHandoffException is not null)
+            {
+                throw _workerRemovalHandoffException;
+            }
+
+            return _workerRemovalHandoffConfirmed;
         }
     }
 

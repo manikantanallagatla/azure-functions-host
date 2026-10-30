@@ -58,7 +58,7 @@ internal sealed partial class FunctionRpcRelay(
         {
             lock (_syncLock)
             {
-                return _currentSession?.WorkerHttpDestination;
+                return _stateManager.State.RemovalRequested ? null : _currentSession?.WorkerHttpDestination;
             }
         }
     }
@@ -127,15 +127,21 @@ internal sealed partial class FunctionRpcRelay(
 
         lock (_syncLock)
         {
-            if (_stopping)
+            if (_stopping || _stateManager.State.RemovalRequested)
             {
                 throw new FunctionRpcRelayAttachmentException(side, FunctionRpcRelayAttachmentFailure.Shutdown,
-                    "The FunctionRpc relay is shutting down.");
+                    "The FunctionRpc relay is shutting down or the worker pod has requested removal.");
             }
 
             if (_currentSession?.IsTerminalAndReleased == true)
             {
                 ClearCurrentSessionLocked();
+            }
+
+            if (_currentSession is null && _stateManager.State.HasAcceptedLink)
+            {
+                throw new FunctionRpcRelayAttachmentException(side, FunctionRpcRelayAttachmentFailure.PreviousSessionTearingDown,
+                    "An accepted attachment cannot be replaced in this WorkerProxy.");
             }
 
             session = _currentSession ??= new FunctionRpcRelaySession(

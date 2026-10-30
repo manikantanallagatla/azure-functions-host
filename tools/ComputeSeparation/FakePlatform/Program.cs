@@ -78,7 +78,10 @@ simulate.MapPost("/worker/{workerProxyName}/link", async (string workerProxyName
         return Results.NotFound($"Unknown worker proxy '{workerProxyName}'.");
     }
 
-    WorkerLink link = new(workerProxy.WorkerGrpcEndpoint.ToString());
+    WorkerLink link = new(
+        workerProxy.WorkerGrpcEndpoint.ToString(),
+        "local-resource-namespace",
+        workerProxy.WorkerId);
     using HttpResponseMessage response = await clients.CreateClient(HostClient)
         .PutAsJsonAsync($"/admin/workers/{Uri.EscapeDataString(workerProxy.WorkerId)}", link, cancellationToken);
 
@@ -157,7 +160,10 @@ internal partial class Program
     private sealed record WorkerAssignment(string StartupMode, string FunctionAppName, string FunctionGroupName,
         bool IsAlwaysReady, Dictionary<string, string> Environment, string FunctionAppDirectory);
 
-    private sealed record WorkerLink(string WorkerGrpcEndpoint);
+    private sealed record WorkerLink(
+        string WorkerGrpcEndpoint,
+        string WorkerNamespace,
+        string WorkerPodName);
 
     private static partial class Log
     {

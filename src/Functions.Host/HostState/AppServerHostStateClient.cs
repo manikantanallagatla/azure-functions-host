@@ -1,0 +1,287 @@
+// Copyright (c) .NET Foundation. All rights reserved.
+// Licensed under the MIT License. See License.txt in the project root for license information.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Functions.Rpc.Client;
+using Microsoft.Azure.WebJobs.Script;
+using Microsoft.Extensions.Configuration;
+
+namespace Azure.Functions.Host.HostState;
+
+internal enum AppServerHostStatePublishResult
+{
+    Applied,
+    CapacityBlocked,
+    Unsupported,
+    TransientFailure,
+    Rejected,
+}
+
+internal enum RuntimeLifecycleStatus
+{
+    Draining,
+    RemovalRequested,
+}
+
+/// <summary>
+/// Publishes Host capacity through AppServer's existing Host-state transaction.
+/// </summary>
+internal sealed class AppServerHostStateClient(
+    IHttpClientFactory httpClientFactory,
+    IHttpWorkerScaleInManager scaleInManager,
+    IRuntimeRetirementWorkerManager retirementWorkerManager,
+    TimeProvider timeProvider,
+    IConfiguration configuration) : IWorkerScaleInStatePublisher
+{
+    internal const string CapacityFenceHeader = "x-ms-functions-host-state-capacity-fence";
+    internal const string CapacityFenceApplied = "applied";
+    internal const string CapacityFenceRequired = "required";
+    internal const string DefaultEndpoint = "http://localhost:6060/";
+    internal const string DrainingStatus = "Draining";
+    internal const string HostStatePath = "admin/infra/host/state";
+    internal const string HttpClientName = "AppServerHostState";
+    internal const string LifecycleCapacityFenceRequired = "lifecycle-required";
+    internal const string RemovalRequestedStatus = "RemovalRequested";
+    internal static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(5);
+
+    private readonly IConfiguration _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+    private readonly string? _containerName = configuration[EnvironmentSettingNames.ContainerName];
+    private readonly IHttpClientFactory _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+    private readonly SemaphoreSlim _publicationGate = new(1, 1);
+    private readonly IHttpWorkerScaleInManager _scaleInManager =
+        scaleInManager ?? throw new ArgumentNullException(nameof(scaleInManager));
+
+    private readonly IRuntimeRetirementWorkerManager _retirementWorkerManager =
+        retirementWorkerManager ?? throw new ArgumentNullException(nameof(retirementWorkerManager));
+
+    private readonly TimeProvider _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+    private DateTimeOffset _lastCreatedTime;
+
+    public async Task<AppServerHostStatePublishResult> PublishAsync(
+        HttpWorkerScaleInState state,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        return await PublishAsync(
+            state,
+            status: null,
+            acquireClosed: null,
+            allowDuringRetirement: false,
+            advanceCreatedTime: false,
+            capacityFence: CapacityFenceRequired,
+            cancellationToken);
+    }
+
+    internal async Task<AppServerHostStatePublishResult> PublishAuthoritativeScaleInAsync(
+        HttpWorkerScaleInState state,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        using CancellationTokenSource timeoutSource =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutSource.CancelAfter(RequestTimeout);
+        try
+        {
+            return await PublishAsync(
+                state,
+                status: null,
+                acquireClosed: null,
+                allowDuringRetirement: false,
+                advanceCreatedTime: false,
+                capacityFence: null,
+                timeoutSource.Token);
+        }
+        catch (OperationCanceledException) when (
+            timeoutSource.IsCancellationRequested &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            return AppServerHostStatePublishResult.TransientFailure;
+        }
+    }
+
+    async Task<bool> IWorkerScaleInStatePublisher.PublishAuthoritativeScaleInAsync(
+        HttpWorkerScaleInState state,
+        CancellationToken cancellationToken)
+        => await PublishAuthoritativeScaleInAsync(state, cancellationToken) is AppServerHostStatePublishResult.Applied;
+
+    internal Task<AppServerHostStatePublishResult> BindRuntimeIncarnationAsync(
+        CancellationToken cancellationToken)
+        => PublishAsync(
+            state: null,
+            status: null,
+            acquireClosed: null,
+            allowDuringRetirement: true,
+            advanceCreatedTime: false,
+            capacityFence: CapacityFenceRequired,
+            cancellationToken);
+
+    internal Task<AppServerHostStatePublishResult> PublishRetirementStateAsync(
+        HttpWorkerScaleInState state,
+        RuntimeLifecycleStatus? status,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (status is RuntimeLifecycleStatus.RemovalRequested)
+        {
+            throw new ArgumentOutOfRangeException(nameof(status));
+        }
+
+        string capacityFence = status is null
+            ? CapacityFenceRequired
+            : LifecycleCapacityFenceRequired;
+        return PublishAsync(
+            state,
+            status,
+            acquireClosed: status is null ? null : true,
+            allowDuringRetirement: true,
+            advanceCreatedTime: true,
+            capacityFence,
+            cancellationToken);
+    }
+
+    internal Task<AppServerHostStatePublishResult> PublishLifecycleAsync(
+        RuntimeLifecycleStatus status,
+        HttpWorkerScaleInState state,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        return PublishAsync(
+            state,
+            status,
+            acquireClosed: true,
+            allowDuringRetirement: true,
+            advanceCreatedTime: false,
+            capacityFence: LifecycleCapacityFenceRequired,
+            cancellationToken);
+    }
+
+    private async Task<AppServerHostStatePublishResult> PublishAsync(
+        HttpWorkerScaleInState? state,
+        RuntimeLifecycleStatus? status,
+        bool? acquireClosed,
+        bool allowDuringRetirement,
+        bool advanceCreatedTime,
+        string? capacityFence,
+        CancellationToken cancellationToken)
+    {
+        await _publicationGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_containerName) ||
+                (!allowDuringRetirement && _retirementWorkerManager.IsRetirementRequested))
+            {
+                return AppServerHostStatePublishResult.Unsupported;
+            }
+
+            state ??= _scaleInManager.Current;
+            DateTimeOffset createdTime = status is not null || advanceCreatedTime
+                ? GetNextCreatedTime(state.CreatedTime)
+                : state.CreatedTime;
+            if (createdTime > _lastCreatedTime)
+            {
+                _lastCreatedTime = createdTime;
+            }
+
+            using HttpRequestMessage request = new(HttpMethod.Put, GetHostStateUri())
+            {
+                Content = JsonContent.Create(
+                    new HostStateRequest(
+                        createdTime,
+                        state.LinkedWorkerCount,
+                        status is null ? state.HttpCapacity : 0,
+                        _retirementWorkerManager.Incarnation.Value,
+                        GetLifecycleStatusValue(status),
+                        acquireClosed,
+                        state.OutstandingWorkerRemovals),
+                    AppServerHostStateJsonContext.Default.HostStateRequest),
+            };
+            request.Headers.Add(ScriptConstants.ContainerInstanceHeader, _containerName);
+            if (capacityFence is not null)
+            {
+                request.Headers.Add(CapacityFenceHeader, capacityFence);
+            }
+
+            using HttpResponseMessage response = await _httpClientFactory.CreateClient(HttpClientName).SendAsync(
+                request,
+                cancellationToken);
+
+            if (response.StatusCode is HttpStatusCode.PreconditionFailed)
+            {
+                return AppServerHostStatePublishResult.CapacityBlocked;
+            }
+
+            if (response.IsSuccessStatusCode)
+            {
+                return capacityFence is null ||
+                    (response.Headers.TryGetValues(CapacityFenceHeader, out var values) &&
+                    values.Any(value => string.Equals(value, CapacityFenceApplied, StringComparison.OrdinalIgnoreCase)))
+                        ? AppServerHostStatePublishResult.Applied
+                        : AppServerHostStatePublishResult.Unsupported;
+            }
+
+            return response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden ||
+                (int)response.StatusCode >= 500
+                    ? AppServerHostStatePublishResult.TransientFailure
+                    : AppServerHostStatePublishResult.Rejected;
+        }
+        finally
+        {
+            _publicationGate.Release();
+        }
+    }
+
+    private DateTimeOffset GetNextCreatedTime(DateTimeOffset stateCreatedTime)
+    {
+        DateTimeOffset createdTime = _timeProvider.GetUtcNow();
+        DateTimeOffset minimumCreatedTime = stateCreatedTime > _lastCreatedTime
+            ? stateCreatedTime
+            : _lastCreatedTime;
+
+        return createdTime > minimumCreatedTime
+            ? createdTime
+            : minimumCreatedTime.AddTicks(1);
+    }
+
+    private static string? GetLifecycleStatusValue(RuntimeLifecycleStatus? status)
+        => status switch
+        {
+            RuntimeLifecycleStatus.Draining => DrainingStatus,
+            RuntimeLifecycleStatus.RemovalRequested => RemovalRequestedStatus,
+            null => null,
+            _ => throw new ArgumentOutOfRangeException(nameof(status)),
+        };
+
+    private Uri GetHostStateUri()
+    {
+        string? endpoint = _configuration[EnvironmentSettingNames.MeshInitURI];
+        if (string.IsNullOrWhiteSpace(endpoint))
+        {
+            endpoint = DefaultEndpoint;
+        }
+
+        return new Uri(new Uri(endpoint.EndsWith('/') ? endpoint : endpoint + "/", UriKind.Absolute), HostStatePath);
+    }
+
+    internal sealed record HostStateRequest(
+        DateTimeOffset CreatedTime,
+        int LinkedWorkerCount,
+        long HttpCapacity,
+        Guid RuntimeIncarnationId,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        string? Status,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        bool? AcquireClosed,
+        IReadOnlyList<FunctionsSplitWorkerRemovalAction> OutstandingWorkerRemovals);
+}
+
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+[JsonSerializable(typeof(AppServerHostStateClient.HostStateRequest))]
+internal sealed partial class AppServerHostStateJsonContext : JsonSerializerContext;

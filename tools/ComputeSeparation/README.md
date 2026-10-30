@@ -4,10 +4,19 @@ A local development tool for running the real Functions Host, WorkerProxy, and .
 
 The tool supplies no `host.json`. It sets the Host's existing read-only app-content option, so the unchanged Host uses defaults without writing that file.
 
+See [HTTP on-demand worker scale-in](HTTP-WORKER-SCALE-IN.md) for the reviewer guide to idle worker reservation, AppServer capacity fencing, invocation draining, and unlink ownership.
+
 ## Prerequisites
 
 - The repository's .NET SDK.
 - For container deployment only, a running Linux x64 Docker engine with Docker Compose.
+
+## BYOC worker lifecycle cleanup
+
+The lifecycle cleanup behavior used by this tool is explained in the
+[BYOC worker lifecycle cleanup reviewer guide](byoc-worker-lifecycle-cleanup.md). The guide covers
+Link history, the fixed never-linked deadline, terminal relay cleanup, explicit Runtime unlink,
+admission closure, assumptions, limitations, and behavioral validation.
 
 The first build downloads the matching Aspire toolchain into the worktree's build output. A global Aspire installation and Azure Functions Core Tools are not required.
 
@@ -75,7 +84,7 @@ The happy path, in order:
 | --- | --- | --- | --- | --- |
 | 1 | WorkerProxy | Platform | `PUT /admin/worker/assignment` | Assigns the pod once its worker has connected. |
 | 2 | Host | Platform | `POST /admin/instance/assign` | Assigns the placeholder Host to the app, which then specializes. Not sent in `project`, whose Host starts already specialized. |
-| 3 | Host | Platform | `PUT /admin/workers/{workerId}` | Links the worker through the WorkerProxy runtime gRPC endpoint. |
+| 3 | Host | Platform | `PUT /admin/workers/{workerId}` | Links the worker through the WorkerProxy runtime gRPC endpoint with its resource namespace and route-matching pod name. |
 | 4 | Host | Client | `GET /api/hello` | Invokes the function through Host -> WorkerProxy -> worker. |
 
 `GET /admin/worker/state` on the WorkerProxy reports the pod state at any time. The `project` profile sends steps 1 and 3 through the fake platform automatically; `project-placeholder-manual` leaves steps 1 to 3 to you.

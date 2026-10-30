@@ -30,10 +30,17 @@ public static class RpcClientServiceCollectionExtensions
         ThrowIfRegistered<IRpcClientFactory>(services, nameof(AddRpcClientServices));
 
         services.AddDefaultHttpProxyService();
+        services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<IRpcClientFactory, RpcClientFactory>();
         services.AddSingleton<IDuplexChannelFactory<StreamingMessage>, FunctionRpcDuplexChannelFactory>();
         services.AddSingleton<IRpcClientWorkerChannelFactory, RpcClientWorkerChannelFactory>();
-        services.AddSingleton<IWorkerChannelRegistry, WorkerChannelRegistry>();
+        services.AddSingleton<WorkerChannelRegistry>();
+        services.AddSingleton<IWorkerChannelRegistry>(provider => provider.GetRequiredService<WorkerChannelRegistry>());
+        services.AddSingleton<IHttpWorkerScaleInManager>(provider => provider.GetRequiredService<WorkerChannelRegistry>());
+        services.AddSingleton<IWorkerCountScaleInManager>(provider => provider.GetRequiredService<WorkerChannelRegistry>());
+        services.AddSingleton<IRuntimeRetirementWorkerManager>(provider => provider.GetRequiredService<WorkerChannelRegistry>());
+        services.AddSingleton<IAppVersionRuntimeDrainWorkerManager>(
+            provider => provider.GetRequiredService<WorkerChannelRegistry>());
         services.AddSingleton<IWorkerFunctionMetadataProvider, RpcClientWorkerFunctionMetadataProvider>();
         services.Configure<FunctionMetadataOptions>(options => options.UseWorkerRuntimeFromMetadata = true);
 
@@ -61,6 +68,7 @@ public static class RpcClientServiceCollectionExtensions
         services.AddSingleton(provider => new RpcClientScriptHostStartupCoordinator(
             provider.GetRequiredService<IWorkerChannelRegistry>(),
             scriptHostFactory(provider),
+            provider.GetRequiredService<IRuntimeRetirementManager>(),
             provider.GetRequiredService<IHostApplicationLifetime>(),
             provider.GetRequiredService<ILogger<RpcClientScriptHostStartupCoordinator>>()));
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<RpcClientScriptHostStartupCoordinator>());
