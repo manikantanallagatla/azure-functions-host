@@ -361,6 +361,66 @@ public sealed partial class WorkerChannelRegistryTests
     }
 
     [Fact]
+    public async Task PostRuntimeDrain_AdmissionFailureKeepsPublishingExistingDrainFallback()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        FunctionMetadata function = CreateFunction("ExistingDrainFunction");
+        ChannelControl worker = new(
+            "existing-drain",
+            functionGroupName: "existing-drain-group",
+            isAlwaysReady: false,
+            completeResponsesOnRequestCompletion: false,
+            workerRemovalHandoffConfirmed: false);
+        harness.Enqueue(worker);
+        await registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        await MakeWorkersReadyAsync(registry, function, worker);
+
+        using AppVersionDrainHostStateHandler handler = new(
+            drainFenceStatus: HttpStatusCode.Conflict);
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        WorkerCountScaleInResult scaleIn =
+            ((IWorkerCountScaleInManager)registry).ScaleInWorkers(
+                "existing-drain-group",
+                false,
+                0);
+        Assert.Equal(1, scaleIn.NewlyDrainingWorkerCount);
+        await worker.Transport.Requests.Completion.WaitAsync(TestTimeout);
+
+        using HttpResponseMessage rejected = await host.PostAsync(CreateDrainJson(
+            "Immediate",
+            "Stop"));
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+
+        worker.Complete();
+        await WaitUntilAsync(() => handler.PublishedStates.Any(state =>
+            state.Status is null &&
+            state.OutstandingWorkerRemovals.Any(action =>
+                string.Equals(action.Worker.PodName, worker.Id, StringComparison.Ordinal))));
+        FunctionsSplitWorkerRemovalAction fallback = Assert.Single(
+            ((IHttpWorkerScaleInManager)registry).Current.OutstandingWorkerRemovals);
+        Assert.Equal("RuntimeUnlink", fallback.Reason);
+        AppServerHostStateClient.HostStateRequest failedFence = Assert.Single(
+            handler.PublishedStates,
+            state => string.Equals(
+                state.Status,
+                AppServerHostStateClient.DrainingStatus,
+                StringComparison.Ordinal));
+        AppServerHostStateClient.HostStateRequest publishedFallback = handler.PublishedStates.Last(state =>
+            state.Status is null &&
+            state.OutstandingWorkerRemovals.Any(action =>
+                string.Equals(action.Worker.PodName, worker.Id, StringComparison.Ordinal)));
+        Assert.True(publishedFallback.CreatedTime > failedFence.CreatedTime);
+    }
+
+    [Fact]
     public async Task PostRuntimeDrain_ImmediateSelectsAllClassesReturnsExistingReceiptAndRejectsDowngrade()
     {
         DrainManualTimeProvider timeProvider = new();
@@ -543,6 +603,80 @@ public sealed partial class WorkerChannelRegistryTests
             "acceptedAtUtc",
             await escalation.Content.ReadAsStringAsync(),
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PostRuntimeDrain_SelectedWorkerFailureRejectsRetryAndEscalationBeforeScheduleCompletes()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        FunctionMetadata function = CreateFunction("WorkerFailureFunction");
+        ChannelControl failed = new(
+            "a-failed",
+            functionGroupName: FunctionGroups.Durable,
+            isAlwaysReady: false,
+            workerRemovalHandoffConfirmed: false);
+        ChannelControl[] pending = Enumerable.Range(0, 4)
+            .Select(index => new ChannelControl(
+                $"b-pending-{index}",
+                functionGroupName: FunctionGroups.Durable,
+                isAlwaysReady: false))
+            .ToArray();
+        ChannelControl[] workers = [failed, .. pending];
+        foreach (ChannelControl worker in workers)
+        {
+            harness.Enqueue(worker);
+            await LinkAsync(registry, worker.Id);
+        }
+
+        await MakeWorkersReadyAsync(registry, function, workers);
+        using AppVersionDrainHostStateHandler handler = new();
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
+            "Phased",
+            "ConfigurationChange"));
+        accepted.EnsureSuccessStatusCode();
+        await failed.Channel.Completion.WaitAsync(TestTimeout);
+
+        HttpResponseMessage repeatedMode;
+        using (CancellationTokenSource timeout = new(TestTimeout))
+        {
+            while (true)
+            {
+                repeatedMode = await host.PostAsync(CreateDrainJson(
+                    "Phased",
+                    "Restart"));
+                if (repeatedMode.StatusCode is HttpStatusCode.ServiceUnavailable)
+                {
+                    break;
+                }
+
+                repeatedMode.Dispose();
+                await Task.Delay(TimeSpan.FromMilliseconds(10), timeout.Token);
+            }
+        }
+
+        using (repeatedMode)
+        {
+            Assert.DoesNotContain(
+                "acceptedAtUtc",
+                await repeatedMode.Content.ReadAsStringAsync(),
+                StringComparison.Ordinal);
+        }
+
+        using HttpResponseMessage escalation = await host.PostAsync(CreateDrainJson(
+            "Immediate",
+            "Restart"));
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, escalation.StatusCode);
+        Assert.DoesNotContain(
+            "acceptedAtUtc",
+            await escalation.Content.ReadAsStringAsync(),
+            StringComparison.Ordinal);
+        Assert.All(pending, worker => Assert.Equal(0, worker.DisposeCount));
     }
 
     private static string CreateDrainJson(string mode, string reason)

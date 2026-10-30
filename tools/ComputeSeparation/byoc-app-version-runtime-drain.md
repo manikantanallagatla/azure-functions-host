@@ -110,6 +110,10 @@ admission, then permanently closes Runtime admission. A concurrent P1 or R2 drai
 first and is tracked as pre-existing work, or observes Runtime retirement and cannot create a later
 selection.
 
+If incarnation binding or the initial lifecycle fence fails, the API remains failed closed. A
+failure-path publisher nevertheless continues publishing the retirement-pending Host state so a
+P1/R2 drain committed before admission can still publish a later exact fallback action.
+
 ## 4. P2 Phased scheduling
 
 The initial non-HTTP snapshot contains linked, invocation-ready Workers that were not already
@@ -147,6 +151,9 @@ P2 does not replace or reset that work.
 
 A repeated Phased request with any valid reason returns the original receipt and does not recreate
 the snapshot, restart the 0/10/20/30/35/40-second schedule, or move any Worker deadline.
+Every selected drain is observed as soon as it completes. A false, faulted, or canceled result is
+latched immediately, so a repeated Phased request or Immediate escalation cannot return a receipt
+while later Phased timers are still pending.
 
 ## 5. Immediate cleanup and escalation
 
@@ -230,6 +237,8 @@ A timer alone cannot bypass fallback ownership.
 
 - R2 and P1 stop creating new selections after Runtime retirement closes admission.
 - A committed R2/P1 drain remains tracked and can still produce the existing exact fallback action.
+- If initial Runtime admission fails after that drain commits, a failure-path publisher keeps its
+  current state and later fallback outbox changes visible to AppServer.
 - R4 duplicate activation-fault retirement remains idempotent for R4-owned retirement. R4 cannot
   replace an active app-version schedule with an uncoordinated second retirement flow.
 - Link requires the worker namespace and route-matching pod name so an uncertain unlink always has
@@ -239,6 +248,8 @@ A timer alone cannot bypass fallback ownership.
   locally closed and does not create a success-shaped response or completion.
 - A failed schedule or lifecycle task is latched. Repeated active-mode requests and later escalation
   fail instead of returning a receipt for a schedule that no longer has a finalization owner.
+- A selected Worker drain failure is latched immediately, before the remaining Phased selection
+  timers finish, and has the same fail-closed retry and escalation behavior.
 
 ## 9. Assumptions and known limitations
 
@@ -267,11 +278,11 @@ A timer alone cannot bypass fallback ownership.
 | `Functions.Rpc.Client/Registry/WorkerChannelRegistry.cs` | Atomic snapshot/closure, deterministic selection, existing-drain tracking, deadline handoff, and fallback reuse. |
 | `Functions.Rpc.Client/WorkerChannel/RpcClientWorkerChannel.cs` | Channel-local eligibility, admission closure, and app-version drain commitment. |
 | `Functions.Rpc.Client/Extensions/RpcClientServiceCollectionExtensions.cs` | Registry seam registration. |
-| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Eight public-API behavioral tests with a deterministic test clock. |
+| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Ten public-API behavioral tests with a deterministic test clock. |
 
 ## 11. Behavioral evidence
 
-The eight focused in-memory public-API methods prove:
+The ten focused in-memory public-API methods prove:
 
 1. synchronous lifecycle fence commitment, exact two-field receipt, active-mode idempotency,
    additive-field compatibility, ordinal required property names, duplicate/type/malformed
@@ -285,8 +296,11 @@ The eight focused in-memory public-API methods prove:
    Immediate requests across valid reasons, and downgrade conflict;
 7. Phased-to-Immediate escalation with original P2 deadline preservation, escalation-time deadlines
    for new selections, repeated Immediate idempotency, and one-way mode progression.
-8. lifecycle-progress publication failure is latched and prevents repeated-mode or escalation
-   receipts.
+8. failed initial admission keeps publishing later exact fallback state from an already-committed
+   P1 drain;
+9. lifecycle-progress publication failure is latched and prevents repeated-mode or escalation
+   receipts;
+10. a selected Worker drain failure is latched before later Phased timers and prevents repeated-mode
+    or escalation receipts.
 
-Validation commands and final results are recorded in the branch handoff after all affected P1, R4,
-Host, and RPC suites complete.
+These tests were updated but not executed in this change, per the requested validation boundary.

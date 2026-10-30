@@ -43,6 +43,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
     private readonly Lock _invocationAdmissionLock = new();
     private readonly Lock _lifecycleLock = new();
     private readonly ChannelWriter<StreamingMessage> _requestWriter;
+    private readonly IWorkerRemovalHandoffChannel? _workerRemovalHandoffChannel;
     private readonly TaskCompletionSource _drainCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _startCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TimeProvider _timeProvider;
@@ -92,6 +93,7 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
     {
         _requestWriter = ownedChannel.Writer;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _workerRemovalHandoffChannel = ownedChannel as IWorkerRemovalHandoffChannel;
         Completion = ownedChannel.Reader.Completion;
     }
 
@@ -107,6 +109,9 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
     internal Task<Exception> FunctionLoadFailure => _functionLoadFailure.Task;
 
     internal bool IsTerminated => Completion.IsCompleted || FunctionLoadFailure.IsCompleted;
+
+    internal bool IsWorkerRemovalHandoffConfirmed =>
+        _workerRemovalHandoffChannel?.IsWorkerRemovalHandoffConfirmed == true;
 
     internal bool ContributesHttpCapacity
     {

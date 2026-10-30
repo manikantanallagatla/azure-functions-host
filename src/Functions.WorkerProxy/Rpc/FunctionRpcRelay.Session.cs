@@ -197,7 +197,12 @@ internal sealed partial class FunctionRpcRelay
         /// </summary>
         public void RequestShutdown()
         {
-            TryTerminate(new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Shutdown, Side: null, Exception: null));
+            TryTerminate(new FunctionRpcRelayTerminalState(
+                id,
+                FunctionRpcRelayTerminationReason.Shutdown,
+                Side: null,
+                Exception: null,
+                RemovalRequested: false));
         }
 
         private static Channel<StreamingMessage> CreateChannel()
@@ -353,7 +358,12 @@ internal sealed partial class FunctionRpcRelay
             {
                 await completedTask;
 
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.PeerClosed, side, Exception: null);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.PeerClosed,
+                    side,
+                    Exception: null,
+                    RemovalRequested: false);
             }
             catch (OperationCanceledException exception)
             {
@@ -362,15 +372,30 @@ internal sealed partial class FunctionRpcRelay
                     return await _completion.Task;
                 }
 
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Canceled, side, exception);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.Canceled,
+                    side,
+                    exception,
+                    RemovalRequested: false);
             }
             catch (Exception exception) when (callCancellationToken.IsCancellationRequested)
             {
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Canceled, side, exception);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.Canceled,
+                    side,
+                    exception,
+                    RemovalRequested: false);
             }
             catch (Exception exception)
             {
-                return new FunctionRpcRelayTerminalState(id, FunctionRpcRelayTerminationReason.Faulted, side, exception);
+                return new FunctionRpcRelayTerminalState(
+                    id,
+                    FunctionRpcRelayTerminationReason.Faulted,
+                    side,
+                    exception,
+                    RemovalRequested: false);
             }
         }
 
@@ -383,12 +408,16 @@ internal sealed partial class FunctionRpcRelay
                     return false;
                 }
 
-                _terminalState = terminalState;
                 bool peerTerminated = terminalState.Reason is FunctionRpcRelayTerminationReason.PeerClosed
                     or FunctionRpcRelayTerminationReason.Canceled
                     or FunctionRpcRelayTerminationReason.Faulted;
                 // Withdraw readiness before completing stream tasks or starting potentially slow teardown/logging.
                 stateManager.OnSessionTerminated(id, peerTerminated);
+                terminalState = terminalState with
+                {
+                    RemovalRequested = stateManager.State.RemovalRequested,
+                };
+                _terminalState = terminalState;
                 _completion.SetResult(terminalState);
             }
 

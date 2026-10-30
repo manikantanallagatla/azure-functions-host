@@ -10,6 +10,7 @@ using Azure.Functions.WorkerProxy.Rpc;
 using Azure.Functions.WorkerProxy.State;
 using Google.Protobuf;
 using Grpc.Core;
+using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
@@ -32,6 +33,40 @@ public partial class FunctionRpcRelayTests
         SiblingIsolation,
         Shutdown,
         InitializationCloseRace
+    }
+
+    [Fact]
+    public async Task RuntimeClose_ConfirmsStickyRemovalOwnershipInGrpcTrailer()
+    {
+        await using WorkerProxyWebApplicationFactory factory =
+            CreateTimeoutFactory(new LifecycleClock());
+        using CancellationTokenSource timeout = new(TestTimeout);
+        await using RelayClient worker = CreateClient(
+            factory,
+            FunctionRpcRelaySide.Worker,
+            timeout.Token);
+        await using RelayClient runtime = CreateClient(
+            factory,
+            FunctionRpcRelaySide.Runtime,
+            timeout.Token);
+        await InitializeLinkAsync(worker, runtime, string.Empty, timeout.Token);
+
+        await runtime.CompleteRequestAsync(timeout.Token);
+        GrpcRpcException termination =
+            await runtime.WaitForTerminationExceptionAsync(timeout.Token);
+
+        Assert.Equal(StatusCode.Unavailable, termination.StatusCode);
+        Assert.Contains(
+            termination.Trailers,
+            trailer =>
+                string.Equals(
+                    trailer.Key,
+                    FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                    StringComparison.Ordinal) &&
+                string.Equals(
+                    trailer.Value,
+                    FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue,
+                    StringComparison.Ordinal));
     }
 
     [Theory]

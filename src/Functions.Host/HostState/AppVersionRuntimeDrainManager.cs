@@ -21,6 +21,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     ILogger<AppVersionRuntimeDrainManager> logger) : IAppVersionRuntimeDrainManager
 {
     internal static readonly TimeSpan InvocationGracePeriod = TimeSpan.FromMinutes(60);
+    private static readonly TimeSpan FailedAdmissionPublishInterval = TimeSpan.FromMinutes(1);
 
     private static readonly TimeSpan[] NonHttpBatchOffsets =
     [
@@ -60,6 +61,8 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private CancellationTokenSource? _phasedScheduleSource;
+    private Task? _failedAdmissionPublisherTask;
+    private Exception? _drainFailure;
     private Exception? _lifecycleFailure;
     private Exception? _selectionFailure;
     private bool _selectionFinalized;
@@ -139,17 +142,24 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                 CancellationToken.None);
             EnsureApplied(fenceResult, "apply the Runtime drain fence");
         }
-        catch (HttpRequestException exception)
+        catch (Exception exception)
         {
-            throw new RuntimeDrainAdmissionException(
-                "AppServer was unavailable while committing the Runtime drain fence.",
-                exception);
-        }
-        catch (OperationCanceledException exception)
-        {
-            throw new RuntimeDrainAdmissionException(
-                "AppServer timed out while committing the Runtime drain fence.",
-                exception);
+            StartFailedAdmissionPublisher();
+            if (exception is HttpRequestException)
+            {
+                throw new RuntimeDrainAdmissionException(
+                    "AppServer was unavailable while committing the Runtime drain fence.",
+                    exception);
+            }
+
+            if (exception is OperationCanceledException)
+            {
+                throw new RuntimeDrainAdmissionException(
+                    "AppServer timed out while committing the Runtime drain fence.",
+                    exception);
+            }
+
+            throw;
         }
 
         DateTimeOffset acceptedAtUtc = _timeProvider.GetUtcNow();
@@ -161,11 +171,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         int phasedBatchSize = 0;
         lock (_operationLock)
         {
-            _trackedDrains.AddRange(start.ExistingDrains);
-            if (start.ExistingDrains.Count > 0)
-            {
-                _drainGeneration++;
-            }
+            TrackDrainsLocked(start.ExistingDrains);
 
             TrackSelectionLocked(_workerManager.SelectWorkers(
                 start.Incarnation,
@@ -333,9 +339,12 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             Task<bool[]>? drains = null;
             int generation = 0;
             Task operationChanged;
+            Exception? drainFailure;
             Exception? selectionFailure;
             lock (_operationLock)
             {
+                LatchCompletedDrainFailuresLocked();
+                drainFailure = _drainFailure;
                 selectionFailure = _selectionFailure;
                 if (_selectionFinalized)
                 {
@@ -351,6 +360,13 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                 throw new InvalidOperationException(
                     "The Runtime drain schedule failed.",
                     selectionFailure);
+            }
+
+            if (drainFailure is not null)
+            {
+                throw new InvalidOperationException(
+                    "At least one Worker could not complete its Runtime drain and unlink.",
+                    drainFailure);
             }
 
             if (drains is null)
@@ -499,13 +515,72 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
     private void TrackSelectionLocked(AppVersionRuntimeDrainSelection selection)
     {
-        if (selection.DrainTasks.Count == 0)
+        TrackDrainsLocked(selection.DrainTasks);
+    }
+
+    private void TrackDrainsLocked(IReadOnlyList<Task<bool>> drains)
+    {
+        if (drains.Count == 0)
         {
             return;
         }
 
-        _trackedDrains.AddRange(selection.DrainTasks);
+        _trackedDrains.AddRange(drains);
         _drainGeneration++;
+        foreach (Task<bool> drain in drains)
+        {
+            _ = drain.ContinueWith(
+                static (task, state) => ((AppVersionRuntimeDrainManager)state!).ObserveTrackedDrain(task),
+                this,
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default);
+        }
+
+        SignalOperationChangedLocked();
+    }
+
+    private void ObserveTrackedDrain(Task<bool> drain)
+    {
+        lock (_operationLock)
+        {
+            LatchDrainFailureLocked(drain);
+        }
+    }
+
+    private void LatchCompletedDrainFailuresLocked()
+    {
+        foreach (Task<bool> drain in _trackedDrains)
+        {
+            if (drain.IsCompleted)
+            {
+                LatchDrainFailureLocked(drain);
+            }
+        }
+    }
+
+    private void LatchDrainFailureLocked(Task<bool> drain)
+    {
+        if (_drainFailure is not null)
+        {
+            return;
+        }
+
+        Exception? failure = drain.Status switch
+        {
+            TaskStatus.RanToCompletion when !drain.Result =>
+                new InvalidOperationException("The Worker drain completed without a confirmed removal handoff."),
+            TaskStatus.Faulted => drain.Exception?.GetBaseException() ??
+                new InvalidOperationException("The Worker drain faulted without an exception."),
+            TaskStatus.Canceled => new OperationCanceledException("The Worker drain was canceled."),
+            _ => null,
+        };
+        if (failure is null)
+        {
+            return;
+        }
+
+        _drainFailure = failure;
         SignalOperationChangedLocked();
     }
 
@@ -527,12 +602,80 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
     private void ThrowIfDrainFailedLocked()
     {
-        Exception? failure = _lifecycleFailure ?? _selectionFailure;
+        LatchCompletedDrainFailuresLocked();
+        Exception? failure = _lifecycleFailure ?? _selectionFailure ?? _drainFailure;
         if (failure is not null)
         {
             throw new RuntimeDrainAdmissionException(
                 "The active Runtime drain lifecycle has already failed.",
                 failure);
+        }
+    }
+
+    private void StartFailedAdmissionPublisher()
+    {
+        Task publisher;
+        lock (_operationLock)
+        {
+            publisher = _failedAdmissionPublisherTask ??= RunFailedAdmissionPublisherAsync();
+        }
+
+        _ = ObserveFailedAdmissionPublisherAsync(publisher);
+    }
+
+    private async Task RunFailedAdmissionPublisherAsync()
+    {
+        while (true)
+        {
+            HttpWorkerScaleInState state;
+            try
+            {
+                state = _scaleInManager.Current;
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+
+            try
+            {
+                AppServerHostStatePublishResult result =
+                    await _appServerClient.PublishRetirementPendingAsync(state, CancellationToken.None);
+                if (result is not AppServerHostStatePublishResult.Applied)
+                {
+                    Log.FailedAdmissionPublicationUnavailable(_logger, result);
+                }
+            }
+            catch (Exception exception)
+            {
+                Log.FailedAdmissionPublicationFailed(_logger, exception);
+            }
+
+            using CancellationTokenSource intervalSource =
+                new(FailedAdmissionPublishInterval, _timeProvider);
+            try
+            {
+                await _scaleInManager.WaitForChangeAsync(state.Version, intervalSource.Token);
+            }
+            catch (OperationCanceledException) when (intervalSource.IsCancellationRequested)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task ObserveFailedAdmissionPublisherAsync(Task publisher)
+    {
+        try
+        {
+            await publisher;
+        }
+        catch (Exception exception)
+        {
+            Log.FailedAdmissionPublisherStopped(_logger, exception);
         }
     }
 
@@ -617,6 +760,24 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             ILogger logger,
             Exception exception,
             Guid runtimeIncarnation);
+
+        [LoggerMessage(1215, LogLevel.Warning,
+            "Runtime drain admission failed and pending Host-state publication returned {Result}.")]
+        public static partial void FailedAdmissionPublicationUnavailable(
+            ILogger logger,
+            AppServerHostStatePublishResult result);
+
+        [LoggerMessage(1216, LogLevel.Warning,
+            "Runtime drain admission failed and pending Host-state publication failed.")]
+        public static partial void FailedAdmissionPublicationFailed(
+            ILogger logger,
+            Exception exception);
+
+        [LoggerMessage(1217, LogLevel.Error,
+            "Runtime drain admission failure publisher stopped unexpectedly.")]
+        public static partial void FailedAdmissionPublisherStopped(
+            ILogger logger,
+            Exception exception);
     }
 }
 

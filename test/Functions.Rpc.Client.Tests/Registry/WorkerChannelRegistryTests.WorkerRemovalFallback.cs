@@ -292,6 +292,37 @@ public sealed partial class WorkerChannelRegistryTests
         Assert.Empty(scaleInManager.Current.OutstandingWorkerRemovals);
     }
 
+    [Fact]
+    public async Task FaultedGrpcCloseWithoutRemovalAcknowledgementCreatesExactFallback()
+    {
+        using CancellationTokenSource timeout = new(TestTimeout);
+        await using FakeWorkerProxyGrpcServer server =
+            await FakeWorkerProxyGrpcServer.StartAsync(timeout.Token);
+        FakeWorkerProxyGrpcServer.TestWorker worker = server.AddWorker("worker-pod-faulted");
+        worker.HoldCloseResponse();
+        await using RpcClientFactory clientFactory =
+            new(NullLogger<RpcClientFactory>.Instance);
+        await using WorkerChannelRegistry registry = CreateRemovalRegistry(clientFactory);
+        FunctionsSplitPodIdentity identity = CreateWorkerIdentity(worker.WorkerId);
+        await registry.LinkAsync(
+            worker.WorkerId,
+            server.Endpoint,
+            identity,
+            timeout.Token);
+
+        Task<bool> unlink = registry.UnlinkAsync(worker.WorkerId, timeout.Token);
+        await worker.RequestsCompleted.WaitAsync(timeout.Token);
+        worker.CompleteUnacknowledgedClose(
+            new Status(StatusCode.Unavailable, "transport failed"));
+        Assert.True(await unlink.WaitAsync(timeout.Token));
+        await worker.Disconnected.WaitAsync(timeout.Token);
+
+        FunctionsSplitWorkerRemovalAction action = Assert.Single(
+            ((IHttpWorkerScaleInManager)registry).Current.OutstandingWorkerRemovals);
+        Assert.Equal(identity, action.Worker);
+        Assert.Equal("RuntimeUnlink", action.Reason);
+    }
+
     private static WorkerChannelRegistry CreateRemovalRegistry(RpcClientFactory clientFactory)
     {
         FunctionRpcDuplexChannelFactory duplexFactory =

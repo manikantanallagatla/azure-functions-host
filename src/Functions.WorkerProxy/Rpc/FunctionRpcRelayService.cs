@@ -6,6 +6,7 @@ using Azure.Functions.WorkerProxy;
 using Grpc.AspNetCore.Server;
 using Grpc.Core;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
 using GrpcRpcException = Grpc.Core.RpcException;
 
@@ -46,6 +47,13 @@ internal sealed class FunctionRpcRelayService(FunctionRpcRelay relay, WorkerProx
             };
 
             throw new GrpcRpcException(new Status(statusCode, exception.Message));
+        }
+
+        if (terminalState.RemovalRequested)
+        {
+            context.ResponseTrailers.Add(
+                FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue);
         }
 
         context.Status = terminalState.Reason switch

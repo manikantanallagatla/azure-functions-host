@@ -3,8 +3,9 @@
 ## Context
 
 WorkerProxy sticky `RemovalRequested` remains the primary worker-removal handoff. Runtime uses
-`outstandingWorkerRemovals` only when a graceful unlink started but WorkerProxy termination did not
-finish reliably enough to prove that primary handoff.
+`outstandingWorkerRemovals` unless WorkerProxy returns the application-level gRPC trailer that is
+emitted only after sticky `RemovalRequested` has been committed. Clean stream completion, transport
+fault, cancellation, timeout, or disposal without that exact trailer remains uncertain.
 
 The fallback action contains the immutable worker coordinates already supplied by Legion Link:
 
@@ -42,11 +43,11 @@ sequenceDiagram
     L->>H: PUT /admin/workers/{podName}<br/>workerNamespace + workerPodName
     H->>H: Validate route pod name ordinally<br/>and retain identity with registry slot
     H->>W: Graceful FunctionRpc request-stream completion
-    alt WorkerProxy termination completes
+    alt WorkerProxy commits sticky RemovalRequested
         W->>W: Persist sticky RemovalRequested
-        W-->>H: Relay stream terminates
+        W-->>H: Relay stream terminates with exact removal trailer
         H->>H: No fallback action
-    else Termination is uncertain
+    else Exact application acknowledgement is absent
         H->>H: Add unique exact RuntimeUnlink action
         H->>G: PUT Host state with outstandingWorkerRemovals
         G-->>HNA: Next Runtime lifecycle snapshot
@@ -69,8 +70,8 @@ admission, clear WorkerProxy retirement, or change the terminal worker slot.
 ```mermaid
 stateDiagram-v2
     [*] --> LinkedExact: Link included valid worker coordinates
-    LinkedExact --> PrimaryComplete: Graceful peer termination completed
-    LinkedExact --> Outstanding: Graceful peer termination uncertain
+    LinkedExact --> PrimaryComplete: Exact removal trailer observed
+    LinkedExact --> Outstanding: Trailer absent after close, fault, cancel, or timeout
     Outstanding --> Outstanding: Malformed, stale, foreign, or non-exact acknowledgement
     Outstanding --> CompletedEvidence: Exact acknowledgement committed
     CompletedEvidence --> CompletedEvidence: Identical lost-response replay
@@ -78,7 +79,9 @@ stateDiagram-v2
 
 - Link requires `workerNamespace` and `workerPodName`.
 - `workerPodName` must equal the route worker ID with ordinal comparison.
-- A successful WorkerProxy stream termination never creates a fallback action.
+- Only the exact WorkerProxy removal trailer confirms primary ownership and avoids a fallback action.
+- Clean, faulted, canceled, timed-out, or disposed streams without the trailer create the exact
+  fallback action.
 - Runtime publishes each action until an exact acknowledgement is committed.
 - Matching uses the full action: resource namespace, pod name, and reason.
 - Malformed acknowledgements return `400`; valid unknown or non-exact actions return `404`.

@@ -856,6 +856,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         bool channelDetached = false;
         bool primaryHandoffConfirmed = false;
+        bool fallbackHandoffOwned = false;
         try
         {
             using CancellationTokenSource operationSource =
@@ -890,9 +891,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                     {
                         channel.FailCommittedInvocations(exception: null);
                         channel.CompleteRequests();
-                        // Wait for peer termination without treating its final gRPC status as an unlink failure.
+                        // Only WorkerProxy's application acknowledgement proves sticky primary removal ownership.
                         await Task.WhenAny(channel.Completion).WaitAsync(_unlinkTimeout, operationSource.Token);
-                        primaryHandoffConfirmed = true;
+                        primaryHandoffConfirmed = channel.IsWorkerRemovalHandoffConfirmed;
                         if (channel.Completion.IsFaulted)
                         {
                             Log.ChannelFailed(_logger, channel.Completion.Exception, workerId);
@@ -904,17 +905,17 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                     }
 
                     failure = await channel.DisposeAndCaptureExceptionAsync(failure);
+                    if (!primaryHandoffConfirmed && !_shutdownSource.IsCancellationRequested)
+                    {
+                        fallbackHandoffOwned = AddOutstandingWorkerRemoval(slot);
+                    }
+
                     if (failure is not null)
                     {
-                        if (!primaryHandoffConfirmed && !_shutdownSource.IsCancellationRequested)
-                        {
-                            AddOutstandingWorkerRemoval(slot);
-                        }
-
                         ExceptionDispatchInfo.Capture(failure).Throw();
                     }
 
-                    return true;
+                    return primaryHandoffConfirmed || fallbackHandoffOwned;
                 }
             }
             finally
@@ -1306,14 +1307,6 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             }
 
             bool unlinked = await UnlinkAsync(workerId, _shutdownSource.Token);
-            if (!unlinked)
-            {
-                lock (_stateLock)
-                {
-                    unlinked = slot.Terminal;
-                }
-            }
-
             drainCompletion.TrySetResult(unlinked);
         }
         catch (OperationCanceledException) when (_shutdownSource.IsCancellationRequested)
@@ -1533,12 +1526,12 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         };
     }
 
-    private void AddOutstandingWorkerRemoval(WorkerSlot slot)
+    private bool AddOutstandingWorkerRemoval(WorkerSlot slot)
     {
         if (slot.Worker is null)
         {
             Log.WorkerRemovalFallbackUnavailable(_logger, slot.Endpoint);
-            return;
+            return false;
         }
 
         FunctionsSplitWorkerRemovalAction action = new(slot.Worker, UnlinkRemovalReason);
@@ -1547,7 +1540,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             if (_completedWorkerRemovals.Contains(action) || _outstandingWorkerRemovalSet.Contains(action))
             {
                 slot.RemovalFallbackRecorded = true;
-                return;
+                return true;
             }
 
             _outstandingWorkerRemovalSet.Add(action);
@@ -1560,6 +1553,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             _logger,
             slot.Worker.PodName,
             slot.Worker.ResourceNamespace);
+        return true;
     }
 
     private bool IsRuntimeRetirementFallbackOutstanding(WorkerSlot slot)

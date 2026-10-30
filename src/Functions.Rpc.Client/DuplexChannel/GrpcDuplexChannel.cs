@@ -21,7 +21,7 @@ namespace Azure.Functions.Rpc.Client;
 /// The channel supports one response reader and multiple concurrent request writers.
 /// </remarks>
 /// <typeparam name="T">The message type used in both directions.</typeparam>
-internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
+internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHandoffChannel
     where T : class
 {
     private readonly AsyncDuplexStreamingCall<T, T> _call;
@@ -30,6 +30,29 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>
     private readonly Task _readPump;
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Task _writePump;
+
+    bool IWorkerRemovalHandoffChannel.IsWorkerRemovalHandoffConfirmed
+    {
+        get
+        {
+            foreach (Metadata.Entry trailer in _call.GetTrailers())
+            {
+                if (string.Equals(
+                    trailer.Key,
+                    FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                    StringComparison.Ordinal) &&
+                    string.Equals(
+                        trailer.Value,
+                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue,
+                        StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="GrpcDuplexChannel{T}"/> class.

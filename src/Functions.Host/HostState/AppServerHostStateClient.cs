@@ -75,6 +75,7 @@ internal sealed class AppServerHostStateClient(
             status: null,
             acquireClosed: null,
             allowDuringRetirement: false,
+            advanceCreatedTime: false,
             capacityFence: CapacityFenceRequired,
             cancellationToken);
     }
@@ -94,6 +95,7 @@ internal sealed class AppServerHostStateClient(
                 status: null,
                 acquireClosed: null,
                 allowDuringRetirement: false,
+                advanceCreatedTime: false,
                 capacityFence: null,
                 timeoutSource.Token);
         }
@@ -117,8 +119,24 @@ internal sealed class AppServerHostStateClient(
             status: null,
             acquireClosed: null,
             allowDuringRetirement: true,
+            advanceCreatedTime: false,
             capacityFence: CapacityFenceRequired,
             cancellationToken);
+
+    internal Task<AppServerHostStatePublishResult> PublishRetirementPendingAsync(
+        HttpWorkerScaleInState state,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        return PublishAsync(
+            state,
+            status: null,
+            acquireClosed: null,
+            allowDuringRetirement: true,
+            advanceCreatedTime: true,
+            capacityFence: CapacityFenceRequired,
+            cancellationToken);
+    }
 
     internal Task<AppServerHostStatePublishResult> PublishLifecycleAsync(
         RuntimeLifecycleStatus status,
@@ -131,6 +149,7 @@ internal sealed class AppServerHostStateClient(
             status,
             acquireClosed: true,
             allowDuringRetirement: true,
+            advanceCreatedTime: false,
             capacityFence: LifecycleCapacityFenceRequired,
             cancellationToken);
     }
@@ -140,6 +159,7 @@ internal sealed class AppServerHostStateClient(
         RuntimeLifecycleStatus? status,
         bool? acquireClosed,
         bool allowDuringRetirement,
+        bool advanceCreatedTime,
         string? capacityFence,
         CancellationToken cancellationToken)
     {
@@ -153,9 +173,9 @@ internal sealed class AppServerHostStateClient(
             }
 
             state ??= _scaleInManager.Current;
-            DateTimeOffset createdTime = status is null
-                ? state.CreatedTime
-                : GetNextCreatedTime(state.CreatedTime);
+            DateTimeOffset createdTime = status is not null || advanceCreatedTime
+                ? GetNextCreatedTime(state.CreatedTime)
+                : state.CreatedTime;
             if (createdTime > _lastCreatedTime)
             {
                 _lastCreatedTime = createdTime;

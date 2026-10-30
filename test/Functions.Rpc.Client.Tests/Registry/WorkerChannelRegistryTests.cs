@@ -1955,10 +1955,11 @@ public sealed partial class WorkerChannelRegistryTests
             Exception setupFailure = null,
             string functionGroupName = null,
             bool? isAlwaysReady = null,
-            bool completeResponsesOnRequestCompletion = true)
+            bool completeResponsesOnRequestCompletion = true,
+            bool workerRemovalHandoffConfirmed = true)
         {
             Id = id;
-            Transport = new(blockDisposal);
+            Transport = new(blockDisposal, workerRemovalHandoffConfirmed);
             _completeResponsesOnRequestCompletion = completeResponsesOnRequestCompletion;
             _functionGroupName = functionGroupName;
             _isAlwaysReady = isAlwaysReady;

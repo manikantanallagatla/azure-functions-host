@@ -164,8 +164,8 @@ flowchart LR
 
 WorkerProxy sticky `RemovalRequested` remains primary. The Runtime fallback outbox is used only when
 an identity-bearing Worker's graceful unlink outcome is uncertain. The compute-separation Link API
-requires worker namespace and route-matching pod name. An internal non-identity link remains
-primary-removal-only; R4 cannot report complete retirement if such an unlink is uncertain.
+requires worker namespace and route-matching pod name. Callers that omit either identity field are
+incompatible with this contract because an uncertain unlink would have no durable fallback owner.
 
 ## 6. Failure semantics
 
@@ -201,7 +201,7 @@ Runtime replacement rather than a success-shaped retry loop.
 
 | Participant | Older version behavior | R4 behavior |
 | --- | --- | --- |
-| Older Worker Link caller | Omits exact Worker identity; primary WorkerProxy removal remains available. | Identity-bearing links additionally support the fallback outbox. |
+| Older Worker Link caller | Omits exact Worker identity and is rejected as incompatible. | Required namespace and route-matching pod name make uncertain unlink recoverable through the fallback outbox. |
 | Older AppServer R2 | Accepts legacy Host-state requests with no new lifecycle fields. It cannot acknowledge `lifecycle-required`. | R4 fails closed instead of treating ignored lifecycle JSON as success. |
 | New AppServer with legacy Host | New fields are optional; R2 behavior is unchanged. | Incarnation-bearing normal publication binds the Host-process epoch. |
 | Legion | Continues passive deletion based on published state. | Also acknowledges accepted exact Worker fallback handoffs. |
