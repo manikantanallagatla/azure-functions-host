@@ -8,7 +8,7 @@ using Newtonsoft.Json.Linq;
 namespace Azure.Functions.Host.RuntimeDrain;
 
 /// <summary>
-/// Identifies the Host-local scheduling policy for an app-version Runtime drain.
+/// Identifies the Host-local scheduling policy for a Runtime drain.
 /// </summary>
 public enum RuntimeDrainMode
 {
@@ -24,7 +24,7 @@ public enum RuntimeDrainMode
 }
 
 /// <summary>
-/// Identifies the external reason for an app-version Runtime drain.
+/// Identifies the external reason for a Runtime drain.
 /// </summary>
 public enum RuntimeDrainReason
 {
@@ -47,10 +47,15 @@ public enum RuntimeDrainReason
     /// The app is restarting.
     /// </summary>
     Restart,
+
+    /// <summary>
+    /// Trigger discovery completed and its Runtime can be removed.
+    /// </summary>
+    TriggerDiscoveryComplete,
 }
 
 /// <summary>
-/// Requests one app-version Runtime drain operation.
+/// Requests one Runtime drain operation.
 /// </summary>
 [JsonConverter(typeof(RuntimeDrainRequestJsonConverter))]
 public sealed class RuntimeDrainRequest
@@ -132,7 +137,7 @@ public sealed record RuntimeDrainReceipt(
     [property: JsonProperty("acceptedAtUtc")] DateTimeOffset AcceptedAtUtc);
 
 /// <summary>
-/// Describes an app-version Runtime drain failure.
+/// Describes a Runtime drain failure.
 /// </summary>
 /// <param name="Code">The stable machine-readable failure code.</param>
 /// <param name="Detail">A safe diagnostic description.</param>
@@ -141,7 +146,7 @@ public sealed record RuntimeDrainError(
     [property: JsonProperty("detail")] string Detail);
 
 /// <summary>
-/// Contains an app-version Runtime drain failure.
+/// Contains a Runtime drain failure.
 /// </summary>
 /// <param name="Error">The failure code and diagnostic detail.</param>
 public sealed record RuntimeDrainErrorResponse(

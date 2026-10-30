@@ -167,11 +167,7 @@ public sealed class RuntimeRetirementManagerTests
         public FunctionsSplitWorkerRemovalAction FallbackAction { get; } = new(
             new(
                 "test-namespace",
-                "worker-pod",
-                Guid.NewGuid(),
-                "test-legion-stamp",
-                FunctionsSplitPodIdentity.WorkerPodType,
-                new("test-app", 123, "test-antares-stamp")),
+                "worker-pod"),
             "RuntimeUnlink");
 
         public RuntimeIncarnation Incarnation { get; } = RuntimeIncarnation.Create();

@@ -96,15 +96,7 @@ public class WorkerLinkContractTests
                       "action": {
                         "worker": {
                           "resourceNamespace": "resource-namespace",
-                          "podName": "worker-pod-abc123",
-                          "podGuid": "47bf3a08-900a-48b3-a0f1-f6baa87191e7",
-                          "legionStampName": "legion-stamp",
-                          "podType": "FunctionsSplitWorkerPod",
-                          "app": {
-                            "functionAppName": "app-name",
-                            "functionAppSiteId": 123,
-                            "antaresStampName": "antares-stamp"
-                          }
+                          "podName": "worker-pod-abc123"
                         },
                         "reason": "RuntimeUnlink"
                       }
@@ -123,27 +115,23 @@ public class WorkerLinkContractTests
         Assert.Equal("""{"error":{"code":"LinkConflict"}}""", json);
     }
 
-    [Theory]
-    [InlineData("workerId")]
-    [InlineData("workerPodName")]
-    public void WorkerLinkRequest_Serialization_UsesExactWorkerObjectNotLegacyBodyIdentity(string propertyName)
+    [Fact]
+    public void WorkerLinkRequest_Serialization_UsesRequiredReducedIdentity()
     {
         WorkerLinkRequest request = Assert.IsType<WorkerLinkRequest>(JsonConvert.DeserializeObject<WorkerLinkRequest>(
-            $$"""
+            """
             {
               "workerGrpcEndpoint": "http://worker-pod-abc123:5001",
-              "{{propertyName}}": null,
+              "workerNamespace": "resource-namespace",
+              "workerPodName": "worker-pod-abc123",
+              "app": {
+                "functionAppName": "legacy-app",
+                "functionAppSiteId": 123,
+                "antaresStampName": "legacy-stamp"
+              },
+              "workerId": "legacy-worker",
               "worker": {
-                "resourceNamespace": "resource-namespace",
-                "podName": "worker-pod-abc123",
-                "podGuid": "47bf3a08-900a-48b3-a0f1-f6baa87191e7",
-                "legionStampName": "legion-stamp",
-                "podType": "FunctionsSplitWorkerPod",
-                "app": {
-                  "functionAppName": "app-name",
-                  "functionAppSiteId": 123,
-                  "antaresStampName": "antares-stamp"
-                }
+                "resourceNamespace": "legacy-namespace"
               }
             }
             """));
@@ -154,20 +142,31 @@ public class WorkerLinkContractTests
             JsonConvert.DeserializeObject<WorkerLinkRequest>(json));
 
         Assert.Equal("http://worker-pod-abc123:5001", request.WorkerGrpcEndpoint);
-        Assert.True(request.Worker!.IsValid());
-        Assert.Equal(request.Worker, roundTrip.Worker);
-        Assert.Null(body.Property(propertyName));
+        Assert.Equal("resource-namespace", request.WorkerNamespace);
+        Assert.Equal("worker-pod-abc123", request.WorkerPodName);
+        Assert.Equal(request.WorkerNamespace, roundTrip.WorkerNamespace);
+        Assert.Equal(request.WorkerPodName, roundTrip.WorkerPodName);
+        Assert.Null(body.Property("app"));
+        Assert.Null(body.Property("worker"));
+        Assert.Null(body.Property("workerId"));
     }
 
     [Fact]
     public void WorkerLinkRequest_Serialization_DoesNotIncludeRemovedHttpEndpoint()
     {
         WorkerLinkRequest request = Assert.IsType<WorkerLinkRequest>(JsonConvert.DeserializeObject<WorkerLinkRequest>(
-            """{"workerGrpcEndpoint":"http://worker-pod-abc123:5001","workerHttpEndpoint":"http://unused:28080"}"""));
+            """
+            {
+              "workerGrpcEndpoint": "http://worker-pod-abc123:5001",
+              "workerHttpEndpoint": "http://unused:28080",
+              "workerNamespace": "resource-namespace",
+              "workerPodName": "worker-pod-abc123"
+            }
+            """));
 
         JObject body = JObject.Parse(JsonConvert.SerializeObject(request));
 
-        Assert.Equal(new[] { "worker", "workerContainerEncryptionKey", "workerGrpcEndpoint" },
+        Assert.Equal(new[] { "workerContainerEncryptionKey", "workerGrpcEndpoint", "workerNamespace", "workerPodName" },
             body.Properties().Select(property => property.Name).Order(StringComparer.Ordinal));
     }
 }

@@ -55,7 +55,13 @@ public sealed class PlaceholderSpecializationWorkerLinkTests
         IOptionsMonitor<ScriptApplicationHostOptions>? hostOptions = null;
         bool? linkedWithStandbyConfiguration = null;
         Mock<IWorkerChannelRegistry> registry = new();
-        registry.Setup(value => value.LinkAsync(WorkerId, new Uri(GrpcEndpoint), It.IsAny<CancellationToken>()))
+        registry.Setup(value => value.LinkAsync(
+                WorkerId,
+                new Uri(GrpcEndpoint),
+                It.Is<FunctionsSplitPodIdentity>(worker =>
+                    string.Equals(worker.ResourceNamespace, "resource-namespace", StringComparison.Ordinal) &&
+                    string.Equals(worker.PodName, WorkerId, StringComparison.Ordinal)),
+                It.IsAny<CancellationToken>()))
             .Returns(() =>
             {
                 linkedWithStandbyConfiguration = hostOptions!.CurrentValue.IsStandbyConfiguration;
@@ -110,7 +116,16 @@ public sealed class PlaceholderSpecializationWorkerLinkTests
     {
         using HttpRequestMessage request = new(HttpMethod.Put, $"/admin/workers/{WorkerId}")
         {
-            Content = new StringContent($$"""{"workerGrpcEndpoint":"{{GrpcEndpoint}}"}""", Encoding.UTF8, "application/json"),
+            Content = new StringContent(
+                $$"""
+                {
+                  "workerGrpcEndpoint": "{{GrpcEndpoint}}",
+                  "workerNamespace": "resource-namespace",
+                  "workerPodName": "{{WorkerId}}"
+                }
+                """,
+                Encoding.UTF8,
+                "application/json"),
         };
         request.Headers.Add(
             ScriptConstants.SiteTokenHeaderName,

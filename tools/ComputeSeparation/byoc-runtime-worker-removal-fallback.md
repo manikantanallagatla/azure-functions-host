@@ -6,25 +6,22 @@ WorkerProxy sticky `RemovalRequested` remains the primary worker-removal handoff
 `outstandingWorkerRemovals` only when a graceful unlink started but WorkerProxy termination did not
 finish reliably enough to prove that primary handoff.
 
-The fallback action is not a request based on a worker name. It contains the exact immutable worker
-physical identity created by Legion:
+The fallback action contains the immutable worker coordinates already supplied by Legion Link:
 
 - resource namespace
 - pod name
-- pod GUID
-- Legion stamp name
-- `FunctionsSplitWorkerPod` pod type
-- Function App name, site ID, and Antares stamp name
 - a frozen bounded reason (`RuntimeUnlink`)
 
-Runtime never derives these values from a pod name, endpoint, app setting, or same-app match.
+Runtime does not copy Function App identity into the action. Legion HNA combines the worker
+coordinates with the authoritative owning app already present in `runtimeState.Self.App` when it
+constructs the deletion request.
 
 ## Ownership
 
 | Component | Responsibility |
 | --- | --- |
-| Legion provisioning and Link path | Construct one `FunctionsSplitPodIdentity` from allocation `PodInfo` plus the original `FunctionAppIdentifier`, then forward it unchanged to Runtime. |
-| Functions Host root registry | Validate and retain optional exact worker identity, own the authoritative fallback outbox, match acknowledgements, and retain bounded duplicate evidence. |
+| Legion provisioning and Link path | Send the existing worker namespace and pod name to Runtime Link. |
+| Functions Host root registry | Validate and retain the required worker coordinates, own the authoritative fallback outbox, match acknowledgements, and retain bounded duplicate evidence. |
 | Host-to-AppServer state transaction | Publish the current outbox with the existing capacity snapshot. |
 | Go AppServer | Reflect the next Host lifecycle snapshot without creating, changing, or clearing removal actions. |
 | Legion HNA/NNA | Observe actions, request SCP deletion, and acknowledge the exact action after accepted deletion handoff. |
@@ -42,7 +39,7 @@ sequenceDiagram
     participant SCP as Legion SCP
     participant N as nginx
 
-    L->>H: PUT /admin/workers/{podName}<br/>worker = exact FunctionsSplitPodIdentity
+    L->>H: PUT /admin/workers/{podName}<br/>workerNamespace + workerPodName
     H->>H: Validate route pod name ordinally<br/>and retain identity with registry slot
     H->>W: Graceful FunctionRpc request-stream completion
     alt WorkerProxy termination completes
@@ -71,8 +68,7 @@ admission, clear WorkerProxy retirement, or change the terminal worker slot.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PrimaryOnly: Link omitted exact identity
-    [*] --> LinkedExact: Link included valid exact identity
+    [*] --> LinkedExact: Link included valid worker coordinates
     LinkedExact --> PrimaryComplete: Graceful peer termination completed
     LinkedExact --> Outstanding: Graceful peer termination uncertain
     Outstanding --> Outstanding: Malformed, stale, foreign, or non-exact acknowledgement
@@ -80,12 +76,11 @@ stateDiagram-v2
     CompletedEvidence --> CompletedEvidence: Identical lost-response replay
 ```
 
-- Link identity is optional for mixed-version compatibility.
-- When identity is present, `worker.podName` must equal the route worker ID with ordinal comparison.
-- Only an identity-bearing slot can create a fallback action.
+- Link requires `workerNamespace` and `workerPodName`.
+- `workerPodName` must equal the route worker ID with ordinal comparison.
 - A successful WorkerProxy stream termination never creates a fallback action.
 - Runtime publishes each action until an exact acknowledgement is committed.
-- Matching uses the full action, including every worker and app incarnation field and the reason.
+- Matching uses the full action: resource namespace, pod name, and reason.
 - Malformed acknowledgements return `400`; valid unknown or non-exact actions return `404`.
 - The first exact acknowledgement and a retained identical replay return `204`.
 - Completed evidence is private, process-local, and bounded to 128 exact actions.
@@ -98,12 +93,11 @@ introduced. The existing Legion `LinkFunctionsWorker` path already sends the Run
 `SiteTokenHeader` from pod infrastructure connectivity, so enabling the Host policy does not require
 a caller contract change.
 
-## Mixed-version behavior
+## Companion behavior
 
 | Combination | Behavior |
 | --- | --- |
-| Old Legion caller -> new Host | Link omits `worker`; primary WorkerProxy removal continues and Runtime fallback stays disabled for that slot. |
-| New Legion caller -> old Host | The additive `worker` JSON field is ignored; primary removal continues without Runtime fallback. |
+| Legion Link -> new Host | Existing worker namespace and pod name are required; the body pod name must match the route. |
 | New Host -> AppServer without outbox reflection | AppServer R2's Go JSON decoder ignores the additive field, so existing capacity publication continues. Host retains and periodically republishes actions, but Legion cannot observe them until AppServer gains reflection support. |
 | Host/AppServer without the nginx exact route | Legion's port-80 acknowledgement cannot reach Host 9091. The Docker companion change is required before fallback is operational. |
 
@@ -111,25 +105,13 @@ a caller contract change.
 
 ### Legion
 
-At worker creation, build `FunctionsSplitPodIdentity` from:
+Preserve the existing worker namespace and pod name through the Link path and send them as required
+top-level `workerNamespace` and `workerPodName` properties to Runtime
+`PUT /admin/workers/{workerId}`. HNA uses `runtimeState.Self.App` as the authoritative app identity
+when translating each reflected removal action into the SCP deletion request.
 
-- `StampCreateAndAllocatePodResponse.PodInfo`: resource namespace, pod name, pod GUID, and Legion stamp
-- the original `CreateFunctionsSplitWorkerRequest.FunctionAppPodContext.FunctionAppIdentifier`
-- `FunctionsPodType.FunctionsSplitWorkerPod`
-
-Preserve that typed value unchanged through:
-
-1. `CreateFunctionsSplitWorkerResponse`
-2. `FunctionsSplitProvisioningService.LinkSplitWorkerAsync`
-3. `RegionalLinkFunctionsWorkerRequest`
-4. `FunctionsWorkerLinkService.CreateRuntimeRequest`
-5. `FunctionsWorkerLinkRequest`
-6. Regional-to-Stamp, Stamp-to-HostRole, HostRole-to-NestedRole, and NNA forwarding contracts
-7. Runtime `PUT /admin/workers/{workerId}` as nullable JSON property `worker`
-
-Legion tests should prove the creation response uses the exact allocation/app values, every typed hop
-preserves equality, the final Runtime request has the exact JSON shape, and an older request without
-`worker` remains valid.
+Legion tests should prove the final Runtime request preserves both worker coordinates, HNA combines
+them with `runtimeState.Self.App`, and acknowledgement returns the exact reflected action.
 
 ### Go AppServer
 

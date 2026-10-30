@@ -105,7 +105,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             }
 
             throw new RuntimeDrainConflictException(
-                "The Runtime is already executing a different app-version drain operation.");
+                "The Runtime is already executing a different drain operation.");
         }
     }
 
@@ -125,7 +125,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                 RuntimeLifecycleStatus.Draining,
                 fencedState,
                 CancellationToken.None);
-            EnsureApplied(fenceResult, "apply the app-version Runtime drain fence");
+            EnsureApplied(fenceResult, "apply the Runtime drain fence");
         }
         catch (HttpRequestException exception)
         {
@@ -341,7 +341,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             if (selectionFailure is not null)
             {
                 throw new InvalidOperationException(
-                    "The app-version Runtime drain schedule failed.",
+                    "The Runtime drain schedule failed.",
                     selectionFailure);
             }
 
@@ -389,7 +389,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             if (results.Any(static drained => !drained))
             {
                 throw new InvalidOperationException(
-                    "At least one Worker could not complete its app-version drain and unlink.");
+                    "At least one Worker could not complete its Runtime drain and unlink.");
             }
 
             lock (_operationLock)
@@ -429,7 +429,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                             RuntimeLifecycleStatus.RemovalRequested,
                             state,
                             CancellationToken.None);
-                    EnsureApplied(removalResult, "publish app-version Runtime removal");
+                    EnsureApplied(removalResult, "publish Runtime removal");
                     Log.RemovalRequested(_logger, _workerManager.Incarnation.Value);
                     return;
                 }
@@ -463,7 +463,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             RuntimeLifecycleStatus.Draining,
             state,
             CancellationToken.None);
-        EnsureApplied(result, "publish app-version Runtime drain progress");
+        EnsureApplied(result, "publish Runtime drain progress");
     }
 
     private void SelectPhasedBatchLocked(
@@ -483,7 +483,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     private void SelectAllRemainingLocked(DateTimeOffset selectionTime)
     {
         AppVersionRuntimeDrainStart start = _initialStart ??
-            throw new InvalidOperationException("The app-version Runtime drain has not started.");
+            throw new InvalidOperationException("The Runtime drain has not started.");
         TrackSelectionLocked(_workerManager.SelectAllRemainingWorkers(
             start.Incarnation,
             selectionTime + InvocationGracePeriod));
@@ -614,7 +614,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     {
         // EventId range is 1210-1219
         [LoggerMessage(1210, LogLevel.Information,
-            "Accepted app-version Runtime drain operation {OperationId} in {Mode} mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
+            "Accepted Runtime drain operation {OperationId} in {Mode} mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
         public static partial void Accepted(
             ILogger logger,
             Guid operationId,
@@ -624,7 +624,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             DateTimeOffset acceptedAtUtc);
 
         [LoggerMessage(1211, LogLevel.Warning,
-            "Escalated app-version Runtime drain operation {OperationId} to Immediate mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
+            "Escalated Runtime drain operation {OperationId} to Immediate mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
         public static partial void Escalated(
             ILogger logger,
             Guid operationId,
@@ -633,18 +633,18 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             DateTimeOffset acceptedAtUtc);
 
         [LoggerMessage(1212, LogLevel.Warning,
-            "Published RemovalRequested for app-version Runtime incarnation {RuntimeIncarnation}.")]
+            "Published RemovalRequested for Runtime incarnation {RuntimeIncarnation}.")]
         public static partial void RemovalRequested(ILogger logger, Guid runtimeIncarnation);
 
         [LoggerMessage(1213, LogLevel.Error,
-            "App-version Runtime drain lifecycle failed for Runtime incarnation {RuntimeIncarnation}.")]
+            "Runtime drain lifecycle failed for Runtime incarnation {RuntimeIncarnation}.")]
         public static partial void LifecycleFailed(
             ILogger logger,
             Exception exception,
             Guid runtimeIncarnation);
 
         [LoggerMessage(1214, LogLevel.Error,
-            "Phased app-version Runtime drain schedule failed for Runtime incarnation {RuntimeIncarnation}.")]
+            "Phased Runtime drain schedule failed for Runtime incarnation {RuntimeIncarnation}.")]
         public static partial void ScheduleFailed(
             ILogger logger,
             Exception exception,

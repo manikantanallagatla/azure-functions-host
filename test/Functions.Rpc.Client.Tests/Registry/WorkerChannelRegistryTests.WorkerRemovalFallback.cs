@@ -81,15 +81,11 @@ public sealed partial class WorkerChannelRegistryTests
             .GetProperty("outstandingWorkerRemovals")[0];
         Assert.Equal("RuntimeUnlink", publishedAction.GetProperty("reason").GetString());
         JsonElement publishedWorker = publishedAction.GetProperty("worker");
+        Assert.Equal(
+            new[] { "podName", "resourceNamespace" },
+            publishedWorker.EnumerateObject().Select(property => property.Name).Order(StringComparer.Ordinal));
         Assert.Equal(action.Worker.ResourceNamespace, publishedWorker.GetProperty("resourceNamespace").GetString());
         Assert.Equal(action.Worker.PodName, publishedWorker.GetProperty("podName").GetString());
-        Assert.Equal(action.Worker.PodGuid, publishedWorker.GetProperty("podGuid").GetGuid());
-        Assert.Equal(action.Worker.LegionStampName, publishedWorker.GetProperty("legionStampName").GetString());
-        Assert.Equal(action.Worker.PodType, publishedWorker.GetProperty("podType").GetString());
-        JsonElement publishedApp = publishedWorker.GetProperty("app");
-        Assert.Equal(action.Worker.App.FunctionAppName, publishedApp.GetProperty("functionAppName").GetString());
-        Assert.Equal(action.Worker.App.FunctionAppSiteId, publishedApp.GetProperty("functionAppSiteId").GetInt32());
-        Assert.Equal(action.Worker.App.AntaresStampName, publishedApp.GetProperty("antaresStampName").GetString());
     }
 
     [Fact]
@@ -118,7 +114,7 @@ public sealed partial class WorkerChannelRegistryTests
     [Theory]
     [InlineData("changed-reason")]
     [InlineData("stale-worker")]
-    [InlineData("same-app-only")]
+    [InlineData("different-pod")]
     [InlineData("unknown")]
     [InlineData("stale-runtime")]
     [InlineData("name-only")]
@@ -141,34 +137,21 @@ public sealed partial class WorkerChannelRegistryTests
             "changed-reason" => action with { Reason = "ChangedReason" },
             "stale-worker" => action with
             {
-                Worker = action.Worker with { PodGuid = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191e8") },
+                Worker = action.Worker with { ResourceNamespace = "other-resource-namespace" },
             },
-            "same-app-only" => action with
+            "different-pod" => action with
             {
-                Worker = action.Worker with
-                {
-                    PodName = "worker-pod-other",
-                    PodGuid = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191e9"),
-                },
+                Worker = action.Worker with { PodName = "worker-pod-other" },
             },
             "unknown" => action with
             {
-                Worker = CreateWorkerIdentity(
-                    "worker-pod-unknown",
-                    Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191ea")) with
-                {
-                    App = new("other-app", 456, "other-antares-stamp"),
-                },
+                Worker = new("other-resource-namespace", "worker-pod-unknown"),
             },
             "name-only" => action with
             {
                 Worker = new(
                     string.Empty,
-                    action.Worker.PodName,
-                    Guid.Empty,
-                    string.Empty,
-                    string.Empty,
-                    new(string.Empty, 0, string.Empty)),
+                    action.Worker.PodName),
             },
             "malformed" => action with { Reason = string.Empty },
             "stale-runtime" => action,
@@ -239,9 +222,8 @@ public sealed partial class WorkerChannelRegistryTests
         WorkerLinkRequest mismatchedRequest = new()
         {
             WorkerGrpcEndpoint = "http://worker-proxy:50053",
-            Worker = CreateWorkerIdentity(
-                "different-worker",
-                Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191eb")),
+            WorkerNamespace = "resource-namespace",
+            WorkerPodName = "different-worker",
         };
 
         BadRequestObjectResult mismatch = Assert.IsType<BadRequestObjectResult>(
@@ -252,12 +234,8 @@ public sealed partial class WorkerChannelRegistryTests
         WorkerLinkRequest placeholderRequest = new()
         {
             WorkerGrpcEndpoint = "http://worker-proxy:50053",
-            Worker = CreateWorkerIdentity(
-                "route-worker",
-                Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191ed")) with
-            {
-                App = new("app-name", 0, "antares-stamp"),
-            },
+            WorkerNamespace = new string('a', 257),
+            WorkerPodName = "route-worker",
         };
         BadRequestObjectResult placeholder = Assert.IsType<BadRequestObjectResult>(
             await linkController.LinkWorker("route-worker", placeholderRequest));
@@ -276,9 +254,7 @@ public sealed partial class WorkerChannelRegistryTests
         await using WorkerChannelRegistry registry = CreateRemovalRegistry(clientFactory);
         IHttpWorkerScaleInManager scaleInManager = registry;
         await registry.LinkAsync("worker-pod-legacy", server.Endpoint, timeout.Token);
-        FunctionsSplitPodIdentity primaryIdentity = CreateWorkerIdentity(
-            "worker-pod-primary",
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191ec"));
+        FunctionsSplitPodIdentity primaryIdentity = CreateWorkerIdentity("worker-pod-primary");
         await registry.LinkAsync(
             "worker-pod-primary",
             server.Endpoint,
@@ -288,11 +264,16 @@ public sealed partial class WorkerChannelRegistryTests
             () => registry.LinkAsync(
                 "worker-pod-legacy",
                 server.Endpoint,
-                CreateWorkerIdentity(
-                    "worker-pod-legacy",
-                    Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191ee")),
+                CreateWorkerIdentity("worker-pod-legacy"),
                 timeout.Token));
         Assert.Equal(WorkerLinkFailureReason.Conflict, legacyIdentityConflict.Reason);
+        WorkerLinkException primaryIdentityConflict = await Assert.ThrowsAsync<WorkerLinkException>(
+            () => registry.LinkAsync(
+                "worker-pod-primary",
+                server.Endpoint,
+                primaryIdentity with { ResourceNamespace = "other-resource-namespace" },
+                timeout.Token));
+        Assert.Equal(WorkerLinkFailureReason.Conflict, primaryIdentityConflict.Reason);
         WorkerLinkResult primaryReplay = await registry.LinkAsync(
             "worker-pod-primary",
             server.Endpoint,
@@ -337,7 +318,7 @@ public sealed partial class WorkerChannelRegistryTests
         await registry.LinkAsync(
             workerId,
             server.Endpoint,
-            CreateWorkerIdentity(workerId, Guid.NewGuid()),
+            CreateWorkerIdentity(workerId),
             cancellationToken);
 
         Task<bool> unlink = registry.UnlinkAsync(workerId, cancellationToken);
@@ -349,14 +330,10 @@ public sealed partial class WorkerChannelRegistryTests
             action => string.Equals(action.Worker.PodName, workerId, StringComparison.Ordinal)));
     }
 
-    private static FunctionsSplitPodIdentity CreateWorkerIdentity(string workerId, Guid podGuid)
+    private static FunctionsSplitPodIdentity CreateWorkerIdentity(string workerId)
         => new(
             "resource-namespace",
-            workerId,
-            podGuid,
-            "legion-stamp",
-            FunctionsSplitPodIdentity.WorkerPodType,
-            new("app-name", 123, "antares-stamp"));
+            workerId);
 
     private sealed class CapturingHostStateHandler : HttpMessageHandler
     {

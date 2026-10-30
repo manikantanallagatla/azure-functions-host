@@ -8,12 +8,12 @@ using Azure.Functions.Host.RuntimeDrain;
 namespace Azure.Functions.Host.HostState;
 
 /// <summary>
-/// Coordinates one in-memory app-version Runtime drain and one optional Phased-to-Immediate escalation.
+/// Coordinates one in-memory Runtime drain and one optional Phased-to-Immediate escalation.
 /// </summary>
 public interface IAppVersionRuntimeDrainManager
 {
     /// <summary>
-    /// Accepts an app-version Runtime drain after committing local admission closure and the AppServer fence.
+    /// Accepts a Runtime drain after committing local admission closure and the AppServer fence.
     /// </summary>
     /// <param name="operationId">The caller-owned idempotency identifier.</param>
     /// <param name="mode">The requested Host-local scheduling mode.</param>

@@ -276,11 +276,7 @@ public sealed partial class WorkerChannelRegistryTests
         FunctionsSplitWorkerRemovalAction fallbackAction = new(
             new(
                 "test-namespace",
-                "overlap-worker",
-                Guid.NewGuid(),
-                "test-legion-stamp",
-                FunctionsSplitPodIdentity.WorkerPodType,
-                new("test-app", 123, "test-antares-stamp")),
+                "overlap-worker"),
             "RuntimeUnlink");
         (RegistryHarness overlapHarness, ChannelControl _, FunctionMetadata _) = await CreateIdleHttpWorkerAsync(
             overlapTimeProvider,

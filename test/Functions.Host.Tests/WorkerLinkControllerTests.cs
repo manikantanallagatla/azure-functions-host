@@ -61,7 +61,6 @@ public class WorkerLinkControllerTests
         WorkerLinkRequest request = ValidRequest();
         request.WorkerGrpcEndpoint = grpcEndpoint;
         request.WorkerContainerEncryptionKey = "reserved-test-value";
-        request.Worker = worker;
 
         Task<IActionResult> link = CreateController().LinkWorker(WorkerId, request, cancellation.Token);
         Assert.True(registryToken.CanBeCanceled);
@@ -87,7 +86,11 @@ public class WorkerLinkControllerTests
     [InlineData(WorkerLinkFailureReason.Timeout, StatusCodes.Status503ServiceUnavailable, "LinkTimeout")]
     public async Task LinkWorker_ExpectedFailure_ReturnsStableError(WorkerLinkFailureReason reason, int status, string code)
     {
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ThrowsAsync(new WorkerLinkException(reason, PrivateDiagnostic, new Exception("Internal diagnostics.")));
 
         IActionResult result = await CreateController().LinkWorker(WorkerId, ValidRequest());
@@ -113,8 +116,12 @@ public class WorkerLinkControllerTests
         using CancellationTokenSource cancellation = new();
         TaskCompletionSource<WorkerLinkResult> initialization = new(TaskCreationOptions.RunContinuationsAsynchronously);
         CancellationToken registryToken = default;
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
-            .Returns((string _, Uri _, CancellationToken token) =>
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((string _, Uri _, FunctionsSplitPodIdentity _, CancellationToken token) =>
             {
                 registryToken = token;
                 return initialization.Task.WaitAsync(token);
@@ -135,7 +142,11 @@ public class WorkerLinkControllerTests
     public async Task LinkWorker_RegistryDeadline_ReturnsLinkTimeoutWithoutCancelingRequest()
     {
         using CancellationTokenSource cancellation = new();
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), cancellation.Token))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                cancellation.Token))
             .ThrowsAsync(new TimeoutException(PrivateDiagnostic));
 
         IActionResult result = await CreateController().LinkWorker(WorkerId, ValidRequest(), cancellation.Token).WaitAsync(TestTimeout);
@@ -150,7 +161,11 @@ public class WorkerLinkControllerTests
     [InlineData(false, StatusCodes.Status200OK)]
     public async Task LinkWorker_CompletedLink_UsesRegistryCreationResult(bool isNewLink, int expectedStatus)
     {
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ReturnsAsync(new WorkerLinkResult(null!, isNewLink));
 
         Task<IActionResult> link = CreateController().LinkWorker(WorkerId, ValidRequest());
@@ -164,7 +179,11 @@ public class WorkerLinkControllerTests
     [Fact]
     public async Task LinkWorker_SynchronousRejection_ReturnsConflict()
     {
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .Throws(new WorkerLinkException(WorkerLinkFailureReason.Conflict, "The worker endpoint conflicts."));
 
         Task<IActionResult> link = CreateController().LinkWorker(WorkerId, ValidRequest());
@@ -178,10 +197,14 @@ public class WorkerLinkControllerTests
     public async Task LinkWorker_EachRequestDelegatesAdmissionToRegistry()
     {
         TaskCompletionSource<WorkerLinkResult> initialization = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        _registry.Setup(registry => registry.LinkAsync(It.IsAny<string>(), It.IsAny<Uri>(), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                It.IsAny<string>(),
+                It.IsAny<Uri>(),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .Returns(initialization.Task);
         WorkerLinkController controller = CreateController();
-        WorkerLinkRequest otherRequest = new() { WorkerGrpcEndpoint = ValidGrpcEndpoint };
+        WorkerLinkRequest otherRequest = ValidRequest("other-worker");
 
         Task<IActionResult> first = controller.LinkWorker(WorkerId, ValidRequest());
         Task<IActionResult> replay = controller.LinkWorker(WorkerId, ValidRequest());
@@ -193,15 +216,27 @@ public class WorkerLinkControllerTests
         initialization.SetResult(new(null!, IsNewLink: false));
         IActionResult[] results = await Task.WhenAll(first, replay, other).WaitAsync(TestTimeout);
         Assert.All(results, result => Assert.Equal(StatusCodes.Status200OK, Assert.IsType<StatusCodeResult>(result).StatusCode));
-        _registry.Verify(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()), Times.Exactly(2));
-        _registry.Verify(registry => registry.LinkAsync("other-worker", new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()), Times.Once);
+        _registry.Verify(registry => registry.LinkAsync(
+            WorkerId,
+            new Uri(ValidGrpcEndpoint),
+            It.IsAny<FunctionsSplitPodIdentity>(),
+            It.IsAny<CancellationToken>()), Times.Exactly(2));
+        _registry.Verify(registry => registry.LinkAsync(
+            "other-worker",
+            new Uri(ValidGrpcEndpoint),
+            It.IsAny<FunctionsSplitPodIdentity>(),
+            It.IsAny<CancellationToken>()), Times.Once);
         _registry.VerifyNoOtherCalls();
     }
 
     [Fact]
     public async Task LinkWorker_RegistryStopping_ReturnsSafeUnavailable()
     {
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .Throws(new ObjectDisposedException(PrivateDiagnostic));
 
         IActionResult result = await CreateController().LinkWorker(WorkerId, ValidRequest());
@@ -234,7 +269,11 @@ public class WorkerLinkControllerTests
             Type type when type == typeof(UriFormatException) => new UriFormatException(PrivateDiagnostic),
             _ => throw new ArgumentOutOfRangeException(nameof(exceptionType)),
         };
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ThrowsAsync(failure);
 
         IActionResult result = await CreateController().LinkWorker(WorkerId, ValidRequest()).WaitAsync(TestTimeout);
@@ -248,7 +287,11 @@ public class WorkerLinkControllerTests
     [Fact]
     public async Task LinkWorker_GrpcDeadlineExceeded_ReturnsLinkTimeout()
     {
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ThrowsAsync(new GrpcException(new Status(StatusCode.DeadlineExceeded, PrivateDiagnostic)));
 
         IActionResult result = await CreateController().LinkWorker(WorkerId, ValidRequest());
@@ -260,7 +303,11 @@ public class WorkerLinkControllerTests
     [Fact]
     public async Task LinkWorker_UnknownFailureReason_IsNotReportedAsKnownError()
     {
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ThrowsAsync(new WorkerLinkException((WorkerLinkFailureReason)int.MaxValue, PrivateDiagnostic));
 
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => CreateController().LinkWorker(WorkerId, ValidRequest()));
@@ -272,7 +319,11 @@ public class WorkerLinkControllerTests
     public async Task LinkWorker_UnexpectedFailure_IsNotReportedAsUnavailable()
     {
         InvalidOperationException failure = new("Programming error.");
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ThrowsAsync(failure);
 
         InvalidOperationException actual = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -302,7 +353,11 @@ public class WorkerLinkControllerTests
                 eventId = (EventId)call.Arguments[1];
                 rendered = call.Arguments[2].ToString();
             }));
-        _registry.Setup(registry => registry.LinkAsync(WorkerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                WorkerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .Returns(fail
                 ? Task.FromException<WorkerLinkResult>(new WorkerLinkException(WorkerLinkFailureReason.Conflict, "Conflict."))
                 : Task.FromResult(new WorkerLinkResult(null!, IsNewLink: true)));
@@ -349,10 +404,68 @@ public class WorkerLinkControllerTests
     [Fact]
     public async Task LinkWorker_MissingGrpcEndpoint_ReturnsRequiredWithoutLinking()
     {
-        IReadOnlyList<RequestValidationError> errors = AssertBadRequest(await CreateController().LinkWorker(WorkerId, new WorkerLinkRequest()));
+        WorkerLinkRequest request = ValidRequest();
+        request.WorkerGrpcEndpoint = null;
+        IReadOnlyList<RequestValidationError> errors = AssertBadRequest(
+            await CreateController().LinkWorker(WorkerId, request));
         RequestValidationError error = Assert.Single(errors);
         Assert.Equal("Required", error.Code);
         Assert.Equal("workerGrpcEndpoint", error.Target);
+        _registry.VerifyNoOtherCalls();
+    }
+
+    [Theory]
+    [InlineData("workerNamespace")]
+    [InlineData("workerPodName")]
+    public async Task LinkWorker_MissingIdentityField_ReturnsRequiredWithoutLinking(string field)
+    {
+        WorkerLinkRequest request = ValidRequest();
+        switch (field)
+        {
+            case "workerNamespace":
+                request.WorkerNamespace = null;
+                break;
+            case "workerPodName":
+                request.WorkerPodName = null;
+                break;
+        }
+
+        IReadOnlyList<RequestValidationError> errors = AssertBadRequest(
+            await CreateController().LinkWorker(WorkerId, request));
+
+        RequestValidationError error = Assert.Single(errors);
+        Assert.Equal("Required", error.Code);
+        Assert.Equal(field, error.Target);
+        _registry.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task LinkWorker_BodyPodNameDoesNotMatchRoute_ReturnsMismatchWithoutLinking()
+    {
+        WorkerLinkRequest request = ValidRequest();
+        request.WorkerPodName = "other-worker";
+
+        IReadOnlyList<RequestValidationError> errors = AssertBadRequest(
+            await CreateController().LinkWorker(WorkerId, request));
+
+        RequestValidationError error = Assert.Single(errors);
+        Assert.Equal("WorkerIdentityMismatch", error.Code);
+        Assert.Equal("workerPodName", error.Target);
+        _registry.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task LinkWorker_InvalidNamespace_ReturnsInvalidIdentityWithoutLinking()
+    {
+        WorkerLinkRequest request = ValidRequest();
+        request.WorkerNamespace = new string('a', 257);
+
+        IReadOnlyList<RequestValidationError> errors = AssertBadRequest(
+            await CreateController().LinkWorker(WorkerId, request));
+
+        RequestValidationError error = Assert.Single(errors);
+        Assert.Equal("InvalidWorkerIdentity", error.Code);
+        Assert.Equal("workerIdentity", error.Target);
         _registry.VerifyNoOtherCalls();
     }
 
@@ -392,13 +505,22 @@ public class WorkerLinkControllerTests
     [InlineData("\0")]
     public async Task LinkWorker_ValidOpaqueWorkerId_PreservesIdentity(string workerId)
     {
-        _registry.Setup(registry => registry.LinkAsync(workerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()))
+        _registry.Setup(registry => registry.LinkAsync(
+                workerId,
+                new Uri(ValidGrpcEndpoint),
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ReturnsAsync(new WorkerLinkResult(null!, IsNewLink: true));
 
-        StatusCodeResult result = Assert.IsType<StatusCodeResult>(await CreateController().LinkWorker(workerId, ValidRequest()));
+        StatusCodeResult result = Assert.IsType<StatusCodeResult>(
+            await CreateController().LinkWorker(workerId, ValidRequest(workerId)));
 
         Assert.Equal(StatusCodes.Status201Created, result.StatusCode);
-        _registry.Verify(registry => registry.LinkAsync(workerId, new Uri(ValidGrpcEndpoint), It.IsAny<CancellationToken>()), Times.Once);
+        _registry.Verify(registry => registry.LinkAsync(
+            workerId,
+            new Uri(ValidGrpcEndpoint),
+            It.Is<FunctionsSplitPodIdentity>(worker => worker == CreateWorkerIdentity(workerId)),
+            It.IsAny<CancellationToken>()), Times.Once);
         _registry.VerifyNoOtherCalls();
     }
 
@@ -406,7 +528,6 @@ public class WorkerLinkControllerTests
     [InlineData(64)]
     [InlineData(253)]
     [InlineData(254)]
-    [InlineData(1024)]
     public Task LinkWorker_WorkerIdLength_DoesNotRestrictIdentity(int length)
         => LinkWorker_ValidOpaqueWorkerId_PreservesIdentity(new string('a', length));
 
@@ -437,7 +558,11 @@ public class WorkerLinkControllerTests
 
     private void VerifyOnlyLinkCall()
     {
-        _registry.Verify(registry => registry.LinkAsync(WorkerId, It.IsAny<Uri>(), It.IsAny<CancellationToken>()), Times.Once);
+        _registry.Verify(registry => registry.LinkAsync(
+            WorkerId,
+            It.IsAny<Uri>(),
+            It.IsAny<FunctionsSplitPodIdentity>(),
+            It.IsAny<CancellationToken>()), Times.Once);
         _registry.VerifyNoOtherCalls();
     }
 
@@ -453,17 +578,18 @@ public class WorkerLinkControllerTests
         return response;
     }
 
-    private static WorkerLinkRequest ValidRequest()
-        => new() { WorkerGrpcEndpoint = ValidGrpcEndpoint };
+    private static WorkerLinkRequest ValidRequest(string workerId = WorkerId)
+        => new()
+        {
+            WorkerGrpcEndpoint = ValidGrpcEndpoint,
+            WorkerNamespace = "resource-namespace",
+            WorkerPodName = workerId,
+        };
 
     private static FunctionsSplitPodIdentity CreateWorkerIdentity(string workerId)
         => new(
             "resource-namespace",
-            workerId,
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191e7"),
-            "legion-stamp",
-            FunctionsSplitPodIdentity.WorkerPodType,
-            new("app-name", 123, "antares-stamp"));
+            workerId);
 
     private static IReadOnlyList<RequestValidationError> AssertBadRequest(IActionResult result)
     {

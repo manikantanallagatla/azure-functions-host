@@ -163,9 +163,9 @@ flowchart LR
 | Legion | Execute Worker and Runtime deletion and acknowledge accepted Worker fallback handoffs. | Host-local draining. |
 
 WorkerProxy sticky `RemovalRequested` remains primary. The Runtime fallback outbox is used only when
-an identity-bearing Worker's graceful unlink outcome is uncertain. Links from older callers that
-omit exact Worker identity keep primary-removal-only behavior; R4 cannot report complete retirement
-if such an unlink is uncertain.
+an identity-bearing Worker's graceful unlink outcome is uncertain. The compute-separation Link API
+requires worker namespace and route-matching pod name. An internal non-identity link remains
+primary-removal-only; R4 cannot report complete retirement if such an unlink is uncertain.
 
 ## 6. Failure semantics
 

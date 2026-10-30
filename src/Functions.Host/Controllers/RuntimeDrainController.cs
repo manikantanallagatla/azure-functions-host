@@ -17,7 +17,7 @@ using Microsoft.Extensions.Logging;
 namespace Azure.Functions.Host.Controllers;
 
 /// <summary>
-/// Accepts app-version Runtime drain operations for compute separation mode.
+/// Accepts Runtime drain operations for compute separation mode.
 /// </summary>
 public sealed partial class RuntimeDrainController : Controller
 {
@@ -27,7 +27,7 @@ public sealed partial class RuntimeDrainController : Controller
     /// <summary>
     /// Initializes a new instance of the <see cref="RuntimeDrainController"/> class.
     /// </summary>
-    /// <param name="manager">The app-version Runtime drain coordinator.</param>
+    /// <param name="manager">The Runtime drain coordinator.</param>
     /// <param name="logger">The logger.</param>
     public RuntimeDrainController(
         IAppVersionRuntimeDrainManager manager,
@@ -38,7 +38,7 @@ public sealed partial class RuntimeDrainController : Controller
     }
 
     /// <summary>
-    /// Commits one idempotent app-version Runtime drain operation.
+    /// Commits one idempotent Runtime drain operation.
     /// </summary>
     /// <param name="request">The exact operation identifier, mode, and reason.</param>
     /// <param name="cancellationToken">Cancels only before irreversible admission begins.</param>
@@ -132,6 +132,13 @@ public sealed partial class RuntimeDrainController : Controller
             errors.Add(new(ErrorCodes.InvalidValue, "reason"));
         }
 
+        if (errors.Count == 0 &&
+            reason is RuntimeDrainReason.TriggerDiscoveryComplete &&
+            mode is not RuntimeDrainMode.Immediate)
+        {
+            errors.Add(new(ErrorCodes.InvalidValue, "mode"));
+        }
+
         return errors;
     }
 
@@ -179,6 +186,12 @@ public sealed partial class RuntimeDrainController : Controller
             return true;
         }
 
+        if (string.Equals(value, nameof(RuntimeDrainReason.TriggerDiscoveryComplete), StringComparison.Ordinal))
+        {
+            reason = RuntimeDrainReason.TriggerDiscoveryComplete;
+            return true;
+        }
+
         reason = default;
         return false;
     }
@@ -196,14 +209,14 @@ public sealed partial class RuntimeDrainController : Controller
     {
         // EventId range is 720-729
         [LoggerMessage(720, LogLevel.Warning,
-            "Rejected conflicting app-version Runtime drain operation {OperationId}: {Reason}.")]
+            "Rejected conflicting Runtime drain operation {OperationId}: {Reason}.")]
         public static partial void Conflict(
             ILogger logger,
             Guid operationId,
             string reason);
 
         [LoggerMessage(721, LogLevel.Error,
-            "Failed to commit app-version Runtime drain operation {OperationId}.")]
+            "Failed to commit Runtime drain operation {OperationId}.")]
         public static partial void AdmissionFailed(
             ILogger logger,
             Exception exception,

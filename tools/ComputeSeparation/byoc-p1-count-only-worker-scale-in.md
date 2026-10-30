@@ -176,9 +176,9 @@ Every function group, including Durable, uses the same deterministic local selec
 1. idle Workers before busy Workers;
 2. Worker ID using ordinal comparison within each activity class.
 
-The optional exact `worker` identity on Worker Link remains independent of ordering. It is retained
-only so an uncertain graceful unlink can publish the existing exact fallback-removal action. Older
-Link callers that omit the identity remain valid and use primary removal only.
+The required worker namespace and route-matching pod name on Worker Link remain independent of
+ordering. They are retained only so an uncertain graceful unlink can publish the existing exact
+fallback-removal action.
 
 ## 8. Atomicity and lifecycle reuse
 
@@ -243,8 +243,7 @@ current state on later passes.
 
 | Combination | Behavior |
 | --- | --- |
-| Older Link caller with no exact identity | Link remains valid. P1 uses the same deterministic ordering and primary removal remains available. |
-| Exact identity supplied | Existing exact fallback-removal behavior remains available without affecting P1 ordering. |
+| Required Link worker coordinates | Resource namespace and route-matching pod name enable existing fallback-removal behavior without affecting P1 ordering. |
 | Older AppServer | Receives an ordinary Host-state request with no new JSON fields and no P1-specific fence requirement. |
 | Repeated P1 request | Already-draining or deleted Workers are absent from usable count and are not counted again. |
 | Mixed-case `HTTP` assignment | Exact matching still requires the request to use the same value; special HTTP publication is recognized case-insensitively. |
@@ -294,7 +293,7 @@ The five added public-API behavioral methods cover:
    publication;
 3. zero Durable target;
 4. positive Durable selection with idle preference followed by ordinal Worker ID;
-5. invalid request rejection plus positive Durable selection for older Links without exact identity.
+5. invalid request rejection plus positive Durable selection with required worker coordinates.
 
 Council findings incorporated before final validation:
 

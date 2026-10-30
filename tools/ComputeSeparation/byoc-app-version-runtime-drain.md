@@ -1,17 +1,18 @@
-# BYOC app-version Runtime drain reviewer guide
+# BYOC Runtime drain reviewer guide
 
-> **Scope:** Functions Host and WorkerProxy-side lifecycle reuse for P2 Phased reconciliation and
-> P3 Immediate stop/delete/restart handling.
+> **Scope:** Functions Host and WorkerProxy-side lifecycle reuse for P2 Phased reconciliation,
+> P3 Immediate stop/delete/restart handling, and Immediate trigger-discovery cleanup.
 > **Public API:** authenticated `POST /admin/functions/drain`.
 > **Stack:** built directly on the existing R2 drain path, exact worker-removal fallback, R4 Runtime
 > retirement fence, and P1 count-only Worker scale-in.
 
 ## 1. Context and non-goals
 
-Legion owns app-version detection, durable operation state, Runtime-set capture, Recreate versus
-RollingUpdate policy, and discovery behavior. AppServer relays one authenticated request to Host.
-Host owns only the local Runtime admission fence, Worker scheduling, invocation grace, graceful
-unlink, fallback handoff, and final Runtime `RemovalRequested`.
+Legion owns app-version detection, trigger-discovery completion, durable operation state,
+Runtime-set capture, Recreate versus RollingUpdate policy, and discovery behavior. AppServer relays
+one authenticated request to Host. Host owns only the local Runtime admission fence, Worker
+scheduling, invocation grace, graceful unlink, fallback handoff, and final Runtime
+`RemovalRequested`.
 
 This change does not add:
 
@@ -43,7 +44,10 @@ Content-Type: application/json
 | --- | --- |
 | `operationId` | Required nonzero GUID. |
 | `mode` | `Phased` or `Immediate`. |
-| `reason` | `ConfigurationChange`, `Stop`, `Delete`, or `Restart`. |
+| `reason` | `ConfigurationChange`, `Stop`, `Delete`, `Restart`, or `TriggerDiscoveryComplete`. |
+
+`TriggerDiscoveryComplete` is valid only with `Immediate`; pairing it with `Phased` returns HTTP
+`400`.
 
 The success response is HTTP `200` and contains exactly three fields:
 
@@ -84,7 +88,7 @@ sequenceDiagram
     participant Registry as Worker registry
     participant Workers
 
-    Legion->>AppServer: App-version operation
+    Legion->>AppServer: Runtime drain operation
     AppServer->>API: POST operationId, mode, reason
     API->>Coordinator: Accept exact fingerprint
     Coordinator->>Registry: Close Link and invocation admission
@@ -147,7 +151,7 @@ P2 does not replace or reset that work.
 Exact replay returns the original receipt and does not recreate the snapshot, restart the 0/10/20/
 30/35/40-second schedule, or move any Worker deadline.
 
-## 5. P3 Immediate and escalation
+## 5. Immediate cleanup and escalation
 
 A first `Immediate` request uses the same admission closure and AppServer lifecycle fence. After
 fence acknowledgement, Host selects every remaining linked, invocation-ready Worker immediately
@@ -156,8 +160,12 @@ across HTTP, non-HTTP, on-demand, and always-ready classes. Each new selection r
 admission closure is also terminally owned immediately without changing the ready-Worker selection
 set or deadline policy.
 
-`Stop`, `Delete`, and `Restart` have identical Host scheduling semantics. The reason remains part of
-the exact operation fingerprint and structured diagnostics; Legion owns its external meaning.
+`Stop`, `Delete`, `Restart`, and `TriggerDiscoveryComplete` have identical Immediate Host scheduling
+semantics. Trigger discovery must use `Immediate`, including when the discovery Runtime has no
+Worker. The existing manager publishes `Draining`, drains and unlinks any discovery Worker, waits
+for an uncertain unlink fallback acknowledgement when necessary, and publishes
+`RemovalRequested` only after all links and fallback actions clear. The reason remains part of the
+exact operation fingerprint and structured diagnostics; Legion owns its external meaning.
 
 ```mermaid
 stateDiagram-v2
@@ -216,7 +224,7 @@ A timer alone cannot bypass fallback ownership.
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| Legion | Action detection, Runtime-set capture, durable operation state, Recreate/RollingUpdate policy, discovery, and physical deletion. | Host-local Worker scheduling or invocation admission. |
+| Legion | Action detection, trigger-discovery completion, Runtime-set capture, durable operation state, Recreate/RollingUpdate policy, discovery, and physical deletion. | Host-local Worker scheduling or invocation admission. |
 | Go AppServer relay | Authenticated one-shot relay, Host response preservation, and invalid-`200` rejection. | Retry, replay, conflict, escalation, or Worker selection. |
 | Host controller/coordinator | Strict request validation, exact fingerprint, one optional escalation, receipt, fence ordering, schedule, progress, and final Runtime lifecycle. | Durable recovery or external app-version policy. |
 | Worker registry/channel | Atomic admission closure, deterministic eligibility, existing-drain tracking, invocation grace, unlink, and fallback creation. | AppServer lifecycle acknowledgement or physical deletion. |
@@ -228,8 +236,8 @@ A timer alone cannot bypass fallback ownership.
 - A committed R2/P1 drain remains tracked and can still produce the existing exact fallback action.
 - R4 duplicate activation-fault retirement remains idempotent for R4-owned retirement. R4 cannot
   replace an active app-version schedule with an uncoordinated second retirement flow.
-- Older Link callers without exact identity keep primary WorkerProxy removal, but an uncertain
-  unlink cannot complete Runtime retirement without durable fallback ownership.
+- Link requires the worker namespace and route-matching pod name so an uncertain unlink always has
+  durable fallback ownership.
 - AppServer lifecycle publication remains serialized through the existing Host-state client gate.
 - Any bind, lifecycle fence, progress, or final-removal publication failure leaves the Runtime
   locally closed and does not create a success-shaped response or completion.
@@ -241,7 +249,7 @@ A timer alone cannot bypass fallback ownership.
 - AppServer uses the coordinated one-shot relay and exact contract from
   `7350d9e1e6273810569d1320df140576c3098804`.
 - Bala's Legion change supplies unique operation IDs, performs durable replay, and owns external
-  reason semantics and Runtime-set reconciliation.
+  reason semantics, trigger-discovery completion, and Runtime-set reconciliation.
 - WorkerProxy capability finalization remains the trusted source of function group and always-ready
   class.
 - Host-process loss during an active Phased or Immediate drain is deferred. The AppServer lifecycle

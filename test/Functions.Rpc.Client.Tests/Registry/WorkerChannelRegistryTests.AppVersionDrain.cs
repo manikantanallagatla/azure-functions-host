@@ -175,6 +175,95 @@ public sealed partial class WorkerChannelRegistryTests
     }
 
     [Fact]
+    public async Task PostRuntimeDrain_TriggerDiscoveryCompleteRequiresImmediateAndRemovesEmptyRuntime()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        using AppVersionDrainHostStateHandler handler = new();
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        Guid operationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fd");
+
+        using HttpResponseMessage phased = await host.PostAsync(CreateDrainJson(
+            operationId,
+            "Phased",
+            "TriggerDiscoveryComplete"));
+        Assert.Equal(HttpStatusCode.BadRequest, phased.StatusCode);
+
+        using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
+            operationId,
+            "Immediate",
+            "TriggerDiscoveryComplete"));
+        DrainReceipt receipt = await ReadDrainReceiptAsync(accepted);
+        Assert.Equal(operationId, receipt.OperationId);
+        Assert.Equal("Immediate", receipt.Mode);
+        await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
+
+        using HttpResponseMessage replay = await host.PostAsync(CreateDrainJson(
+            operationId,
+            "Immediate",
+            "TriggerDiscoveryComplete"));
+        Assert.Equal(receipt, await ReadDrainReceiptAsync(replay));
+
+        using HttpResponseMessage changedReason = await host.PostAsync(CreateDrainJson(
+            operationId,
+            "Immediate",
+            "Stop"));
+        Assert.Equal(HttpStatusCode.Conflict, changedReason.StatusCode);
+        Assert.Contains(handler.PublishedStates, state =>
+            string.Equals(state.Status, AppServerHostStateClient.DrainingStatus, StringComparison.Ordinal));
+        Assert.Contains(handler.PublishedStates, state =>
+            string.Equals(state.Status, AppServerHostStateClient.RemovalRequestedStatus, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task PostRuntimeDrain_TriggerDiscoveryCompleteWaitsForWorkerFallbackAcknowledgement()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        FunctionMetadata function = CreateFunction("DiscoveryFunction");
+        ChannelControl discoveryWorker = new(
+            "discovery-worker",
+            functionGroupName: "trigger-discovery",
+            isAlwaysReady: false,
+            completeResponsesOnRequestCompletion: false);
+        harness.Enqueue(discoveryWorker);
+        await registry.LinkAsync(
+            discoveryWorker.Id,
+            CreateEndpoint(discoveryWorker.Id),
+            CreateWorkerIdentity(discoveryWorker.Id));
+        await MakeWorkersReadyAsync(registry, function, discoveryWorker);
+
+        using AppVersionDrainHostStateHandler handler = new();
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
+            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fe"),
+            "Immediate",
+            "TriggerDiscoveryComplete"));
+        accepted.EnsureSuccessStatusCode();
+
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        await WaitUntilAsync(() => scaleInManager.Current.OutstandingWorkerRemovals.Count == 1);
+        FunctionsSplitWorkerRemovalAction fallback =
+            Assert.Single(scaleInManager.Current.OutstandingWorkerRemovals);
+        Assert.Equal(discoveryWorker.Id, fallback.Worker.PodName);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        Assert.Equal(
+            WorkerRemovalAcknowledgementResult.Accepted,
+            scaleInManager.AcknowledgeWorkerRemoval(fallback));
+        await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
+        Assert.Equal(1, discoveryWorker.DisposeCount);
+    }
+
+    [Fact]
     public async Task PostRuntimeDrain_PhasedSelectsDeterministicBatchesAtOriginalOffsetsAndHttpAtThirtyFiveSeconds()
     {
         DrainManualTimeProvider timeProvider = new();
@@ -264,7 +353,7 @@ public sealed partial class WorkerChannelRegistryTests
             await registry.LinkAsync(
                 worker.Id,
                 CreateEndpoint(worker.Id),
-                CreateWorkerIdentity(worker.Id, Guid.NewGuid()));
+                CreateWorkerIdentity(worker.Id));
         }
 
         await MakeWorkersReadyAsync(registry, function, preExisting, phased);
@@ -394,7 +483,7 @@ public sealed partial class WorkerChannelRegistryTests
         foreach (ChannelControl worker in workers)
         {
             harness.Enqueue(worker);
-            FunctionsSplitPodIdentity identity = CreateWorkerIdentity(worker.Id, Guid.NewGuid());
+            FunctionsSplitPodIdentity identity = CreateWorkerIdentity(worker.Id);
             await registry.LinkAsync(worker.Id, CreateEndpoint(worker.Id), identity);
         }
 
@@ -487,7 +576,7 @@ public sealed partial class WorkerChannelRegistryTests
         await registry.LinkAsync(
             worker.Id,
             CreateEndpoint(worker.Id),
-            CreateWorkerIdentity(worker.Id, Guid.NewGuid()));
+            CreateWorkerIdentity(worker.Id));
         await MakeWorkersReadyAsync(registry, function, worker);
         Assert.True(worker.Channel.TryDispatchInvocation(CreateScaleInInvocation(function)));
         await worker.ReadRequestAsync(StreamingMessage.ContentOneofCase.InvocationRequest);

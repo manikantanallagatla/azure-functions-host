@@ -26,9 +26,14 @@ public sealed class WorkerLinkRequest
     public string? WorkerContainerEncryptionKey { get; set; }
 
     /// <summary>
-    /// Gets or sets the optional authoritative exact worker identity supplied by Legion.
-    /// Older callers may omit this field; those links remain primary-removal only.
+    /// Gets or sets the required Legion resource namespace containing the Worker pod.
     /// </summary>
-    [JsonProperty("worker")]
-    public FunctionsSplitPodIdentity? Worker { get; set; }
+    [JsonProperty("workerNamespace")]
+    public string? WorkerNamespace { get; set; }
+
+    /// <summary>
+    /// Gets or sets the required Worker pod name, which must match the route worker ID.
+    /// </summary>
+    [JsonProperty("workerPodName")]
+    public string? WorkerPodName { get; set; }
 }

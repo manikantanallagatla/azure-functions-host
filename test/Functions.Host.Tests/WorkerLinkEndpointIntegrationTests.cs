@@ -16,7 +16,7 @@ using Xunit;
 namespace Azure.Functions.Host.Tests;
 
 /// <summary>
-/// Exercises the legacy MVC/Newtonsoft worker-link contract against the public registry interface.
+/// Exercises the MVC/Newtonsoft worker-link contract against the public registry interface.
 /// Fixture authorization is permissive and does not test production authentication.
 /// </summary>
 public sealed class WorkerLinkEndpointIntegrationTests
@@ -49,8 +49,12 @@ public sealed class WorkerLinkEndpointIntegrationTests
         using var timeout = new CancellationTokenSource(TestTimeout);
         TaskCompletionSource invoked = new(TaskCreationOptions.RunContinuationsAsynchronously);
         TaskCompletionSource<WorkerLinkResult> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        _registry.Setup(value => value.LinkAsync(WorkerId, Endpoint, It.IsAny<CancellationToken>()))
-            .Returns((string _, Uri _, CancellationToken token) =>
+        _registry.Setup(value => value.LinkAsync(
+                WorkerId,
+                Endpoint,
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((string _, Uri _, FunctionsSplitPodIdentity _, CancellationToken token) =>
             {
                 invoked.TrySetResult();
                 return completion.Task.WaitAsync(token);
@@ -74,8 +78,12 @@ public sealed class WorkerLinkEndpointIntegrationTests
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
         TaskCompletionSource<CancellationToken> invoked = new(TaskCreationOptions.RunContinuationsAsynchronously);
         TaskCompletionSource<WorkerLinkResult> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        _registry.Setup(value => value.LinkAsync(WorkerId, Endpoint, It.IsAny<CancellationToken>()))
-            .Returns((string _, Uri _, CancellationToken token) =>
+        _registry.Setup(value => value.LinkAsync(
+                WorkerId,
+                Endpoint,
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((string _, Uri _, FunctionsSplitPodIdentity _, CancellationToken token) =>
             {
                 invoked.TrySetResult(token);
                 return completion.Task.WaitAsync(token);
@@ -104,7 +112,13 @@ public sealed class WorkerLinkEndpointIntegrationTests
         using var timeout = new CancellationTokenSource(TestTimeout);
         SetupLink();
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
-        string json = JsonSerializer.Serialize(new { workerGrpcEndpoint = Endpoint.AbsoluteUri, workerHttpEndpoint = httpEndpoint });
+        string json = JsonSerializer.Serialize(new
+        {
+            workerGrpcEndpoint = Endpoint.AbsoluteUri,
+            workerHttpEndpoint = httpEndpoint,
+            workerNamespace = "resource-namespace",
+            workerPodName = WorkerId,
+        });
 
         using HttpResponseMessage response = await host.PutAsync(json, timeout.Token);
 
@@ -139,10 +153,11 @@ public sealed class WorkerLinkEndpointIntegrationTests
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
 
         using HttpResponseMessage response = await host.PutAsync("{}", timeout.Token);
-        JsonElement error = Assert.Single(await ReadValidationErrorsAsync(response, timeout.Token));
+        JsonElement[] errors = await ReadValidationErrorsAsync(response, timeout.Token);
 
-        Assert.Equal("Required", error.GetProperty("code").GetString());
-        Assert.Equal("workerGrpcEndpoint", error.GetProperty("target").GetString());
+        Assert.Contains(errors, error =>
+            string.Equals(error.GetProperty("code").GetString(), "Required", StringComparison.Ordinal) &&
+            string.Equals(error.GetProperty("target").GetString(), "workerGrpcEndpoint", StringComparison.Ordinal));
         _registry.VerifyNoOtherCalls();
     }
 
@@ -151,9 +166,13 @@ public sealed class WorkerLinkEndpointIntegrationTests
     {
         using var timeout = new CancellationTokenSource(TestTimeout);
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
-        const string json = """
-            {"workerGrpcEndpoint":"relative/grpc","workerHttpEndpoint":"relative/http"}
-            """;
+        string json = JsonSerializer.Serialize(new
+        {
+            workerGrpcEndpoint = "relative/grpc",
+            workerHttpEndpoint = "relative/http",
+            workerNamespace = "resource-namespace",
+            workerPodName = WorkerId,
+        });
 
         using HttpResponseMessage response = await host.PutAsync(json, timeout.Token);
         JsonElement[] errors = await ReadValidationErrorsAsync(response, timeout.Token);
@@ -186,45 +205,37 @@ public sealed class WorkerLinkEndpointIntegrationTests
         _registry.VerifyNoOtherCalls();
     }
 
-    [Theory]
-    [InlineData("workerId", "\"worker-pod-abc123\"")]
-    [InlineData("workerId", "\"another-worker\"")]
-    [InlineData("workerId", "\"\"")]
-    [InlineData("workerId", "null")]
-    [InlineData("workerId", "123")]
-    [InlineData("workerId", "true")]
-    [InlineData("workerId", "{}")]
-    [InlineData("workerId", "[]")]
-    [InlineData("WorkerId", "null")]
-    [InlineData("WORKERID", "\"another-worker\"")]
-    [InlineData("workerPodName", "\"another-worker\"")]
-    [InlineData("WorkerPodName", "null")]
-    public async Task Put_BodyWorkerIdentity_IsIgnoredAndUsesRouteIdentity(string propertyName, string identityJson)
+    [Fact]
+    public async Task Put_BodyPodNameDoesNotMatchRoute_ReturnsMismatch()
     {
         using var timeout = new CancellationTokenSource(TestTimeout);
-        SetupLink();
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
-        string json = $$"""
-            {"workerGrpcEndpoint":"{{Endpoint.AbsoluteUri}}","{{propertyName}}":{{identityJson}}}
-            """;
 
-        using HttpResponseMessage response = await host.PutAsync(json, timeout.Token);
+        using HttpResponseMessage response = await host.PutAsync(LinkJson("another-worker"), timeout.Token);
+        JsonElement error = Assert.Single(await ReadValidationErrorsAsync(response, timeout.Token));
 
-        await AssertLinkResponseAsync(response, HttpStatusCode.Created, timeout.Token);
-        VerifyLink();
+        Assert.Equal("WorkerIdentityMismatch", error.GetProperty("code").GetString());
+        Assert.Equal("workerPodName", error.GetProperty("target").GetString());
+        _registry.VerifyNoOtherCalls();
     }
 
     [Fact]
     public async Task Put_BodyWorkerId_DoesNotBypassEndpointConflict()
     {
         using var timeout = new CancellationTokenSource(TestTimeout);
-        _registry.Setup(value => value.LinkAsync(WorkerId, Endpoint, It.IsAny<CancellationToken>()))
+        _registry.Setup(value => value.LinkAsync(
+                WorkerId,
+                Endpoint,
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ThrowsAsync(new WorkerLinkException(WorkerLinkFailureReason.Conflict, "Endpoint conflict."));
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
         string json = JsonSerializer.Serialize(new
         {
             workerId = "another-worker",
             workerGrpcEndpoint = Endpoint.AbsoluteUri,
+            workerNamespace = "resource-namespace",
+            workerPodName = WorkerId,
         });
 
         using HttpResponseMessage response = await host.PutAsync(json, timeout.Token);
@@ -243,10 +254,11 @@ public sealed class WorkerLinkEndpointIntegrationTests
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
 
         using HttpResponseMessage response = await host.PutAsync(LinkJson(), timeout.Token, Uri.EscapeDataString(workerId));
-        JsonElement error = Assert.Single(await ReadValidationErrorsAsync(response, timeout.Token));
+        JsonElement[] errors = await ReadValidationErrorsAsync(response, timeout.Token);
 
-        Assert.Equal("Required", error.GetProperty("code").GetString());
-        Assert.Equal("workerId", error.GetProperty("target").GetString());
+        Assert.Contains(errors, error =>
+            string.Equals(error.GetProperty("code").GetString(), "Required", StringComparison.Ordinal) &&
+            string.Equals(error.GetProperty("target").GetString(), "workerId", StringComparison.Ordinal));
         _registry.VerifyNoOtherCalls();
     }
 
@@ -255,7 +267,6 @@ public sealed class WorkerLinkEndpointIntegrationTests
     [InlineData(64)]
     [InlineData(253)]
     [InlineData(254)]
-    [InlineData(1024)]
     public async Task Put_WorkerIdentityLength_DoesNotRestrictLinking(int length)
     {
         using var timeout = new CancellationTokenSource(TestTimeout);
@@ -263,7 +274,7 @@ public sealed class WorkerLinkEndpointIntegrationTests
         SetupLink(workerId);
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
 
-        using HttpResponseMessage response = await host.PutAsync(LinkJson(), timeout.Token, workerId);
+        using HttpResponseMessage response = await host.PutAsync(LinkJson(workerId), timeout.Token, workerId);
 
         await AssertLinkResponseAsync(response, HttpStatusCode.Created, timeout.Token);
         VerifyLink(workerId);
@@ -288,7 +299,10 @@ public sealed class WorkerLinkEndpointIntegrationTests
         SetupLink(workerId);
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
 
-        using HttpResponseMessage response = await host.PutAsync(LinkJson(), timeout.Token, Uri.EscapeDataString(workerId));
+        using HttpResponseMessage response = await host.PutAsync(
+            LinkJson(workerId),
+            timeout.Token,
+            Uri.EscapeDataString(workerId));
 
         await AssertLinkResponseAsync(response, HttpStatusCode.Created, timeout.Token);
         VerifyLink(workerId);
@@ -346,7 +360,11 @@ public sealed class WorkerLinkEndpointIntegrationTests
     {
         const string privateDiagnostic = "private-worker-detail-do-not-return";
         using var timeout = new CancellationTokenSource(TestTimeout);
-        _registry.Setup(value => value.LinkAsync(WorkerId, Endpoint, It.IsAny<CancellationToken>()))
+        _registry.Setup(value => value.LinkAsync(
+                WorkerId,
+                Endpoint,
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
             .ThrowsAsync(new WorkerLinkException(reason, privateDiagnostic, new Exception(privateDiagnostic)));
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
 
@@ -363,8 +381,13 @@ public sealed class WorkerLinkEndpointIntegrationTests
         const string privateDiagnostic = "private-timeout-detail-do-not-return";
         using var timeout = new CancellationTokenSource(TestTimeout);
         CancellationToken registryToken = default;
-        _registry.Setup(value => value.LinkAsync(WorkerId, Endpoint, It.IsAny<CancellationToken>()))
-            .Callback<string, Uri, CancellationToken>((_, _, token) => registryToken = token)
+        _registry.Setup(value => value.LinkAsync(
+                WorkerId,
+                Endpoint,
+                It.IsAny<FunctionsSplitPodIdentity>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<string, Uri, FunctionsSplitPodIdentity, CancellationToken>(
+                (_, _, _, token) => registryToken = token)
             .ThrowsAsync(new TimeoutException(privateDiagnostic));
         await using WorkerLinkTestHost host = await WorkerLinkTestHost.StartAsync(timeout.Token, _registry.Object);
 
@@ -376,18 +399,34 @@ public sealed class WorkerLinkEndpointIntegrationTests
         VerifyLink();
     }
 
-    private static string LinkJson()
-        => JsonSerializer.Serialize(new { workerGrpcEndpoint = Endpoint.AbsoluteUri });
+    private static string LinkJson(string workerId = WorkerId)
+        => JsonSerializer.Serialize(new
+        {
+            workerGrpcEndpoint = Endpoint.AbsoluteUri,
+            workerNamespace = "resource-namespace",
+            workerPodName = workerId,
+        });
 
     private void SetupLink(string workerId = WorkerId, bool isNewLink = true)
-        => _registry.Setup(value => value.LinkAsync(workerId, Endpoint, It.IsAny<CancellationToken>()))
+        => _registry.Setup(value => value.LinkAsync(
+                workerId,
+                Endpoint,
+                It.Is<FunctionsSplitPodIdentity>(worker => worker == CreateWorkerIdentity(workerId)),
+                It.IsAny<CancellationToken>()))
             .ReturnsAsync(new WorkerLinkResult(null!, isNewLink));
 
     private void VerifyLink(string workerId = WorkerId)
     {
-        _registry.Verify(value => value.LinkAsync(workerId, Endpoint, It.IsAny<CancellationToken>()), Times.Once);
+        _registry.Verify(value => value.LinkAsync(
+            workerId,
+            Endpoint,
+            It.Is<FunctionsSplitPodIdentity>(worker => worker == CreateWorkerIdentity(workerId)),
+            It.IsAny<CancellationToken>()), Times.Once);
         _registry.VerifyNoOtherCalls();
     }
+
+    private static FunctionsSplitPodIdentity CreateWorkerIdentity(string workerId)
+        => new("resource-namespace", workerId);
 
     private static async Task<JsonElement[]> ReadValidationErrorsAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
@@ -406,8 +445,10 @@ public sealed class WorkerLinkEndpointIntegrationTests
             Assert.Equal(JsonValueKind.Object, error.ValueKind);
             Assert.Equal(new[] { "code", "target" },
                 error.EnumerateObject().Select(property => property.Name).Order(StringComparer.Ordinal));
-            Assert.Contains(error.GetProperty("code").GetString(), new[] { "Required", "InvalidEndpoint", "InvalidBody" });
-            Assert.Contains(error.GetProperty("target").GetString(), new[] { "request", "workerId", "workerGrpcEndpoint" });
+            Assert.Contains(error.GetProperty("code").GetString(),
+                new[] { "Required", "InvalidEndpoint", "InvalidBody", "InvalidWorkerIdentity", "WorkerIdentityMismatch" });
+            Assert.Contains(error.GetProperty("target").GetString(),
+                new[] { "request", "workerId", "workerGrpcEndpoint", "workerNamespace", "workerPodName", "workerIdentity" });
         });
         return errors;
     }

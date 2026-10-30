@@ -82,8 +82,12 @@ public sealed partial class WorkerLinkController : Controller
         CancellationToken cancellationToken = default)
     {
         long started = Stopwatch.GetTimestamp();
-        IReadOnlyList<RequestValidationError> errors = ValidateRequest(workerId, request, out Uri? grpcEndpoint);
-        if (errors.Count > 0 || grpcEndpoint is null)
+        IReadOnlyList<RequestValidationError> errors = ValidateRequest(
+            workerId,
+            request,
+            out Uri? grpcEndpoint,
+            out FunctionsSplitPodIdentity? worker);
+        if (errors.Count > 0 || grpcEndpoint is null || worker is null)
         {
             Log.LinkRejected(_logger, null, workerId, ValidationFailedReason,
                 Stopwatch.GetElapsedTime(started).TotalMilliseconds);
@@ -94,15 +98,17 @@ public sealed partial class WorkerLinkController : Controller
         return await LinkValidatedWorkerAsync(
             workerId,
             grpcEndpoint,
-            request!.Worker,
+            worker,
             started,
             cancellationToken);
     }
 
     private IReadOnlyList<RequestValidationError> ValidateRequest(string workerId, WorkerLinkRequest? request,
-        out Uri? grpcEndpoint)
+        out Uri? grpcEndpoint,
+        out FunctionsSplitPodIdentity? worker)
     {
         grpcEndpoint = null;
+        worker = null;
         List<RequestValidationError> errors = [];
 
         if (string.IsNullOrWhiteSpace(workerId))
@@ -126,15 +132,35 @@ public sealed partial class WorkerLinkController : Controller
                 : new(ErrorCodes.InvalidEndpoint, "workerGrpcEndpoint"));
         }
 
-        if (request.Worker is not null)
+        bool hasWorkerNamespace = !string.IsNullOrWhiteSpace(request.WorkerNamespace);
+        if (!hasWorkerNamespace)
         {
-            if (!request.Worker.IsValid())
+            errors.Add(new(ErrorCodes.Required, "workerNamespace"));
+        }
+
+        bool hasWorkerPodName = !string.IsNullOrWhiteSpace(request.WorkerPodName);
+        if (!hasWorkerPodName)
+        {
+            errors.Add(new(ErrorCodes.Required, "workerPodName"));
+        }
+        else if (!string.Equals(workerId, request.WorkerPodName, StringComparison.Ordinal))
+        {
+            errors.Add(new(ErrorCodes.WorkerIdentityMismatch, "workerPodName"));
+        }
+
+        if (hasWorkerNamespace &&
+            hasWorkerPodName)
+        {
+            FunctionsSplitPodIdentity candidate = new(
+                request.WorkerNamespace!,
+                request.WorkerPodName!);
+            if (candidate.IsValid())
             {
-                errors.Add(new(ErrorCodes.InvalidWorkerIdentity, "worker"));
+                worker = candidate;
             }
-            else if (!string.Equals(workerId, request.Worker.PodName, StringComparison.Ordinal))
+            else
             {
-                errors.Add(new(ErrorCodes.WorkerIdentityMismatch, "worker.podName"));
+                errors.Add(new(ErrorCodes.InvalidWorkerIdentity, "workerIdentity"));
             }
         }
 
@@ -145,18 +171,15 @@ public sealed partial class WorkerLinkController : Controller
     private async Task<IActionResult> LinkValidatedWorkerAsync(
         string workerId,
         Uri grpcEndpoint,
-        FunctionsSplitPodIdentity? worker,
+        FunctionsSplitPodIdentity worker,
         long started,
         CancellationToken cancellationToken)
     {
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            WorkerLinkResult result = worker switch
-            {
-                null => await _registry.LinkAsync(workerId, grpcEndpoint, cancellationToken),
-                _ => await _registry.LinkAsync(workerId, grpcEndpoint, worker, cancellationToken),
-            };
+            WorkerLinkResult result =
+                await _registry.LinkAsync(workerId, grpcEndpoint, worker, cancellationToken);
             Log.LinkAccepted(_logger, workerId, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
             return StatusCode(result.IsNewLink ? StatusCodes.Status201Created : StatusCodes.Status200OK);

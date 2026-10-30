@@ -733,7 +733,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             incarnation != _runtimeIncarnation)
         {
             throw new InvalidOperationException(
-                "The app-version Runtime drain does not match the active retiring incarnation.");
+                "The Runtime drain does not match the active retiring incarnation.");
         }
     }
 
@@ -1556,7 +1556,10 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             SignalScaleInStateChangedLocked();
         }
 
-        Log.WorkerRemovalFallbackAdded(_logger, slot.Worker.PodName, slot.Worker.PodGuid);
+        Log.WorkerRemovalFallbackAdded(
+            _logger,
+            slot.Worker.PodName,
+            slot.Worker.ResourceNamespace);
     }
 
     private bool IsRuntimeRetirementFallbackOutstanding(WorkerSlot slot)
@@ -1744,11 +1747,14 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         public static partial void ChannelSetupFailed(ILogger logger, Exception exception, string workerId);
 
         [LoggerMessage(6, LogLevel.Warning,
-            "Published fallback removal for worker {WorkerId} incarnation {WorkerPodGuid} after an uncertain graceful unlink.")]
-        public static partial void WorkerRemovalFallbackAdded(ILogger logger, string workerId, Guid workerPodGuid);
+            "Published fallback removal for worker {WorkerId} in namespace {WorkerNamespace} after an uncertain graceful unlink.")]
+        public static partial void WorkerRemovalFallbackAdded(
+            ILogger logger,
+            string workerId,
+            string workerNamespace);
 
         [LoggerMessage(7, LogLevel.Warning,
-            "Cannot publish fallback removal after an uncertain graceful unlink for endpoint {WorkerEndpoint} because the link omitted exact worker identity.")]
+            "Cannot publish fallback removal after an uncertain graceful unlink for endpoint {WorkerEndpoint} because the link has no worker identity.")]
         public static partial void WorkerRemovalFallbackUnavailable(ILogger logger, Uri workerEndpoint);
 
         [LoggerMessage(8, LogLevel.Information,
@@ -1775,14 +1781,14 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             bool isAlwaysReady);
 
         [LoggerMessage(14, LogLevel.Information,
-            "Selected worker {WorkerId} for app-version Runtime drain with committed-invocation grace deadline {InvocationGraceDeadline}.")]
+            "Selected worker {WorkerId} for Runtime drain with committed-invocation grace deadline {InvocationGraceDeadline}.")]
         public static partial void AppVersionDrainWorkerSelected(
             ILogger logger,
             string workerId,
             DateTimeOffset invocationGraceDeadline);
 
         [LoggerMessage(15, LogLevel.Warning,
-            "Committed-invocation grace expired for app-version draining worker {WorkerId} at {InvocationGraceDeadline}; closing its channel.")]
+            "Committed-invocation grace expired for Runtime draining worker {WorkerId} at {InvocationGraceDeadline}; closing its channel.")]
         public static partial void AppVersionDrainGraceExpired(
             ILogger logger,
             string workerId,

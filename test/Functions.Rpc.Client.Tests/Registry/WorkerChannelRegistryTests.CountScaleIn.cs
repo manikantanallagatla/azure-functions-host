@@ -171,7 +171,7 @@ public sealed partial class WorkerChannelRegistryTests
             await registry.LinkAsync(
                 worker.Id,
                 CreateEndpoint(worker.Id),
-                CreateWorkerIdentity(worker.Id, Guid.NewGuid()));
+                CreateWorkerIdentity(worker.Id));
         }
 
         await MakeWorkersReadyAsync(registry, function, workers);
