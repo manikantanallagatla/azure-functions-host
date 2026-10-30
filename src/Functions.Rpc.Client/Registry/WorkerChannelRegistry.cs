@@ -562,6 +562,12 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                         continue;
                     }
 
+                    if (slot.RemovalOwnershipCompletion is not null)
+                    {
+                        existingDrains.Add(slot.RemovalOwnershipCompletion.Task);
+                        continue;
+                    }
+
                     if (slot.Channel is not { } channel)
                     {
                         continue;
@@ -614,6 +620,10 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                 if (slot.DrainTask is not null)
                 {
                     existingDrains.Add(slot.DrainTask);
+                }
+                else if (slot.RemovalOwnershipCompletion is not null)
+                {
+                    existingDrains.Add(slot.RemovalOwnershipCompletion.Task);
                 }
 
                 if (slot.Channel is not { } channel ||
@@ -818,6 +828,26 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                         => new TimeoutException("The worker link initialization deadline expired.", exception),
                     _ => exception,
                 };
+                bool removalOwnershipPending;
+                lock (_stateLock)
+                {
+                    if (_runtimeRetirementRequested &&
+                        slot.Worker is not null &&
+                        !slot.RemovalHandoffConfirmed &&
+                        !slot.RemovalFallbackRecorded)
+                    {
+                        EnsureRemovalOwnershipPendingLocked(slot);
+                    }
+
+                    removalOwnershipPending = slot.RemovalOwnershipPending;
+                }
+
+                if (removalOwnershipPending && candidate is not null)
+                {
+                    failure = await SettleRejectedLinkOwnershipAsync(workerId, slot, candidate, failure);
+                    candidate = null;
+                }
+
                 failure = await candidate.DisposeAndCaptureExceptionAsync(failure);
                 failure = await ownedChannel.DisposeAndCaptureExceptionAsync(failure);
                 ExceptionDispatchInfo.Capture(failure).Throw();
@@ -833,12 +863,89 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             // Accepted links are cleaned up by monitor/unlink; completing Link must not wait for deferred setup.
             if (!initialized)
             {
-                RemoveEmptySlot(workerId, slot);
-                lock (_stateLock)
-                {
-                    _linkAttempts.Remove(workerId);
-                }
+                CompleteFailedLinkAttempt(workerId, slot);
             }
+        }
+    }
+
+    private async Task<Exception> SettleRejectedLinkOwnershipAsync(
+        string workerId,
+        WorkerSlot slot,
+        RpcClientWorkerChannel channel,
+        Exception failure)
+    {
+        bool primaryHandoffConfirmed = false;
+        try
+        {
+            channel.FailCommittedInvocations(exception: null);
+            channel.CompleteRequests();
+            await Task.WhenAny(channel.Completion).WaitAsync(_unlinkTimeout, _shutdownSource.Token);
+            primaryHandoffConfirmed = channel.IsWorkerRemovalHandoffConfirmed;
+            if (channel.Completion.IsFaulted)
+            {
+                Log.ChannelFailed(_logger, channel.Completion.Exception, workerId);
+            }
+        }
+        catch (Exception exception)
+        {
+            failure = AggregateException.Combine(failure, exception);
+        }
+
+        if (primaryHandoffConfirmed)
+        {
+            lock (_stateLock)
+            {
+                RecordPrimaryWorkerRemovalHandoffLocked(slot);
+            }
+        }
+        else if (!_shutdownSource.IsCancellationRequested)
+        {
+            AddOutstandingWorkerRemoval(slot);
+        }
+
+        return await channel.DisposeAndCaptureExceptionAsync(failure);
+    }
+
+    private void CompleteFailedLinkAttempt(string workerId, WorkerSlot slot)
+    {
+        bool fallbackAdded = false;
+        lock (_stateLock)
+        {
+            if (!_disposed &&
+                _runtimeRetirementRequested &&
+                slot.Worker is not null &&
+                !slot.RemovalHandoffConfirmed &&
+                !slot.RemovalFallbackRecorded)
+            {
+                EnsureRemovalOwnershipPendingLocked(slot);
+                AddOutstandingWorkerRemovalLocked(slot, out fallbackAdded);
+            }
+
+            if (slot.RemovalOwnershipPending)
+            {
+                return;
+            }
+
+            if (slot.Channel is null &&
+                _slots.TryGetValue(workerId, out WorkerSlot currentSlot) &&
+                ReferenceEquals(currentSlot, slot))
+            {
+                _slots.Remove(workerId);
+            }
+
+            if (_linkAttempts.TryGetValue(workerId, out currentSlot) &&
+                ReferenceEquals(currentSlot, slot))
+            {
+                _linkAttempts.Remove(workerId);
+            }
+        }
+
+        if (fallbackAdded)
+        {
+            Log.WorkerRemovalFallbackAdded(
+                _logger,
+                slot.Worker!.PodName,
+                slot.Worker.ResourceNamespace);
         }
     }
 
@@ -883,7 +990,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                             !slot.RemovalHandoffConfirmed &&
                             !slot.RemovalFallbackRecorded)
                         {
-                            slot.RemovalOwnershipPending = true;
+                            EnsureRemovalOwnershipPendingLocked(slot);
                         }
 
                         channel = DetachChannelLocked(slot, expectedChannel: null);
@@ -1110,6 +1217,14 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             _disposed = true;
             slots = [.. _slots];
             monitorTasks = [.. _monitorTasks];
+            foreach (WorkerSlot slot in _linkAttempts.Values)
+            {
+                if (slot.RemovalOwnershipPending)
+                {
+                    slot.RemovalOwnershipCompletion?.TrySetResult(false);
+                }
+            }
+
             _initializedChannelAvailable.TrySetResult();
             _scaleInStateChanged.TrySetException(new ObjectDisposedException(GetType().FullName));
 
@@ -1419,6 +1534,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_runtimeRetirementRequested)
             {
+                if (slot.Worker is not null &&
+                    !slot.RemovalHandoffConfirmed &&
+                    !slot.RemovalFallbackRecorded)
+                {
+                    if (EnsureRemovalOwnershipPendingLocked(slot))
+                    {
+                        SignalScaleInStateChangedLocked();
+                    }
+                }
+
                 throw new WorkerLinkException(
                     WorkerLinkFailureReason.RuntimeStopping,
                     "The Runtime started retiring before the Worker Link was registered.");
@@ -1598,9 +1723,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         if (_completedWorkerRemovals.Contains(action) || _outstandingWorkerRemovalSet.Contains(action))
         {
             slot.RemovalFallbackRecorded = true;
-            if (slot.RemovalOwnershipPending)
+            if (CompleteRemovalOwnershipLocked(slot))
             {
-                slot.RemovalOwnershipPending = false;
                 SignalScaleInStateChangedLocked();
             }
 
@@ -1610,7 +1734,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         _outstandingWorkerRemovalSet.Add(action);
         _outstandingWorkerRemovals.Add(action);
         slot.RemovalFallbackRecorded = true;
-        slot.RemovalOwnershipPending = false;
+        CompleteRemovalOwnershipLocked(slot);
         added = true;
         SignalScaleInStateChangedLocked();
         return true;
@@ -1624,9 +1748,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
 
         slot.RemovalHandoffConfirmed = true;
-        if (slot.RemovalOwnershipPending)
+        if (CompleteRemovalOwnershipLocked(slot))
         {
-            slot.RemovalOwnershipPending = false;
             SignalScaleInStateChangedLocked();
         }
     }
@@ -1636,16 +1759,29 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         foreach (WorkerSlot slot in _linkAttempts.Values)
         {
             if (slot.RemovalHandoffConfirmed ||
-                slot.RemovalFallbackRecorded ||
-                (slot.Channel is null && !slot.Terminal) ||
-                slot.Channel is { IsTerminated: false })
+                slot.RemovalFallbackRecorded)
+            {
+                continue;
+            }
+
+            if (slot.Channel is null && !slot.Terminal)
+            {
+                if (slot.Worker is not null && slot.LinkTask is not null)
+                {
+                    EnsureRemovalOwnershipPendingLocked(slot);
+                }
+
+                continue;
+            }
+
+            if (slot.Channel is { IsTerminated: false })
             {
                 continue;
             }
 
             if (!AddOutstandingWorkerRemovalLocked(slot, out bool added))
             {
-                slot.RemovalOwnershipPending = true;
+                EnsureRemovalOwnershipPendingLocked(slot);
                 continue;
             }
 
@@ -1657,6 +1793,31 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                     slot.Worker.ResourceNamespace);
             }
         }
+    }
+
+    private static bool EnsureRemovalOwnershipPendingLocked(WorkerSlot slot)
+    {
+        if (slot.RemovalOwnershipPending)
+        {
+            return false;
+        }
+
+        slot.RemovalOwnershipPending = true;
+        slot.RemovalOwnershipCompletion ??=
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        return true;
+    }
+
+    private static bool CompleteRemovalOwnershipLocked(WorkerSlot slot)
+    {
+        if (!slot.RemovalOwnershipPending)
+        {
+            return false;
+        }
+
+        slot.RemovalOwnershipPending = false;
+        slot.RemovalOwnershipCompletion?.TrySetResult(true);
+        return true;
     }
 
     private bool IsRuntimeRetirementFallbackOutstanding(WorkerSlot slot)
@@ -1805,6 +1966,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         // Keeps final retirement fenced when no primary acknowledgement or exact fallback identity is available.
         public bool RemovalOwnershipPending { get; set; }
+
+        // Completes when an in-flight Link transfers deletion ownership to WorkerProxy or the exact fallback outbox.
+        public TaskCompletionSource<bool> RemovalOwnershipCompletion { get; set; }
 
         // Indicates that a previously accepted link has terminated and cannot be replayed.
         public bool Terminal { get; set; }

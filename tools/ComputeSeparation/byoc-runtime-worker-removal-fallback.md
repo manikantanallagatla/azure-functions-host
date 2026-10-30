@@ -82,6 +82,9 @@ stateDiagram-v2
 - Only the exact WorkerProxy removal trailer confirms primary ownership and avoids a fallback action.
 - Clean, faulted, canceled, timed-out, or disposed streams without the trailer create the exact
   fallback action.
+- An identity-bearing Link still initializing when Runtime retirement closes remains counted until
+  late registration yields the exact trailer or the exact fallback is recorded. A connection
+  failure before channel creation records the same fallback from the retained Link identity.
 - After Runtime retirement closes admission, the channel monitor applies the same rule before
   removing a channel that terminates or reports a function-load failure ahead of delayed Worker
   selection. Function-load failure alone cannot expose transport trailers and is therefore not

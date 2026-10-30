@@ -97,6 +97,18 @@ internal sealed class RuntimeDrainRequestJsonConverter : JsonConverter
                 DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error,
             });
 
+        foreach (JProperty property in body.Properties())
+        {
+            if ((string.Equals(property.Name, ModePropertyName, StringComparison.OrdinalIgnoreCase) &&
+                 !string.Equals(property.Name, ModePropertyName, StringComparison.Ordinal)) ||
+                (string.Equals(property.Name, ReasonPropertyName, StringComparison.OrdinalIgnoreCase) &&
+                 !string.Equals(property.Name, ReasonPropertyName, StringComparison.Ordinal)))
+            {
+                throw new JsonSerializationException(
+                    "The Runtime drain request must use canonical lowercase mode and reason property names.");
+            }
+        }
+
         if (body.Property(ModePropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } modeProperty ||
             body.Property(ReasonPropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } reasonProperty)
         {

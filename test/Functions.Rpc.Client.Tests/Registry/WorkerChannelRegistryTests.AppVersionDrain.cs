@@ -21,6 +21,7 @@ using Microsoft.AspNetCore.Mvc.ApplicationParts;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.WebJobs.Script;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
 using Microsoft.Azure.WebJobs.Script.ManagedDependencies;
 using Microsoft.Azure.WebJobs.Script.WebHost;
@@ -167,6 +168,249 @@ public sealed partial class WorkerChannelRegistryTests
             "acceptedAtUtc",
             await rejected.Content.ReadAsStringAsync(),
             StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("""{"mode":"Phased","Mode":"Immediate","reason":"ConfigurationChange"}""")]
+    [InlineData("""{"Mode":"Immediate","mode":"Phased","reason":"ConfigurationChange"}""")]
+    [InlineData("""{"mode":"Phased","reason":"ConfigurationChange","Reason":"Restart"}""")]
+    [InlineData("""{"mode":"Phased","Reason":"Restart","reason":"ConfigurationChange"}""")]
+    public async Task PostRuntimeDrain_CaseInsensitiveKnownPropertyAliasesReturnBadRequest(string json)
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        using AppVersionDrainHostStateHandler handler = new();
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+
+        using HttpResponseMessage response = await host.PostAsync(json);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(handler.PublishedStates);
+    }
+
+    [Theory]
+    [InlineData("Phased")]
+    [InlineData("Immediate")]
+    public async Task PostRuntimeDrain_WaitsForInFlightIdentityBearingLinkOwnership(string mode)
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        ChannelControl worker = new(
+            "worker",
+            blockStart: true,
+            completeResponsesOnRequestCompletion: false,
+            workerRemovalHandoffConfirmed: false);
+        harness.Enqueue(worker);
+        Task<WorkerLinkResult> link = registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        await worker.StartEntered.WaitAsync(TestTimeout);
+
+        using AppVersionDrainHostStateHandler handler = new();
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
+            mode,
+            "ConfigurationChange"));
+        accepted.EnsureSuccessStatusCode();
+        if (string.Equals(mode, "Phased", StringComparison.Ordinal))
+        {
+            timeProvider.Advance(TimeSpan.FromSeconds(40));
+        }
+
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        Assert.Equal(1, scaleInManager.Current.LinkedWorkerCount);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        worker.AllowStart();
+        await worker.Transport.Requests.Completion.WaitAsync(TestTimeout);
+        Assert.Equal(1, scaleInManager.Current.LinkedWorkerCount);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        worker.Complete();
+        await WaitUntilAsync(() => scaleInManager.Current.OutstandingWorkerRemovals.Count == 1);
+        WorkerLinkException linkFailure =
+            await Assert.ThrowsAsync<WorkerLinkException>(() => link.WaitAsync(TestTimeout));
+        Assert.Equal(WorkerLinkFailureReason.RuntimeStopping, linkFailure.Reason);
+        FunctionsSplitWorkerRemovalAction fallback =
+            Assert.Single(scaleInManager.Current.OutstandingWorkerRemovals);
+        Assert.Equal(worker.Id, fallback.Worker.PodName);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        Assert.Equal(
+            WorkerRemovalAcknowledgementResult.Accepted,
+            scaleInManager.AcknowledgeWorkerRemoval(fallback));
+        await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
+    }
+
+    [Fact]
+    public async Task PostRuntimeDrain_ConnectionFailureTransfersInFlightLinkToExactFallback()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        TaskCompletionSource connectionEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource<DuplexChannel<StreamingMessage>> connection =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.DuplexFactory
+            .Setup(factory => factory.ConnectAsync(
+                It.IsAny<Uri>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((Uri _, CancellationToken cancellationToken) =>
+            {
+                connectionEntered.TrySetResult();
+                return connection.Task.WaitAsync(cancellationToken);
+            });
+        FunctionsSplitPodIdentity worker = CreateWorkerIdentity("worker");
+        Task<WorkerLinkResult> link = registry.LinkAsync(
+            worker.PodName,
+            CreateEndpoint(worker.PodName),
+            worker);
+        await connectionEntered.Task.WaitAsync(TestTimeout);
+
+        using AppVersionDrainHostStateHandler handler = new();
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
+            "Immediate",
+            "ConfigurationChange"));
+        accepted.EnsureSuccessStatusCode();
+
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        Assert.Equal(1, scaleInManager.Current.LinkedWorkerCount);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        connection.TrySetException(new IOException("connection failed"));
+        IOException linkFailure = await Assert.ThrowsAsync<IOException>(() => link.WaitAsync(TestTimeout));
+        Assert.Equal("connection failed", linkFailure.Message);
+        await WaitUntilAsync(() => scaleInManager.Current.OutstandingWorkerRemovals.Count == 1);
+        FunctionsSplitWorkerRemovalAction fallback =
+            Assert.Single(scaleInManager.Current.OutstandingWorkerRemovals);
+        Assert.Equal(worker, fallback.Worker);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        Assert.Equal(
+            WorkerRemovalAcknowledgementResult.Accepted,
+            scaleInManager.AcknowledgeWorkerRemoval(fallback));
+        await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
+    }
+
+    [Fact]
+    public async Task RuntimeRetirementWaitsForInFlightIdentityBearingLinkOwnership()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        ChannelControl worker = new(
+            "worker",
+            blockStart: true,
+            completeResponsesOnRequestCompletion: false,
+            workerRemovalHandoffConfirmed: true);
+        harness.Enqueue(worker);
+        Task<WorkerLinkResult> link = registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        await worker.StartEntered.WaitAsync(TestTimeout);
+
+        using AppVersionDrainHostStateHandler handler = new();
+        using HttpClient httpClient = new(handler, disposeHandler: false);
+        Mock<IHttpClientFactory> factory = new();
+        factory.Setup(value => value.CreateClient(AppServerHostStateClient.HttpClientName))
+            .Returns(httpClient);
+        IConfiguration configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string>
+            {
+                [EnvironmentSettingNames.ContainerName] = "test-container",
+                [EnvironmentSettingNames.MeshInitURI] = "http://appserver.test/",
+            })
+            .Build();
+        AppServerHostStateClient client = new(
+            factory.Object,
+            registry,
+            registry,
+            timeProvider,
+            configuration);
+        using RuntimeRetirementStatePublisher publisher = new(
+            registry,
+            client,
+            timeProvider,
+            NullLogger<RuntimeRetirementStatePublisher>.Instance);
+        RuntimeRetirementManager manager = new(
+            registry,
+            registry,
+            client,
+            publisher,
+            NullLogger<RuntimeRetirementManager>.Instance);
+        SplitScriptHostActivationFaulted condition = new(
+            ((IRuntimeRetirementWorkerManager)registry).Incarnation,
+            new InvalidOperationException("activation failed"));
+
+        Task retirement = manager.RequestRetirementAsync(condition);
+        await handler.DrainFenceObserved.Task.WaitAsync(TestTimeout);
+
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        Assert.Equal(1, scaleInManager.Current.LinkedWorkerCount);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        worker.AllowStart();
+        await worker.Transport.Requests.Completion.WaitAsync(TestTimeout);
+        Assert.Equal(1, scaleInManager.Current.LinkedWorkerCount);
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        worker.Complete();
+        WorkerLinkException linkFailure =
+            await Assert.ThrowsAsync<WorkerLinkException>(() => link.WaitAsync(TestTimeout));
+        Assert.Equal(WorkerLinkFailureReason.RuntimeStopping, linkFailure.Reason);
+        Assert.Empty(scaleInManager.Current.OutstandingWorkerRemovals);
+        await retirement.WaitAsync(TestTimeout);
+        await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
+    }
+
+    [Fact]
+    public async Task RuntimeRetirementDisposalFailsPendingLinkOwnershipClosed()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        ChannelControl worker = new(
+            "worker",
+            blockStart: true,
+            completeResponsesOnRequestCompletion: false,
+            workerRemovalHandoffConfirmed: false);
+        harness.Enqueue(worker);
+        Task<WorkerLinkResult> link = registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        await worker.StartEntered.WaitAsync(TestTimeout);
+
+        IRuntimeRetirementWorkerManager manager = registry;
+        SplitScriptHostActivationFaulted condition = new(
+            manager.Incarnation,
+            new InvalidOperationException("activation failed"));
+        Assert.True(manager.TryCloseAdmission(condition));
+        Task<RuntimeRetirementDrainResult> retirement = manager.DrainAllWorkersAsync(
+            manager.Incarnation,
+            CancellationToken.None);
+        Assert.Equal(1, ((IHttpWorkerScaleInManager)registry).Current.LinkedWorkerCount);
+
+        await registry.DisposeAsync().AsTask().WaitAsync(TestTimeout);
+
+        RuntimeRetirementDrainResult result = await retirement.WaitAsync(TestTimeout);
+        Assert.False(result.IsComplete);
+        await Assert.ThrowsAnyAsync<Exception>(() => link.WaitAsync(TestTimeout));
     }
 
     [Theory]

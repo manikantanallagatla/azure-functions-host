@@ -18,7 +18,8 @@ R4 turns this one terminal Host-local condition into an ordered retirement:
 3. Bind the Host incarnation to AppServer, then request `Draining`, zero capacity, and
    `acquireClosed`.
 4. Wait for AppServer's existing capacity-fence acknowledgement.
-5. Select every attached Worker together once, drain committed work, and use graceful unlink.
+5. Select every attached Worker together once, drain committed work, and retain every
+   identity-bearing in-flight Link until primary or exact fallback ownership settles.
 6. Wait for any required exact worker-removal fallback acknowledgements.
 7. Publish sticky Runtime `RemovalRequested`.
 
@@ -103,6 +104,7 @@ sequenceDiagram
     Note over Host,Workers: No Worker is selected before this acknowledgement
     Host->>Registry: Select all attached Workers exactly once
     Registry->>Workers: Close new admission, drain committed work, graceful unlink
+    Note over Registry,Workers: In-flight identity-bearing Links remain counted until primary or exact fallback ownership settles
     Workers-->>Registry: Primary unlink outcomes
     alt graceful outcome is uncertain and exact Worker identity exists
         Registry-->>AppServer: Outstanding exact worker-removal fallback

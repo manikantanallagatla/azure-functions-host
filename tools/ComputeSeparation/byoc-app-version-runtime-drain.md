@@ -26,8 +26,10 @@ This change does not add:
 ## 2. Shared contract
 
 The request requires two known fields. Additive unknown fields are accepted for forward
-compatibility. Missing known fields, wrong JSON types, case-variant known field names, duplicate
-properties, malformed JSON, and invalid values return HTTP `400`.
+compatibility. Any property name that case-insensitively matches `mode` or `reason` must use the
+exact canonical lowercase spelling. Missing known fields, wrong JSON types, case-variant known
+field names, canonical-plus-alias combinations in either order, duplicate properties, malformed
+JSON, and invalid values return HTTP `400`.
 
 ```http
 POST /admin/functions/drain
@@ -109,6 +111,13 @@ classifies its pre-closure invocation readiness under the same channel lock used
 admission, then permanently closes Runtime admission. A concurrent P1 or R2 drain either commits
 first and is tracked as pre-existing work, or observes Runtime retirement and cannot create a later
 selection.
+
+An identity-bearing Link attempt that has published its registry slot but is still initializing at
+admission closure remains counted as ownership-pending. If registration loses the state-lock race,
+Host closes the candidate request stream and accepts only WorkerProxy's exact removal trailer as
+primary ownership; otherwise it records the exact `RuntimeUnlink` fallback before disposal.
+Connection failure without a candidate also records the exact fallback. Final Runtime removal
+cannot publish until this pending ownership and any fallback action settle.
 
 If incarnation binding or the initial lifecycle fence fails, the API remains failed closed. One
 root-owned retirement publisher nevertheless continues publishing the retirement-pending Host
@@ -286,7 +295,7 @@ A timer alone cannot bypass fallback ownership.
 | `Functions.Rpc.Client/Registry/WorkerChannelRegistry.cs` | Atomic snapshot/closure, deterministic selection, existing-drain tracking, deadline handoff, and fallback reuse. |
 | `Functions.Rpc.Client/WorkerChannel/RpcClientWorkerChannel.cs` | Channel-local eligibility, admission closure, and app-version drain commitment. |
 | `Functions.Rpc.Client/Extensions/RpcClientServiceCollectionExtensions.cs` | Registry seam registration. |
-| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Twelve focused behavioral methods with a deterministic test clock. |
+| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Focused behavioral methods with a deterministic test clock. |
 
 ## 11. Behavioral evidence
 
