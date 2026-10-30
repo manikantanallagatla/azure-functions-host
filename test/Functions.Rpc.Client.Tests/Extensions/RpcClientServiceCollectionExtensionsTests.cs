@@ -35,6 +35,7 @@ public sealed class RpcClientServiceCollectionExtensionsTests
         AssertSingleton<WorkerChannelRegistry, WorkerChannelRegistry>(services);
         AssertSingletonFactory<IWorkerChannelRegistry>(services);
         AssertSingletonFactory<IHttpWorkerScaleInManager>(services);
+        AssertSingletonFactory<IAppVersionRuntimeDrainWorkerManager>(services);
         AssertSingleton<IWorkerFunctionMetadataProvider, RpcClientWorkerFunctionMetadataProvider>(services);
         Assert.DoesNotContain(services, descriptor => descriptor.ServiceType == typeof(RpcClientScriptHostStartupCoordinator));
         Assert.DoesNotContain(services, descriptor => descriptor.ServiceType == typeof(IHostedService));
@@ -58,6 +59,7 @@ public sealed class RpcClientServiceCollectionExtensionsTests
         AssertSingleton<WorkerChannelRegistry, WorkerChannelRegistry>(services);
         AssertSingletonFactory<IWorkerChannelRegistry>(services);
         AssertSingletonFactory<IHttpWorkerScaleInManager>(services);
+        AssertSingletonFactory<IAppVersionRuntimeDrainWorkerManager>(services);
         AssertSingleton<IWorkerFunctionMetadataProvider, RpcClientWorkerFunctionMetadataProvider>(services);
         AssertSingleton<IFunctionMetadataProvider, RpcClientFunctionMetadataProvider>(services);
         ServiceDescriptor coordinator = Assert.Single(services.Where(descriptor => descriptor.ServiceType == typeof(RpcClientScriptHostStartupCoordinator)));

@@ -26,7 +26,7 @@ namespace Azure.Functions.Rpc.Client;
 /// ScriptHost function set is known; only ready channels are available for invocation dispatch.
 /// </remarks>
 internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IHttpWorkerScaleInManager,
-    IWorkerCountScaleInManager, IRuntimeRetirementWorkerManager
+    IWorkerCountScaleInManager, IRuntimeRetirementWorkerManager, IAppVersionRuntimeDrainWorkerManager
 {
     private const int CompletedWorkerRemovalCapacity = 128;
     private const int DefaultHttpWorkerCapacity = 16;
@@ -62,6 +62,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
     private TaskCompletionSource<long> _scaleInStateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _scaleInStateVersion;
     private Task<RuntimeRetirementDrainResult> _runtimeRetirementDrainTask;
+    private RuntimeRetirementOwner _runtimeRetirementOwner;
     private bool _runtimeRetirementRequested;
 
     // Setup writers hold _stateLock; ready-channel readers observe this published signal without taking that lock.
@@ -104,6 +105,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         _scaleInStateCreatedTime = _timeProvider.GetUtcNow();
     }
 
+    private enum RuntimeRetirementOwner
+    {
+        None,
+        ActivationFault,
+        AppVersion,
+    }
+
     HttpWorkerScaleInState IHttpWorkerScaleInManager.Current
     {
         get
@@ -129,6 +137,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
     }
 
     RuntimeIncarnation IRuntimeRetirementWorkerManager.Incarnation => _runtimeIncarnation;
+
+    RuntimeIncarnation IAppVersionRuntimeDrainWorkerManager.Incarnation => _runtimeIncarnation;
 
     bool IRuntimeRetirementWorkerManager.IsRetirementRequested
     {
@@ -571,10 +581,11 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
             if (_runtimeRetirementRequested)
             {
-                return true;
+                return _runtimeRetirementOwner is RuntimeRetirementOwner.ActivationFault;
             }
 
             _runtimeRetirementRequested = true;
+            _runtimeRetirementOwner = RuntimeRetirementOwner.ActivationFault;
             foreach (WorkerSlot slot in _slots.Values)
             {
                 slot.Channel?.CloseRuntimeAdmission();
@@ -599,7 +610,9 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         lock (_stateLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (!_runtimeRetirementRequested || incarnation != _runtimeIncarnation)
+            if (!_runtimeRetirementRequested ||
+                _runtimeRetirementOwner is not RuntimeRetirementOwner.ActivationFault ||
+                incarnation != _runtimeIncarnation)
             {
                 throw new InvalidOperationException("Runtime retirement drain does not match the active retiring incarnation.");
             }
@@ -642,6 +655,154 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
 
         return drainTask.WaitAsync(cancellationToken);
+    }
+
+    bool IAppVersionRuntimeDrainWorkerManager.TryStartAppVersionDrain(
+        out AppVersionRuntimeDrainStart start)
+    {
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_runtimeRetirementRequested)
+            {
+                start = null;
+                return false;
+            }
+
+            _runtimeRetirementRequested = true;
+            _runtimeRetirementOwner = RuntimeRetirementOwner.AppVersion;
+            List<string> nonHttpWorkerIds = [];
+            List<string> httpWorkerIds = [];
+            List<string> nonReadyWorkerIds = [];
+            List<Task<bool>> existingDrains = [];
+            foreach ((string workerId, WorkerSlot slot) in _slots)
+            {
+                if (slot.DrainTask is not null)
+                {
+                    existingDrains.Add(slot.DrainTask);
+                }
+
+                if (slot.Channel is not { } channel ||
+                    !channel.CloseRuntimeAdmissionForAppVersionDrain(
+                        out bool isInvocationReady,
+                        out bool isHttp))
+                {
+                    continue;
+                }
+
+                if (isInvocationReady)
+                {
+                    (isHttp ? httpWorkerIds : nonHttpWorkerIds).Add(workerId);
+                }
+                else
+                {
+                    nonReadyWorkerIds.Add(workerId);
+                }
+            }
+
+            nonHttpWorkerIds.Sort(StringComparer.Ordinal);
+            httpWorkerIds.Sort(StringComparer.Ordinal);
+            nonReadyWorkerIds.Sort(StringComparer.Ordinal);
+            SignalReadyChannelsLocked();
+            SignalScaleInStateChangedLocked();
+            start = new(
+                _runtimeIncarnation,
+                nonHttpWorkerIds,
+                httpWorkerIds,
+                nonReadyWorkerIds,
+                existingDrains);
+            return true;
+        }
+    }
+
+    AppVersionRuntimeDrainSelection IAppVersionRuntimeDrainWorkerManager.SelectWorkers(
+        RuntimeIncarnation incarnation,
+        IReadOnlyList<string> workerIds,
+        DateTimeOffset invocationGraceDeadline)
+    {
+        ArgumentNullException.ThrowIfNull(workerIds);
+        return SelectAppVersionDrainWorkers(
+            incarnation,
+            workerIds,
+            invocationGraceDeadline);
+    }
+
+    AppVersionRuntimeDrainSelection IAppVersionRuntimeDrainWorkerManager.SelectAllRemainingWorkers(
+        RuntimeIncarnation incarnation,
+        DateTimeOffset invocationGraceDeadline)
+    {
+        string[] workerIds;
+        lock (_stateLock)
+        {
+            ValidateAppVersionDrainLocked(incarnation);
+            workerIds = [.. _slots.Keys.Order(StringComparer.Ordinal)];
+        }
+
+        return SelectAppVersionDrainWorkers(
+            incarnation,
+            workerIds,
+            invocationGraceDeadline);
+    }
+
+    private AppVersionRuntimeDrainSelection SelectAppVersionDrainWorkers(
+        RuntimeIncarnation incarnation,
+        IReadOnlyList<string> workerIds,
+        DateTimeOffset invocationGraceDeadline)
+    {
+        List<(string WorkerId, WorkerSlot Slot, Task InvocationDrainTask, TaskCompletionSource<bool> Completion)> selections = [];
+        lock (_stateLock)
+        {
+            ValidateAppVersionDrainLocked(incarnation);
+            foreach (string workerId in workerIds)
+            {
+                if (!_slots.TryGetValue(workerId, out WorkerSlot slot) ||
+                    slot.DrainTask is not null ||
+                    slot.Channel is not { } channel ||
+                    channel.BeginAppVersionRuntimeDrain() is not { } invocationDrainTask)
+                {
+                    continue;
+                }
+
+                TaskCompletionSource<bool> completion =
+                    new(TaskCreationOptions.RunContinuationsAsynchronously);
+                slot.DrainTask = completion.Task;
+                selections.Add((workerId, slot, invocationDrainTask, completion));
+            }
+
+            if (selections.Count > 0)
+            {
+                SignalReadyChannelsLocked();
+                SignalScaleInStateChangedLocked();
+            }
+        }
+
+        foreach (var selection in selections)
+        {
+            _ = CompleteDrainAsync(
+                selection.WorkerId,
+                selection.Slot,
+                selection.InvocationDrainTask,
+                selection.Completion,
+                invocationGraceDeadline);
+            Log.AppVersionDrainWorkerSelected(
+                _logger,
+                selection.WorkerId,
+                invocationGraceDeadline);
+        }
+
+        return new([.. selections.Select(static selection => selection.Completion.Task)]);
+    }
+
+    private void ValidateAppVersionDrainLocked(RuntimeIncarnation incarnation)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_runtimeRetirementRequested ||
+            _runtimeRetirementOwner is not RuntimeRetirementOwner.AppVersion ||
+            incarnation != _runtimeIncarnation)
+        {
+            throw new InvalidOperationException(
+                "The app-version Runtime drain does not match the active retiring incarnation.");
+        }
     }
 
     private async Task LinkAndCompleteAsync(string workerId, Uri grpcEndpoint, WorkerSlot slot, TaskCompletionSource<WorkerChannel> linkCompletion,
@@ -1174,11 +1335,44 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         string workerId,
         WorkerSlot slot,
         Task invocationDrainTask,
-        TaskCompletionSource<bool> drainCompletion)
+        TaskCompletionSource<bool> drainCompletion,
+        DateTimeOffset? invocationGraceDeadline = null)
     {
         try
         {
-            await invocationDrainTask.WaitAsync(_shutdownSource.Token);
+            if (invocationGraceDeadline is null)
+            {
+                await invocationDrainTask.WaitAsync(_shutdownSource.Token);
+            }
+            else
+            {
+                TimeSpan remaining = invocationGraceDeadline.Value - _timeProvider.GetUtcNow();
+                if (remaining > TimeSpan.Zero)
+                {
+                    Task deadline = Task.Delay(remaining, _timeProvider, _shutdownSource.Token);
+                    Task completed = await Task.WhenAny(invocationDrainTask, deadline);
+                    if (ReferenceEquals(completed, invocationDrainTask))
+                    {
+                        await invocationDrainTask.WaitAsync(_shutdownSource.Token);
+                    }
+                    else
+                    {
+                        await deadline;
+                        Log.AppVersionDrainGraceExpired(
+                            _logger,
+                            workerId,
+                            invocationGraceDeadline.Value);
+                    }
+                }
+                else
+                {
+                    Log.AppVersionDrainGraceExpired(
+                        _logger,
+                        workerId,
+                        invocationGraceDeadline.Value);
+                }
+            }
+
             bool unlinked = await UnlinkAsync(workerId, _shutdownSource.Token);
             if (!unlinked)
             {
@@ -1667,5 +1861,19 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             string functionGroup,
             bool isAlwaysReady,
             int newestCandidateCount);
+
+        [LoggerMessage(14, LogLevel.Information,
+            "Selected worker {WorkerId} for app-version Runtime drain with committed-invocation grace deadline {InvocationGraceDeadline}.")]
+        public static partial void AppVersionDrainWorkerSelected(
+            ILogger logger,
+            string workerId,
+            DateTimeOffset invocationGraceDeadline);
+
+        [LoggerMessage(15, LogLevel.Warning,
+            "Committed-invocation grace expired for app-version draining worker {WorkerId} at {InvocationGraceDeadline}; closing its channel.")]
+        public static partial void AppVersionDrainGraceExpired(
+            ILogger logger,
+            string workerId,
+            DateTimeOffset invocationGraceDeadline);
     }
 }

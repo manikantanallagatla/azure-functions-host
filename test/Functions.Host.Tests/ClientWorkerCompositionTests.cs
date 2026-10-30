@@ -75,6 +75,7 @@ public class ClientWorkerCompositionTests
             "Azure.Functions.Rpc.Client.WorkerChannelRegistry");
         AssertSingletonFactory(services, "Azure.Functions.Rpc.Client.IWorkerChannelRegistry");
         AssertSingletonFactory(services, "Azure.Functions.Rpc.Client.IHttpWorkerScaleInManager");
+        AssertSingletonFactory(services, "Azure.Functions.Rpc.Client.IAppVersionRuntimeDrainWorkerManager");
         AssertSingleton(services, "Microsoft.Azure.WebJobs.Script.IWorkerFunctionMetadataProvider",
             "Azure.Functions.Rpc.Client.RpcClientWorkerFunctionMetadataProvider");
         AssertSingleton(services, "Microsoft.Azure.WebJobs.Script.WebHost.IWebHostWorkerManager",

@@ -525,6 +525,51 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
         }
     }
 
+    internal bool CloseRuntimeAdmissionForAppVersionDrain(
+        out bool isInvocationReady,
+        out bool isHttp)
+    {
+        lock (_invocationAdmissionLock)
+        {
+            bool isDrainCandidate =
+                !_draining &&
+                !_terminalAdmissionClosed &&
+                !IsTerminated;
+            isInvocationReady =
+                isDrainCandidate &&
+                _scaleInReady &&
+                IsChannelReadyForInvocations();
+            isHttp = IsHttpFunctionGroup;
+            Volatile.Write(ref _runtimeAdmissionClosed, true);
+            _scaleInReservationId = null;
+            _idleSinceTimestamp = null;
+            return isDrainCandidate;
+        }
+    }
+
+    internal Task BeginAppVersionRuntimeDrain()
+    {
+        lock (_invocationAdmissionLock)
+        {
+            if (!_runtimeAdmissionClosed)
+            {
+                throw new InvalidOperationException(
+                    "Runtime invocation admission must close before app-version Worker drain selection.");
+            }
+
+            if (_draining ||
+                _terminalAdmissionClosed ||
+                IsTerminated)
+            {
+                return null;
+            }
+
+            Volatile.Write(ref _draining, true);
+            CompleteDrainIfReadyLocked();
+            return _drainCompletion.Task;
+        }
+    }
+
     internal Task BeginRuntimeRetirementDrain()
     {
         lock (_invocationAdmissionLock)

@@ -25,6 +25,9 @@ internal static class AppServerHostStateServiceCollectionExtensions
         services.AddSingleton<RuntimeRetirementManager>();
         services.AddSingleton<IRuntimeRetirementManager>(
             provider => provider.GetRequiredService<RuntimeRetirementManager>());
+        services.AddSingleton<AppVersionRuntimeDrainManager>();
+        services.AddSingleton<IAppVersionRuntimeDrainManager>(
+            provider => provider.GetRequiredService<AppVersionRuntimeDrainManager>());
         services.AddSingleton<IHostedService, HttpOnDemandWorkerScaleInService>();
 
         return services;

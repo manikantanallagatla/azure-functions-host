@@ -39,6 +39,8 @@ public static class RpcClientServiceCollectionExtensions
         services.AddSingleton<IHttpWorkerScaleInManager>(provider => provider.GetRequiredService<WorkerChannelRegistry>());
         services.AddSingleton<IWorkerCountScaleInManager>(provider => provider.GetRequiredService<WorkerChannelRegistry>());
         services.AddSingleton<IRuntimeRetirementWorkerManager>(provider => provider.GetRequiredService<WorkerChannelRegistry>());
+        services.AddSingleton<IAppVersionRuntimeDrainWorkerManager>(
+            provider => provider.GetRequiredService<WorkerChannelRegistry>());
         services.AddSingleton<IWorkerFunctionMetadataProvider, RpcClientWorkerFunctionMetadataProvider>();
         services.Configure<FunctionMetadataOptions>(options => options.UseWorkerRuntimeFromMetadata = true);
 
