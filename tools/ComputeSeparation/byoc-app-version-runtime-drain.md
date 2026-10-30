@@ -25,16 +25,15 @@ This change does not add:
 
 ## 2. Shared contract
 
-The request requires three known fields. Additive unknown fields are accepted for forward
+The request requires two known fields. Additive unknown fields are accepted for forward
 compatibility. Missing known fields, wrong JSON types, case-variant known field names, duplicate
-properties, malformed JSON, invalid values, and a zero operation ID return HTTP `400`.
+properties, malformed JSON, and invalid values return HTTP `400`.
 
 ```http
 POST /admin/functions/drain
 Content-Type: application/json
 
 {
-  "operationId": "47bf3a08-900a-48b3-a0f1-f6baa87191f0",
   "mode": "Phased",
   "reason": "ConfigurationChange"
 }
@@ -42,40 +41,38 @@ Content-Type: application/json
 
 | Field | Accepted values |
 | --- | --- |
-| `operationId` | Required nonzero GUID. |
 | `mode` | `Phased` or `Immediate`. |
 | `reason` | `ConfigurationChange`, `Stop`, `Delete`, `Restart`, or `TriggerDiscoveryComplete`. |
 
 `TriggerDiscoveryComplete` is valid only with `Immediate`; pairing it with `Phased` returns HTTP
 `400`.
 
-The success response is HTTP `200` and contains exactly three fields:
+The success response is HTTP `200` and contains exactly two fields:
 
 ```json
 {
-  "operationId": "47bf3a08-900a-48b3-a0f1-f6baa87191f0",
   "mode": "Phased",
   "acceptedAtUtc": "2026-10-30T00:00:00+00:00"
 }
 ```
 
-`acceptedAtUtc` is the Host-authoritative RFC 3339 acceptance time. The operation ID and mode match
-the request. Scheduling details, reason, batch size, deadlines, Worker IDs, and Runtime incarnation
-remain private Host state.
+`acceptedAtUtc` is the Host-authoritative RFC 3339 acceptance time for the active mode. Scheduling
+details, reason, batch size, deadlines, Worker IDs, and Runtime incarnation remain private Host
+state.
 
 | Result | HTTP behavior |
 | --- | --- |
-| First valid operation | `200` only after local Link/invocation admission is closed and AppServer acknowledges `lifecycle-required`. |
-| Exact operation ID and payload replay | Original immutable receipt; snapshots and deadlines are not reset. |
-| Same operation ID with different payload | `409`. |
-| Different operation while Phased is active | `409`, except for the one allowed Immediate escalation. |
-| Different operation after Immediate is active | `409`. |
-| Invalid mode, reason, required field, body, duplicate property, or zero GUID | `400`. |
-| AppServer admission fence cannot be committed | Non-success response with no receipt. |
+| First valid mode | `200` only after local Link/invocation admission is closed and AppServer acknowledges `lifecycle-required`. |
+| Request for the active mode with any valid reason | Existing immutable receipt; snapshots, timers, selections, and deadlines are not reset. |
+| `Phased` while `Immediate` is active | `409`; the Runtime cannot downgrade or restart. |
+| `Immediate` while `Phased` is active | One allowed escalation with a new Immediate receipt. |
+| Invalid mode, reason, required field, body, or duplicate property | `400`. |
+| Admission or background lifecycle failure | Non-success response with no receipt, including repeated active-mode requests. |
 
 The coordinated Go relay at commit `7350d9e1e6273810569d1320df140576c3098804`
 forwards the request once, preserves Host non-success status/body/content type, and treats an invalid
-or unexpected Host `200` as `502`. Host therefore owns all replay, conflict, and escalation behavior.
+or unexpected Host `200` as `502`. Host therefore owns all state-based idempotency, conflict, and
+escalation behavior.
 
 ## 3. Shared admission and retirement sequence
 
@@ -89,8 +86,8 @@ sequenceDiagram
     participant Workers
 
     Legion->>AppServer: Runtime drain operation
-    AppServer->>API: POST operationId, mode, reason
-    API->>Coordinator: Accept exact fingerprint
+    AppServer->>API: POST mode, reason
+    API->>Coordinator: Accept requested mode
     Coordinator->>Registry: Close Link and invocation admission
     Registry-->>Coordinator: Runtime incarnation + one-time Worker snapshot
     Coordinator->>AppServer: Bind runtimeIncarnationId
@@ -100,8 +97,8 @@ sequenceDiagram
     Note over Coordinator: acceptedAtUtc is committed here
     Coordinator->>Registry: Select Workers according to active mode
     Coordinator-->>API: Immutable receipt
-    API-->>AppServer: HTTP 200 exact receipt
-    AppServer-->>Legion: Exact receipt
+    API-->>AppServer: HTTP 200 receipt
+    AppServer-->>Legion: Active-mode receipt
     Registry->>Workers: Existing drain, graceful unlink, fallback if uncertain
     Coordinator->>AppServer: Draining progress and fallback actions
     Coordinator->>AppServer: RemovalRequested only after links and fallbacks clear
@@ -148,8 +145,8 @@ The deadline bounds committed-invocation grace, not AppServer acknowledgement la
 already draining through R2 or P1 retain their existing drain and remain part of Runtime completion;
 P2 does not replace or reset that work.
 
-Exact replay returns the original receipt and does not recreate the snapshot, restart the 0/10/20/
-30/35/40-second schedule, or move any Worker deadline.
+A repeated Phased request with any valid reason returns the original receipt and does not recreate
+the snapshot, restart the 0/10/20/30/35/40-second schedule, or move any Worker deadline.
 
 ## 5. Immediate cleanup and escalation
 
@@ -164,31 +161,30 @@ set or deadline policy.
 semantics. Trigger discovery must use `Immediate`, including when the discovery Runtime has no
 Worker. The existing manager publishes `Draining`, drains and unlinks any discovery Worker, waits
 for an uncertain unlink fallback acknowledgement when necessary, and publishes
-`RemovalRequested` only after all links and fallback actions clear. The reason remains part of the
-exact operation fingerprint and structured diagnostics; Legion owns its external meaning.
+`RemovalRequested` only after all links and fallback actions clear. The reason remains structured
+diagnostic context for the first accepted mode or escalation; Legion owns its external meaning.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Phased: first Phased accepted
     [*] --> Immediate: first Immediate accepted
-    Phased --> Immediate: one new Immediate operation
-    Phased --> Phased: exact Phased replay
-    Immediate --> Immediate: exact known replay
-    Phased --> Conflict: other differing operation
-    Immediate --> Conflict: downgrade or other differing operation
+    Phased --> Immediate: first Immediate request
+    Phased --> Phased: repeated Phased request
+    Immediate --> Immediate: repeated Immediate request
+    Immediate --> Conflict: Phased downgrade
 ```
 
 During the one allowed Phased-to-Immediate escalation:
 
-1. Host retains the original Phased receipt for exact replay.
-2. Host cancels or neutralizes future Phased timer selections.
-3. Already-selected Workers keep their original P2 deadlines.
-4. Every remaining eligible Worker is selected once with an escalation-time deadline.
-5. Host returns and retains the new Immediate receipt.
-6. Phased cannot resume and another differing operation returns `409`.
+1. Host cancels or neutralizes future Phased timer selections.
+2. Already-selected Workers keep their original P2 deadlines.
+3. Every remaining eligible Worker is selected once with an escalation-time deadline.
+4. Host returns and retains the new Immediate receipt.
+5. Repeated Immediate requests return that receipt regardless of valid reason.
+6. Phased cannot resume; a later Phased request returns `409`.
 
-The coordinator retains at most the initial operation and one escalation. It is not a generalized
-operation-history or workflow framework.
+The coordinator retains only the active-mode acceptance tasks needed for state idempotency. It is
+not a generalized operation-history or workflow framework.
 
 ## 6. Deadline, unlink, and fallback behavior
 
@@ -225,8 +221,8 @@ A timer alone cannot bypass fallback ownership.
 | Component | Owns | Does not own |
 | --- | --- | --- |
 | Legion | Action detection, trigger-discovery completion, Runtime-set capture, durable operation state, Recreate/RollingUpdate policy, discovery, and physical deletion. | Host-local Worker scheduling or invocation admission. |
-| Go AppServer relay | Authenticated one-shot relay, Host response preservation, and invalid-`200` rejection. | Retry, replay, conflict, escalation, or Worker selection. |
-| Host controller/coordinator | Strict request validation, exact fingerprint, one optional escalation, receipt, fence ordering, schedule, progress, and final Runtime lifecycle. | Durable recovery or external app-version policy. |
+| Go AppServer relay | Authenticated one-shot relay, Host response preservation, and invalid-`200` rejection. | State idempotency, conflict, escalation, or Worker selection. |
+| Host controller/coordinator | Strict request validation, active-mode idempotency, one optional escalation, receipt, fence ordering, schedule, progress, and final Runtime lifecycle. | Durable recovery or external app-version policy. |
 | Worker registry/channel | Atomic admission closure, deterministic eligibility, existing-drain tracking, invocation grace, unlink, and fallback creation. | AppServer lifecycle acknowledgement or physical deletion. |
 | WorkerProxy | Existing sticky primary Worker `RemovalRequested`. | P2/P3 scheduling or Runtime finalization. |
 
@@ -241,15 +237,15 @@ A timer alone cannot bypass fallback ownership.
 - AppServer lifecycle publication remains serialized through the existing Host-state client gate.
 - Any bind, lifecycle fence, progress, or final-removal publication failure leaves the Runtime
   locally closed and does not create a success-shaped response or completion.
-- A failed lifecycle task is latched. A later Phased-to-Immediate escalation is rejected instead of
-  returning a receipt for a schedule that no longer has a finalization owner.
+- A failed schedule or lifecycle task is latched. Repeated active-mode requests and later escalation
+  fail instead of returning a receipt for a schedule that no longer has a finalization owner.
 
 ## 9. Assumptions and known limitations
 
-- AppServer uses the coordinated one-shot relay and exact contract from
-  `7350d9e1e6273810569d1320df140576c3098804`.
-- Bala's Legion change supplies unique operation IDs, performs durable replay, and owns external
-  reason semantics, trigger-discovery completion, and Runtime-set reconciliation.
+- AppServer uses the coordinated one-shot relay with the same two-field request and two-field
+  receipt contract.
+- Bala's Legion change owns external reason semantics, trigger-discovery completion, Runtime-set
+  reconciliation, and any durable retry policy.
 - WorkerProxy capability finalization remains the trusted source of function group and always-ready
   class.
 - Host-process loss during an active Phased or Immediate drain is deferred. The AppServer lifecycle
@@ -265,29 +261,32 @@ A timer alone cannot bypass fallback ownership.
 | `Functions.Host/Controllers/RuntimeDrainController.cs` | Authenticated API, validation, exact receipt, `400`/`409`/failure mapping. |
 | `Functions.Host/Models/RuntimeDrainRequest.cs` | Required known request fields with additive-field compatibility, receipt, enum, and error wire shapes. |
 | `Functions.Host/HostState/IAppVersionRuntimeDrainManager.cs` | Narrow public controller dependency. |
-| `Functions.Host/HostState/AppVersionRuntimeDrainManager.cs` | One in-memory P2/P3 coordinator, replay, escalation, timers, progress, and final lifecycle. |
+| `Functions.Host/HostState/AppVersionRuntimeDrainManager.cs` | One in-memory P2/P3 coordinator, active-mode idempotency, escalation, timers, progress, and final lifecycle. |
 | `Functions.Host/HostState/AppServerHostStateServiceCollectionExtensions.cs` | Root coordinator registration. |
 | `Functions.Rpc.Client/Retirement/IAppVersionRuntimeDrainWorkerManager.cs` | Narrow Host-to-registry admission and selection seam. |
 | `Functions.Rpc.Client/Registry/WorkerChannelRegistry.cs` | Atomic snapshot/closure, deterministic selection, existing-drain tracking, deadline handoff, and fallback reuse. |
 | `Functions.Rpc.Client/WorkerChannel/RpcClientWorkerChannel.cs` | Channel-local eligibility, admission closure, and app-version drain commitment. |
 | `Functions.Rpc.Client/Extensions/RpcClientServiceCollectionExtensions.cs` | Registry seam registration. |
-| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Six public-API behavioral tests with a deterministic test clock. |
+| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Eight public-API behavioral tests with a deterministic test clock. |
 
 ## 11. Behavioral evidence
 
-The six focused in-memory public-API methods prove:
+The eight focused in-memory public-API methods prove:
 
-1. synchronous lifecycle fence commitment, exact three-field receipt, exact replay, conflict,
+1. synchronous lifecycle fence commitment, exact two-field receipt, active-mode idempotency,
    additive-field compatibility, ordinal required property names, duplicate/type/malformed
    rejection, non-ready linked-Worker ownership, and closed late Link admission;
-2. deterministic 20% non-HTTP batches at 0/10/20/30/40 seconds, HTTP selection at 35 seconds, and
-   replay without schedule reset;
-3. per-selection 60-minute deadline fallback plus completion ownership for a pre-existing P1 drain;
-4. first Immediate selection across HTTP/non-HTTP and on-demand/always-ready classes, exact replay,
-   and downgrade/different-operation conflict;
-5. Phased-to-Immediate escalation with original P2 deadline preservation, escalation-time deadlines
-   for new selections, both known receipt replays, and one-way mode progression.
-6. lifecycle-progress publication failure is latched and prevents a later escalation receipt.
+2. Immediate-only trigger-discovery cleanup for an empty Runtime with active-mode idempotency;
+3. trigger-discovery completion waits for exact Worker fallback acknowledgement;
+4. deterministic 20% non-HTTP batches at 0/10/20/30/40 seconds, HTTP selection at 35 seconds, and
+   repeated Phased requests without schedule reset;
+5. per-selection 60-minute deadline fallback plus completion ownership for a pre-existing P1 drain;
+6. first Immediate selection across HTTP/non-HTTP and on-demand/always-ready classes, repeated
+   Immediate requests across valid reasons, and downgrade conflict;
+7. Phased-to-Immediate escalation with original P2 deadline preservation, escalation-time deadlines
+   for new selections, repeated Immediate idempotency, and one-way mode progression.
+8. lifecycle-progress publication failure is latched and prevents repeated-mode or escalation
+   receipts.
 
 Validation commands and final results are recorded in the branch handoff after all affected P1, R4,
 Host, and RPC suites complete.

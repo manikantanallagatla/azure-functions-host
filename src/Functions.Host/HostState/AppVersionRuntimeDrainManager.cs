@@ -65,17 +65,11 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     private bool _selectionFinalized;
 
     public Task<RuntimeDrainReceipt> AcceptAsync(
-        Guid operationId,
         RuntimeDrainMode mode,
         RuntimeDrainReason reason)
     {
         lock (_operationLock)
         {
-            if (TryGetReplayLocked(operationId, mode, reason, out Task<RuntimeDrainReceipt>? replay))
-            {
-                return replay!;
-            }
-
             if (_initialOperation is null)
             {
                 if (!_workerManager.TryStartAppVersionDrain(out AppVersionRuntimeDrainStart? start))
@@ -86,10 +80,29 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
                 _initialStart = start;
                 _activeMode = mode;
-                OperationRecord operation = new(operationId, mode, reason);
+                OperationRecord operation = new(mode, reason);
                 _initialOperation = operation;
                 operation.AdmissionTask = AdmitInitialAsync(operation, start);
                 return operation.AdmissionTask;
+            }
+
+            if (_activeMode is RuntimeDrainMode.Immediate &&
+                mode is RuntimeDrainMode.Phased)
+            {
+                throw new RuntimeDrainConflictException(
+                    "The Runtime is already executing an Immediate drain operation.");
+            }
+
+            ThrowIfDrainFailedLocked();
+            if (_escalationOperation is not null &&
+                mode is RuntimeDrainMode.Immediate)
+            {
+                return _escalationOperation.AdmissionTask;
+            }
+
+            if (_activeMode == mode)
+            {
+                return _initialOperation.AdmissionTask;
             }
 
             if (_activeMode is RuntimeDrainMode.Phased &&
@@ -97,8 +110,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                 _escalationOperation is null &&
                 !_finalizationStarted)
             {
-                ThrowIfLifecycleFailedLocked();
-                OperationRecord operation = new(operationId, mode, reason);
+                OperationRecord operation = new(mode, reason);
                 _escalationOperation = operation;
                 operation.AdmissionTask = EscalateAsync(operation, _initialOperation.AdmissionTask);
                 return operation.AdmissionTask;
@@ -142,7 +154,6 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
         DateTimeOffset acceptedAtUtc = _timeProvider.GetUtcNow();
         RuntimeDrainReceipt receipt = new(
-            operation.OperationId,
             operation.Mode.ToString(),
             acceptedAtUtc);
 
@@ -190,7 +201,6 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
         Log.Accepted(
             _logger,
-            operation.OperationId,
             operation.Mode,
             operation.Reason,
             start.Incarnation.Value,
@@ -208,7 +218,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
         lock (_operationLock)
         {
-            ThrowIfLifecycleFailedLocked();
+            ThrowIfDrainFailedLocked();
             if (_finalizationStarted)
             {
                 throw new RuntimeDrainConflictException(
@@ -224,13 +234,11 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
         Log.Escalated(
             _logger,
-            operation.OperationId,
             operation.Reason,
             _workerManager.Incarnation.Value,
             acceptedAtUtc);
 
         return new(
-            operation.OperationId,
             operation.Mode.ToString(),
             acceptedAtUtc);
     }
@@ -501,42 +509,6 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         SignalOperationChangedLocked();
     }
 
-    private bool TryGetReplayLocked(
-        Guid operationId,
-        RuntimeDrainMode mode,
-        RuntimeDrainReason reason,
-        out Task<RuntimeDrainReceipt>? replay)
-    {
-        if (_initialOperation is not null && _initialOperation.OperationId == operationId)
-        {
-            replay = GetMatchingReplay(_initialOperation, mode, reason);
-            return true;
-        }
-
-        if (_escalationOperation is not null && _escalationOperation.OperationId == operationId)
-        {
-            replay = GetMatchingReplay(_escalationOperation, mode, reason);
-            return true;
-        }
-
-        replay = null;
-        return false;
-    }
-
-    private static Task<RuntimeDrainReceipt> GetMatchingReplay(
-        OperationRecord operation,
-        RuntimeDrainMode mode,
-        RuntimeDrainReason reason)
-    {
-        if (operation.Mode != mode || operation.Reason != reason)
-        {
-            throw new RuntimeDrainConflictException(
-                "The operation identifier is already associated with a different drain payload.");
-        }
-
-        return operation.AdmissionTask;
-    }
-
     private async Task DelayUntilAsync(DateTimeOffset target, CancellationToken cancellationToken)
     {
         TimeSpan delay = target - _timeProvider.GetUtcNow();
@@ -553,13 +525,14 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         changed.TrySetResult();
     }
 
-    private void ThrowIfLifecycleFailedLocked()
+    private void ThrowIfDrainFailedLocked()
     {
-        if (_lifecycleFailure is not null)
+        Exception? failure = _lifecycleFailure ?? _selectionFailure;
+        if (failure is not null)
         {
             throw new RuntimeDrainAdmissionException(
                 "The active Runtime drain lifecycle has already failed.",
-                _lifecycleFailure);
+                failure);
         }
     }
 
@@ -597,15 +570,12 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     }
 
     private sealed class OperationRecord(
-        Guid operationId,
         RuntimeDrainMode mode,
         RuntimeDrainReason reason)
     {
         public Task<RuntimeDrainReceipt> AdmissionTask { get; set; } = null!;
 
         public RuntimeDrainMode Mode { get; } = mode;
-
-        public Guid OperationId { get; } = operationId;
 
         public RuntimeDrainReason Reason { get; } = reason;
     }
@@ -614,20 +584,18 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     {
         // EventId range is 1210-1219
         [LoggerMessage(1210, LogLevel.Information,
-            "Accepted Runtime drain operation {OperationId} in {Mode} mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
+            "Accepted Runtime drain in {Mode} mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
         public static partial void Accepted(
             ILogger logger,
-            Guid operationId,
             RuntimeDrainMode mode,
             RuntimeDrainReason reason,
             Guid runtimeIncarnation,
             DateTimeOffset acceptedAtUtc);
 
         [LoggerMessage(1211, LogLevel.Warning,
-            "Escalated Runtime drain operation {OperationId} to Immediate mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
+            "Escalated Runtime drain to Immediate mode for reason {Reason}, Runtime incarnation {RuntimeIncarnation}, at {AcceptedAtUtc}.")]
         public static partial void Escalated(
             ILogger logger,
-            Guid operationId,
             RuntimeDrainReason reason,
             Guid runtimeIncarnation,
             DateTimeOffset acceptedAtUtc);

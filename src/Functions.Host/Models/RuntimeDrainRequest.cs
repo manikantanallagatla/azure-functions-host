@@ -61,12 +61,6 @@ public enum RuntimeDrainReason
 public sealed class RuntimeDrainRequest
 {
     /// <summary>
-    /// Gets or sets the caller-owned idempotency identifier.
-    /// </summary>
-    [JsonProperty("operationId")]
-    public Guid? OperationId { get; set; }
-
-    /// <summary>
     /// Gets or sets the string drain mode.
     /// </summary>
     [JsonProperty("mode")]
@@ -82,7 +76,6 @@ public sealed class RuntimeDrainRequest
 internal sealed class RuntimeDrainRequestJsonConverter : JsonConverter
 {
     private const string ModePropertyName = "mode";
-    private const string OperationIdPropertyName = "operationId";
     private const string ReasonPropertyName = "reason";
 
     public override bool CanWrite => false;
@@ -104,18 +97,15 @@ internal sealed class RuntimeDrainRequestJsonConverter : JsonConverter
                 DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error,
             });
 
-        if (body.Property(OperationIdPropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } operationIdProperty ||
-            body.Property(ModePropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } modeProperty ||
-            body.Property(ReasonPropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } reasonProperty ||
-            !Guid.TryParse(operationIdProperty.Value.Value<string>(), out Guid operationId))
+        if (body.Property(ModePropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } modeProperty ||
+            body.Property(ReasonPropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } reasonProperty)
         {
             throw new JsonSerializationException(
-                "The Runtime drain request must contain string operationId, mode, and reason properties.");
+                "The Runtime drain request must contain string mode and reason properties.");
         }
 
         return new RuntimeDrainRequest
         {
-            OperationId = operationId,
             Mode = modeProperty.Value.Value<string>(),
             Reason = reasonProperty.Value.Value<string>(),
         };
@@ -128,11 +118,9 @@ internal sealed class RuntimeDrainRequestJsonConverter : JsonConverter
 /// <summary>
 /// Confirms irreversible Host admission closure and the AppServer lifecycle fence.
 /// </summary>
-/// <param name="OperationId">The accepted caller-owned operation identifier.</param>
 /// <param name="Mode">The accepted canonical drain mode.</param>
 /// <param name="AcceptedAtUtc">The Host-authoritative UTC acceptance time.</param>
 public sealed record RuntimeDrainReceipt(
-    [property: JsonProperty("operationId")] Guid OperationId,
     [property: JsonProperty("mode")] string Mode,
     [property: JsonProperty("acceptedAtUtc")] DateTimeOffset AcceptedAtUtc);
 

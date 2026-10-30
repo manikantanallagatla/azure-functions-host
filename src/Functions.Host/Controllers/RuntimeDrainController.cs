@@ -40,7 +40,7 @@ public sealed partial class RuntimeDrainController : Controller
     /// <summary>
     /// Commits one idempotent Runtime drain operation.
     /// </summary>
-    /// <param name="request">The exact operation identifier, mode, and reason.</param>
+    /// <param name="request">The exact mode and reason.</param>
     /// <param name="cancellationToken">Cancels only before irreversible admission begins.</param>
     /// <returns>The immutable Host acceptance receipt.</returns>
     [HttpPost]
@@ -52,7 +52,6 @@ public sealed partial class RuntimeDrainController : Controller
     {
         IReadOnlyList<RequestValidationError> errors = ValidateRequest(
             request,
-            out Guid operationId,
             out RuntimeDrainMode mode,
             out RuntimeDrainReason reason);
         if (errors.Count > 0)
@@ -63,19 +62,19 @@ public sealed partial class RuntimeDrainController : Controller
         cancellationToken.ThrowIfCancellationRequested();
         try
         {
-            RuntimeDrainReceipt receipt = await _manager.AcceptAsync(operationId, mode, reason);
+            RuntimeDrainReceipt receipt = await _manager.AcceptAsync(mode, reason);
             return Ok(receipt);
         }
         catch (RuntimeDrainConflictException exception)
         {
-            Log.Conflict(_logger, operationId, exception.Message);
+            Log.Conflict(_logger, mode, exception.Message);
             return StatusCode(
                 StatusCodes.Status409Conflict,
                 new RuntimeDrainErrorResponse(new(ErrorCodes.DrainConflict, exception.Message)));
         }
         catch (RuntimeDrainAdmissionException exception)
         {
-            Log.AdmissionFailed(_logger, exception, operationId);
+            Log.AdmissionFailed(_logger, exception, mode);
             return StatusCode(
                 StatusCodes.Status503ServiceUnavailable,
                 new RuntimeDrainErrorResponse(new(
@@ -86,11 +85,9 @@ public sealed partial class RuntimeDrainController : Controller
 
     private IReadOnlyList<RequestValidationError> ValidateRequest(
         RuntimeDrainRequest? request,
-        out Guid operationId,
         out RuntimeDrainMode mode,
         out RuntimeDrainReason reason)
     {
-        operationId = default;
         mode = default;
         reason = default;
         List<RequestValidationError> errors = [];
@@ -99,19 +96,6 @@ public sealed partial class RuntimeDrainController : Controller
         {
             errors.Add(new(ErrorCodes.InvalidBody, "request"));
             return errors;
-        }
-
-        if (request.OperationId is null)
-        {
-            errors.Add(new(ErrorCodes.Required, "operationId"));
-        }
-        else if (request.OperationId == Guid.Empty)
-        {
-            errors.Add(new(ErrorCodes.InvalidValue, "operationId"));
-        }
-        else
-        {
-            operationId = request.OperationId.Value;
         }
 
         if (string.IsNullOrWhiteSpace(request.Mode))
@@ -209,17 +193,17 @@ public sealed partial class RuntimeDrainController : Controller
     {
         // EventId range is 720-729
         [LoggerMessage(720, LogLevel.Warning,
-            "Rejected conflicting Runtime drain operation {OperationId}: {Reason}.")]
+            "Rejected conflicting Runtime drain request in {Mode} mode: {Detail}.")]
         public static partial void Conflict(
             ILogger logger,
-            Guid operationId,
-            string reason);
+            RuntimeDrainMode mode,
+            string detail);
 
         [LoggerMessage(721, LogLevel.Error,
-            "Failed to commit Runtime drain operation {OperationId}.")]
+            "Failed to commit Runtime drain request in {Mode} mode.")]
         public static partial void AdmissionFailed(
             ILogger logger,
             Exception exception,
-            Guid operationId);
+            RuntimeDrainMode mode);
     }
 }

@@ -36,7 +36,7 @@ public sealed partial class WorkerChannelRegistryTests
     private static readonly TimeSpan AppVersionUnlinkTimeout = TimeSpan.FromMilliseconds(100);
 
     [Fact]
-    public async Task PostRuntimeDrain_PhasedCommitsFenceReturnsExactReceiptAndValidatesKnownFields()
+    public async Task PostRuntimeDrain_PhasedCommitsFenceReturnsStateReceiptAndValidatesKnownFields()
     {
         DrainManualTimeProvider timeProvider = new();
         RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
@@ -67,9 +67,8 @@ public sealed partial class WorkerChannelRegistryTests
             registry,
             handler,
             timeProvider);
-        Guid operationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f0");
         Task<HttpResponseMessage> request = host.PostAsync(
-            $$"""{"operationId":"{{operationId}}","mode":"Phased","reason":"ConfigurationChange","extra":true}""");
+            """{"mode":"Phased","reason":"ConfigurationChange","extra":true}""");
         await handler.DrainFenceObserved.Task.WaitAsync(TestTimeout);
 
         Assert.False(request.IsCompleted);
@@ -94,64 +93,41 @@ public sealed partial class WorkerChannelRegistryTests
         handler.AllowDrainFence.TrySetResult();
         using HttpResponseMessage accepted = await request.WaitAsync(TestTimeout);
         DrainReceipt firstReceipt = await ReadDrainReceiptAsync(accepted);
-        Assert.Equal(operationId, firstReceipt.OperationId);
         Assert.Equal("Phased", firstReceipt.Mode);
         Assert.Equal(timeProvider.GetUtcNow(), firstReceipt.AcceptedAtUtc);
         await WaitUntilAsync(() => readinessPending.DisposeCount == 1);
 
-        using HttpResponseMessage replay = await host.PostAsync(CreateDrainJson(
-            operationId,
-            "Phased",
-            "ConfigurationChange"));
-        Assert.Equal(firstReceipt, await ReadDrainReceiptAsync(replay));
-
-        using HttpResponseMessage changedPayload = await host.PostAsync(CreateDrainJson(
-            operationId,
+        using HttpResponseMessage repeatedMode = await host.PostAsync(CreateDrainJson(
             "Phased",
             "Restart"));
-        Assert.Equal(HttpStatusCode.Conflict, changedPayload.StatusCode);
-
-        using HttpResponseMessage differentOperation = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f1"),
-            "Phased",
-            "ConfigurationChange"));
-        Assert.Equal(HttpStatusCode.Conflict, differentOperation.StatusCode);
+        Assert.Equal(firstReceipt, await ReadDrainReceiptAsync(repeatedMode));
 
         using HttpResponseMessage unsupportedMode = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f2"),
             "Rolling",
             "ConfigurationChange"));
         Assert.Equal(HttpStatusCode.BadRequest, unsupportedMode.StatusCode);
 
         using HttpResponseMessage caseVariant = await host.PostAsync(
-            $$"""{"OperationId":"{{Guid.NewGuid()}}","mode":"Phased","reason":"ConfigurationChange"}""");
+            """{"Mode":"Phased","reason":"ConfigurationChange"}""");
         Assert.Equal(HttpStatusCode.BadRequest, caseVariant.StatusCode);
 
         using HttpResponseMessage duplicateProperty = await host.PostAsync(
-            $$"""{"operationId":"{{Guid.NewGuid()}}","mode":"Phased","mode":"Immediate","reason":"ConfigurationChange"}""");
+            """{"mode":"Phased","mode":"Immediate","reason":"ConfigurationChange"}""");
         Assert.Equal(HttpStatusCode.BadRequest, duplicateProperty.StatusCode);
 
         using HttpResponseMessage invalidTokenType = await host.PostAsync(
-            $$"""{"operationId":"{{Guid.NewGuid()}}","mode":1,"reason":"ConfigurationChange"}""");
+            """{"mode":1,"reason":"ConfigurationChange"}""");
         Assert.Equal(HttpStatusCode.BadRequest, invalidTokenType.StatusCode);
 
         using HttpResponseMessage missingProperty = await host.PostAsync(
-            $$"""{"operationId":"{{Guid.NewGuid()}}","mode":"Phased"}""");
+            """{"mode":"Phased"}""");
         Assert.Equal(HttpStatusCode.BadRequest, missingProperty.StatusCode);
 
-        using HttpResponseMessage zeroOperationId = await host.PostAsync(
-            """{"operationId":"00000000-0000-0000-0000-000000000000","mode":"Phased","reason":"ConfigurationChange"}""");
-        Assert.Equal(HttpStatusCode.BadRequest, zeroOperationId.StatusCode);
-
-        using HttpResponseMessage invalidOperationId = await host.PostAsync(
-            """{"operationId":"not-a-guid","mode":"Phased","reason":"ConfigurationChange"}""");
-        Assert.Equal(HttpStatusCode.BadRequest, invalidOperationId.StatusCode);
-
         using HttpResponseMessage invalidReason = await host.PostAsync(
-            $$"""{"operationId":"{{Guid.NewGuid()}}","mode":"Phased","reason":"configurationchange"}""");
+            """{"mode":"Phased","reason":"configurationchange"}""");
         Assert.Equal(HttpStatusCode.BadRequest, invalidReason.StatusCode);
 
-        using HttpResponseMessage malformed = await host.PostAsync("""{"operationId":""");
+        using HttpResponseMessage malformed = await host.PostAsync("""{"mode":""");
         Assert.Equal(HttpStatusCode.BadRequest, malformed.StatusCode);
 
         DrainManualTimeProvider rejectedTimeProvider = new();
@@ -164,7 +140,6 @@ public sealed partial class WorkerChannelRegistryTests
             rejectedHandler,
             rejectedTimeProvider);
         using HttpResponseMessage rejected = await rejectedHost.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fc"),
             "Immediate",
             "Stop"));
         Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
@@ -185,34 +160,23 @@ public sealed partial class WorkerChannelRegistryTests
             registry,
             handler,
             timeProvider);
-        Guid operationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fd");
 
         using HttpResponseMessage phased = await host.PostAsync(CreateDrainJson(
-            operationId,
             "Phased",
             "TriggerDiscoveryComplete"));
         Assert.Equal(HttpStatusCode.BadRequest, phased.StatusCode);
 
         using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
-            operationId,
             "Immediate",
             "TriggerDiscoveryComplete"));
         DrainReceipt receipt = await ReadDrainReceiptAsync(accepted);
-        Assert.Equal(operationId, receipt.OperationId);
         Assert.Equal("Immediate", receipt.Mode);
         await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
 
-        using HttpResponseMessage replay = await host.PostAsync(CreateDrainJson(
-            operationId,
-            "Immediate",
-            "TriggerDiscoveryComplete"));
-        Assert.Equal(receipt, await ReadDrainReceiptAsync(replay));
-
-        using HttpResponseMessage changedReason = await host.PostAsync(CreateDrainJson(
-            operationId,
+        using HttpResponseMessage repeatedMode = await host.PostAsync(CreateDrainJson(
             "Immediate",
             "Stop"));
-        Assert.Equal(HttpStatusCode.Conflict, changedReason.StatusCode);
+        Assert.Equal(receipt, await ReadDrainReceiptAsync(repeatedMode));
         Assert.Contains(handler.PublishedStates, state =>
             string.Equals(state.Status, AppServerHostStateClient.DrainingStatus, StringComparison.Ordinal));
         Assert.Contains(handler.PublishedStates, state =>
@@ -244,7 +208,6 @@ public sealed partial class WorkerChannelRegistryTests
             handler,
             timeProvider);
         using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fe"),
             "Immediate",
             "TriggerDiscoveryComplete"));
         accepted.EnsureSuccessStatusCode();
@@ -295,9 +258,7 @@ public sealed partial class WorkerChannelRegistryTests
             registry,
             handler,
             timeProvider);
-        Guid operationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f3");
         using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
-            operationId,
             "Phased",
             "ConfigurationChange"));
         DrainReceipt receipt = await ReadDrainReceiptAsync(accepted);
@@ -307,11 +268,10 @@ public sealed partial class WorkerChannelRegistryTests
         Assert.All(httpWorkers, worker => Assert.Equal(0, worker.DisposeCount));
 
         timeProvider.Advance(TimeSpan.FromSeconds(9));
-        using HttpResponseMessage replay = await host.PostAsync(CreateDrainJson(
-            operationId,
+        using HttpResponseMessage repeatedMode = await host.PostAsync(CreateDrainJson(
             "Phased",
-            "ConfigurationChange"));
-        Assert.Equal(receipt, await ReadDrainReceiptAsync(replay));
+            "Restart"));
+        Assert.Equal(receipt, await ReadDrainReceiptAsync(repeatedMode));
         Assert.Equal(2, nonHttpWorkers.Count(worker => worker.DisposeCount == 1));
 
         timeProvider.Advance(TimeSpan.FromSeconds(1));
@@ -371,7 +331,6 @@ public sealed partial class WorkerChannelRegistryTests
             handler,
             timeProvider);
         using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f4"),
             "Phased",
             "ConfigurationChange"));
         accepted.EnsureSuccessStatusCode();
@@ -402,7 +361,7 @@ public sealed partial class WorkerChannelRegistryTests
     }
 
     [Fact]
-    public async Task PostRuntimeDrain_ImmediateSelectsAllClassesSupportsReplayAndRejectsOtherOperations()
+    public async Task PostRuntimeDrain_ImmediateSelectsAllClassesReturnsExistingReceiptAndRejectsDowngrade()
     {
         DrainManualTimeProvider timeProvider = new();
         RegistryHarness harness = new(timeProvider);
@@ -427,9 +386,7 @@ public sealed partial class WorkerChannelRegistryTests
             registry,
             handler,
             timeProvider);
-        Guid operationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f5");
         using HttpResponseMessage accepted = await host.PostAsync(CreateDrainJson(
-            operationId,
             "Immediate",
             "Delete"));
         DrainReceipt receipt = await ReadDrainReceiptAsync(accepted);
@@ -437,20 +394,12 @@ public sealed partial class WorkerChannelRegistryTests
         await WaitUntilAsync(() => workers.All(worker => worker.DisposeCount == 1));
         await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
 
-        using HttpResponseMessage replay = await host.PostAsync(CreateDrainJson(
-            operationId,
+        using HttpResponseMessage repeatedMode = await host.PostAsync(CreateDrainJson(
             "Immediate",
-            "Delete"));
-        Assert.Equal(receipt, await ReadDrainReceiptAsync(replay));
-
-        using HttpResponseMessage differentImmediate = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f6"),
-            "Immediate",
-            "Delete"));
-        Assert.Equal(HttpStatusCode.Conflict, differentImmediate.StatusCode);
+            "Restart"));
+        Assert.Equal(receipt, await ReadDrainReceiptAsync(repeatedMode));
 
         using HttpResponseMessage downgrade = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f7"),
             "Phased",
             "Delete"));
         Assert.Equal(HttpStatusCode.Conflict, downgrade.StatusCode);
@@ -500,41 +449,24 @@ public sealed partial class WorkerChannelRegistryTests
             registry,
             handler,
             timeProvider);
-        Guid phasedOperationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f8");
         using HttpResponseMessage phasedAccepted = await host.PostAsync(CreateDrainJson(
-            phasedOperationId,
             "Phased",
             "ConfigurationChange"));
         DrainReceipt phasedReceipt = await ReadDrainReceiptAsync(phasedAccepted);
 
         timeProvider.Advance(TimeSpan.FromSeconds(5));
-        Guid immediateOperationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f9");
         using HttpResponseMessage immediateAccepted = await host.PostAsync(CreateDrainJson(
-            immediateOperationId,
             "Immediate",
             "Restart"));
         DrainReceipt immediateReceipt = await ReadDrainReceiptAsync(immediateAccepted);
         Assert.Equal(phasedReceipt.AcceptedAtUtc.AddSeconds(5), immediateReceipt.AcceptedAtUtc);
         await WaitUntilAsync(() => idleWorkers.All(worker => worker.DisposeCount == 1));
 
-        using HttpResponseMessage immediateReplay = await host.PostAsync(CreateDrainJson(
-            immediateOperationId,
+        using HttpResponseMessage repeatedImmediate = await host.PostAsync(CreateDrainJson(
             "Immediate",
-            "Restart"));
-        Assert.Equal(immediateReceipt, await ReadDrainReceiptAsync(immediateReplay));
-        using HttpResponseMessage phasedReplay = await host.PostAsync(CreateDrainJson(
-            phasedOperationId,
-            "Phased",
-            "ConfigurationChange"));
-        Assert.Equal(phasedReceipt, await ReadDrainReceiptAsync(phasedReplay));
-
-        using HttpResponseMessage otherImmediate = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fa"),
-            "Immediate",
-            "Restart"));
-        Assert.Equal(HttpStatusCode.Conflict, otherImmediate.StatusCode);
+            "Delete"));
+        Assert.Equal(immediateReceipt, await ReadDrainReceiptAsync(repeatedImmediate));
         using HttpResponseMessage downgrade = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fb"),
             "Phased",
             "ConfigurationChange"));
         Assert.Equal(HttpStatusCode.Conflict, downgrade.StatusCode);
@@ -561,7 +493,7 @@ public sealed partial class WorkerChannelRegistryTests
     }
 
     [Fact]
-    public async Task PostRuntimeDrain_LifecycleFailureRejectsLaterEscalation()
+    public async Task PostRuntimeDrain_LifecycleFailureRejectsRepeatedModeAndEscalation()
     {
         DrainManualTimeProvider timeProvider = new();
         RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
@@ -587,7 +519,6 @@ public sealed partial class WorkerChannelRegistryTests
             handler,
             timeProvider);
         using HttpResponseMessage phased = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fd"),
             "Phased",
             "ConfigurationChange"));
         phased.EnsureSuccessStatusCode();
@@ -595,8 +526,16 @@ public sealed partial class WorkerChannelRegistryTests
         await handler.DrainProgressFailureObserved.Task.WaitAsync(TestTimeout);
         await Task.Delay(TimeSpan.FromMilliseconds(50));
 
+        using HttpResponseMessage repeatedMode = await host.PostAsync(CreateDrainJson(
+            "Phased",
+            "Restart"));
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, repeatedMode.StatusCode);
+        Assert.DoesNotContain(
+            "acceptedAtUtc",
+            await repeatedMode.Content.ReadAsStringAsync(),
+            StringComparison.Ordinal);
+
         using HttpResponseMessage escalation = await host.PostAsync(CreateDrainJson(
-            Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191fe"),
             "Immediate",
             "Restart"));
         Assert.Equal(HttpStatusCode.ServiceUnavailable, escalation.StatusCode);
@@ -606,22 +545,20 @@ public sealed partial class WorkerChannelRegistryTests
             StringComparison.Ordinal);
     }
 
-    private static string CreateDrainJson(Guid operationId, string mode, string reason)
-        => $$"""{"operationId":"{{operationId}}","mode":"{{mode}}","reason":"{{reason}}"}""";
+    private static string CreateDrainJson(string mode, string reason)
+        => $$"""{"mode":"{{mode}}","reason":"{{reason}}"}""";
 
     private static async Task<DrainReceipt> ReadDrainReceiptAsync(HttpResponseMessage response)
     {
         response.EnsureSuccessStatusCode();
         using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.Equal(3, body.RootElement.EnumerateObject().Count());
+        Assert.Equal(2, body.RootElement.EnumerateObject().Count());
         return new(
-            body.RootElement.GetProperty("operationId").GetGuid(),
             body.RootElement.GetProperty("mode").GetString(),
             body.RootElement.GetProperty("acceptedAtUtc").GetDateTimeOffset());
     }
 
     private sealed record DrainReceipt(
-        Guid OperationId,
         string Mode,
         DateTimeOffset AcceptedAtUtc);
 
