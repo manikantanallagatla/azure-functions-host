@@ -110,9 +110,11 @@ admission, then permanently closes Runtime admission. A concurrent P1 or R2 drai
 first and is tracked as pre-existing work, or observes Runtime retirement and cannot create a later
 selection.
 
-If incarnation binding or the initial lifecycle fence fails, the API remains failed closed. A
-failure-path publisher nevertheless continues publishing the retirement-pending Host state so a
-P1/R2 drain committed before admission can still publish a later exact fallback action.
+If incarnation binding or the initial lifecycle fence fails, the API remains failed closed. One
+root-owned retirement publisher nevertheless continues publishing the retirement-pending Host
+state so a P1/R2 drain committed before admission can still publish a later exact fallback action.
+The same publisher retains `Draining` publication after post-admission selection, progress, or
+schedule failure.
 
 ## 4. P2 Phased scheduling
 
@@ -214,6 +216,11 @@ waits for WorkerProxy termination, disposes the channel, and records the existin
 `RuntimeUnlink` fallback action when primary handoff is uncertain. No second removal command or
 identity scheme is introduced.
 
+The channel monitor uses the same ownership rule after Runtime admission closes. If a captured
+channel terminates before delayed Phased selection or before Immediate selection following the
+AppServer fence, it can leave linked-worker accounting only after the exact WorkerProxy trailer or
+an exact retained fallback action.
+
 Pre-existing R2/P1 drain tasks and newly selected drain tasks must all complete successfully. Final
 Runtime `RemovalRequested` additionally requires:
 
@@ -237,8 +244,9 @@ A timer alone cannot bypass fallback ownership.
 
 - R2 and P1 stop creating new selections after Runtime retirement closes admission.
 - A committed R2/P1 drain remains tracked and can still produce the existing exact fallback action.
-- If initial Runtime admission fails after that drain commits, a failure-path publisher keeps its
-  current state and later fallback outbox changes visible to AppServer.
+- If any R4/P2/P3 bind, fence, selection, progress, or schedule path fails after a drain commits, the root
+  retirement publisher keeps the correct monotonic pending/`Draining` state and later fallback
+  outbox changes visible to AppServer.
 - R4 duplicate activation-fault retirement remains idempotent for R4-owned retirement. R4 cannot
   replace an active app-version schedule with an uncoordinated second retirement flow.
 - Link requires the worker namespace and route-matching pod name so an uncertain unlink always has
@@ -278,11 +286,11 @@ A timer alone cannot bypass fallback ownership.
 | `Functions.Rpc.Client/Registry/WorkerChannelRegistry.cs` | Atomic snapshot/closure, deterministic selection, existing-drain tracking, deadline handoff, and fallback reuse. |
 | `Functions.Rpc.Client/WorkerChannel/RpcClientWorkerChannel.cs` | Channel-local eligibility, admission closure, and app-version drain commitment. |
 | `Functions.Rpc.Client/Extensions/RpcClientServiceCollectionExtensions.cs` | Registry seam registration. |
-| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Ten public-API behavioral tests with a deterministic test clock. |
+| `Functions.Rpc.Client.Tests/Registry/WorkerChannelRegistryTests.AppVersionDrain.cs` | Twelve focused behavioral methods with a deterministic test clock. |
 
 ## 11. Behavioral evidence
 
-The ten focused in-memory public-API methods prove:
+The focused in-memory methods prove:
 
 1. synchronous lifecycle fence commitment, exact two-field receipt, active-mode idempotency,
    additive-field compatibility, ordinal required property names, duplicate/type/malformed
@@ -301,6 +309,10 @@ The ten focused in-memory public-API methods prove:
 9. lifecycle-progress publication failure is latched and prevents repeated-mode or escalation
    receipts;
 10. a selected Worker drain failure is latched before later Phased timers and prevents repeated-mode
-    or escalation receipts.
+    or escalation receipts;
+11. Phased and Immediate pre-selection reader faults and function-load failures retain exact fallback
+    ownership before channel accounting disappears;
+12. initial, escalation, and scheduled selection failures keep publishing a fallback action created
+    after the failure.
 
 These tests were updated but not executed in this change, per the requested validation boundary.

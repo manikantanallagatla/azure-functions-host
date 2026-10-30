@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -12,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Azure.Functions.Host.Controllers;
 using Azure.Functions.Host.HostState;
+using Azure.Functions.Host.RuntimeDrain;
 using Azure.Functions.Rpc.Client;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -26,6 +28,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
 
@@ -45,7 +48,8 @@ public sealed partial class WorkerChannelRegistryTests
         ChannelControl worker = new(
             "worker",
             functionGroupName: FunctionGroups.Durable,
-            isAlwaysReady: false);
+            isAlwaysReady: false,
+            workerRemovalHandoffConfirmed: false);
         ChannelControl readinessPending = new(
             "readiness-pending",
             functionGroupName: FunctionGroups.Durable,
@@ -147,6 +151,109 @@ public sealed partial class WorkerChannelRegistryTests
             "acceptedAtUtc",
             await rejected.Content.ReadAsStringAsync(),
             StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("Phased")]
+    [InlineData("Immediate")]
+    public async Task PostRuntimeDrain_PreSelectionReaderFaultRetainsExactFallback(string mode)
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        FunctionMetadata function = CreateFunction("PreSelectionFaultFunction");
+        ChannelControl worker = new(
+            "worker",
+            functionGroupName: FunctionGroups.Durable,
+            isAlwaysReady: false,
+            workerRemovalHandoffConfirmed: false);
+        harness.Enqueue(worker);
+        await registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        await MakeWorkersReadyAsync(registry, function, worker);
+
+        using AppVersionDrainHostStateHandler handler = new(blockFirstDrainFence: true);
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        Task<HttpResponseMessage> request = host.PostAsync(CreateDrainJson(
+            mode,
+            "ConfigurationChange"));
+        await handler.DrainFenceObserved.Task.WaitAsync(TestTimeout);
+
+        worker.Complete(new IOException("reader failed before selection"));
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        await WaitUntilAsync(() => scaleInManager.Current.OutstandingWorkerRemovals.Count == 1);
+        FunctionsSplitWorkerRemovalAction fallback =
+            Assert.Single(scaleInManager.Current.OutstandingWorkerRemovals);
+        Assert.Equal(worker.Id, fallback.Worker.PodName);
+        Assert.Equal("RuntimeUnlink", fallback.Reason);
+
+        handler.AllowDrainFence.TrySetResult();
+        using HttpResponseMessage accepted = await request.WaitAsync(TestTimeout);
+        accepted.EnsureSuccessStatusCode();
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        Assert.Equal(
+            WorkerRemovalAcknowledgementResult.Accepted,
+            scaleInManager.AcknowledgeWorkerRemoval(fallback));
+        if (string.Equals(mode, "Phased", StringComparison.Ordinal))
+        {
+            timeProvider.Advance(TimeSpan.FromSeconds(40));
+        }
+
+        await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
+    }
+
+    [Fact]
+    public async Task PostRuntimeDrain_PreSelectionFunctionLoadFailureRetainsExactFallback()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
+        await using WorkerChannelRegistry registry = harness.Registry;
+        FunctionMetadata function = CreateFunction("PreSelectionFunctionLoadFailure");
+        ChannelControl worker = new(
+            "worker",
+            functionGroupName: FunctionGroups.Durable,
+            isAlwaysReady: false);
+        harness.Enqueue(worker);
+        await registry.LinkAsync(
+            worker.Id,
+            CreateEndpoint(worker.Id),
+            CreateWorkerIdentity(worker.Id));
+        await MakeWorkersReadyAsync(registry, function, worker);
+
+        using AppVersionDrainHostStateHandler handler = new(blockFirstDrainFence: true);
+        await using AppVersionDrainApiHost host = await AppVersionDrainApiHost.StartAsync(
+            registry,
+            handler,
+            timeProvider);
+        Task<HttpResponseMessage> request = host.PostAsync(CreateDrainJson(
+            "Immediate",
+            "ConfigurationChange"));
+        await handler.DrainFenceObserved.Task.WaitAsync(TestTimeout);
+
+        await worker.FailFunctionLoadAsync();
+        Assert.False(worker.Channel.Completion.IsCompleted);
+        IHttpWorkerScaleInManager scaleInManager = registry;
+        await WaitUntilAsync(() => scaleInManager.Current.OutstandingWorkerRemovals.Count == 1);
+        FunctionsSplitWorkerRemovalAction fallback =
+            Assert.Single(scaleInManager.Current.OutstandingWorkerRemovals);
+        Assert.Equal(worker.Id, fallback.Worker.PodName);
+        Assert.Equal("RuntimeUnlink", fallback.Reason);
+
+        handler.AllowDrainFence.TrySetResult();
+        using HttpResponseMessage accepted = await request.WaitAsync(TestTimeout);
+        accepted.EnsureSuccessStatusCode();
+        Assert.False(handler.RemovalRequestedObserved.Task.IsCompleted);
+
+        Assert.Equal(
+            WorkerRemovalAcknowledgementResult.Accepted,
+            scaleInManager.AcknowledgeWorkerRemoval(fallback));
+        await handler.RemovalRequestedObserved.Task.WaitAsync(TestTimeout);
     }
 
     [Fact]
@@ -582,8 +689,9 @@ public sealed partial class WorkerChannelRegistryTests
             "Phased",
             "ConfigurationChange"));
         phased.EnsureSuccessStatusCode();
-        timeProvider.Advance(TimeSpan.FromMinutes(60));
         await handler.DrainProgressFailureObserved.Task.WaitAsync(TestTimeout);
+        timeProvider.Advance(TimeSpan.FromMinutes(60));
+        await handler.FallbackRequestObserved.Task.WaitAsync(TestTimeout);
         await Task.Delay(TimeSpan.FromMilliseconds(50));
 
         using HttpResponseMessage repeatedMode = await host.PostAsync(CreateDrainJson(
@@ -679,6 +787,194 @@ public sealed partial class WorkerChannelRegistryTests
         Assert.All(pending, worker => Assert.Equal(0, worker.DisposeCount));
     }
 
+    [Fact]
+    public async Task RuntimeDrainScheduleFailureKeepsPublishingLateFallback()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        SelectionFailureWorkerManager workerManager = new(timeProvider.GetUtcNow());
+        using AppVersionDrainHostStateHandler handler = new();
+        using HttpClient httpClient = new(handler);
+        Mock<IHttpClientFactory> factory = new();
+        factory.Setup(value => value.CreateClient(AppServerHostStateClient.HttpClientName))
+            .Returns(httpClient);
+        IConfiguration configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string>
+            {
+                [EnvironmentSettingNames.ContainerName] = "test-container",
+                [EnvironmentSettingNames.MeshInitURI] = "http://appserver.test/",
+            })
+            .Build();
+        AppServerHostStateClient client = new(
+            factory.Object,
+            workerManager,
+            workerManager,
+            timeProvider,
+            configuration);
+        using RuntimeRetirementStatePublisher publisher = new(
+            workerManager,
+            client,
+            timeProvider,
+            NullLogger<RuntimeRetirementStatePublisher>.Instance);
+        AppVersionRuntimeDrainManager manager = new(
+            workerManager,
+            workerManager,
+            client,
+            publisher,
+            timeProvider,
+            NullLogger<AppVersionRuntimeDrainManager>.Instance);
+
+        await manager.AcceptAsync(
+            RuntimeDrainMode.Phased,
+            RuntimeDrainReason.ConfigurationChange);
+        timeProvider.Advance(TimeSpan.FromSeconds(10));
+        await workerManager.SelectionFailureTriggered.Task.WaitAsync(TestTimeout);
+
+        using CancellationTokenSource timeout = new(TestTimeout);
+        while (true)
+        {
+            try
+            {
+                await manager.AcceptAsync(
+                    RuntimeDrainMode.Phased,
+                    RuntimeDrainReason.Restart);
+            }
+            catch (InvalidOperationException)
+            {
+                break;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(10), timeout.Token);
+        }
+
+        workerManager.PublishFallback();
+        await handler.FallbackRequestObserved.Task.WaitAsync(TestTimeout);
+
+        AppServerHostStateClient.HostStateRequest fallback = handler.PublishedStates.Last(state =>
+            state.OutstandingWorkerRemovals.Count != 0);
+        Assert.Equal(AppServerHostStateClient.DrainingStatus, fallback.Status);
+        Assert.Equal(workerManager.FallbackAction, Assert.Single(fallback.OutstandingWorkerRemovals));
+    }
+
+    [Theory]
+    [InlineData(RuntimeDrainMode.Phased, "a-worker", false)]
+    [InlineData(RuntimeDrainMode.Immediate, null, true)]
+    public async Task RuntimeDrainInitialSelectionFailureKeepsPublishingLateFallback(
+        RuntimeDrainMode mode,
+        string failingWorkerId,
+        bool failAllRemainingSelection)
+    {
+        DrainManualTimeProvider timeProvider = new();
+        SelectionFailureWorkerManager workerManager = new(
+            timeProvider.GetUtcNow(),
+            failingWorkerId,
+            failAllRemainingSelection);
+        using AppVersionDrainHostStateHandler handler = new();
+        using HttpClient httpClient = new(handler);
+        Mock<IHttpClientFactory> factory = new();
+        factory.Setup(value => value.CreateClient(AppServerHostStateClient.HttpClientName))
+            .Returns(httpClient);
+        IConfiguration configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string>
+            {
+                [EnvironmentSettingNames.ContainerName] = "test-container",
+                [EnvironmentSettingNames.MeshInitURI] = "http://appserver.test/",
+            })
+            .Build();
+        AppServerHostStateClient client = new(
+            factory.Object,
+            workerManager,
+            workerManager,
+            timeProvider,
+            configuration);
+        using RuntimeRetirementStatePublisher publisher = new(
+            workerManager,
+            client,
+            timeProvider,
+            NullLogger<RuntimeRetirementStatePublisher>.Instance);
+        AppVersionRuntimeDrainManager manager = new(
+            workerManager,
+            workerManager,
+            client,
+            publisher,
+            timeProvider,
+            NullLogger<AppVersionRuntimeDrainManager>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.AcceptAsync(
+            mode,
+            RuntimeDrainReason.ConfigurationChange));
+        await workerManager.SelectionFailureTriggered.Task.WaitAsync(TestTimeout);
+
+        workerManager.PublishFallback();
+        await handler.FallbackRequestObserved.Task.WaitAsync(TestTimeout);
+
+        AppServerHostStateClient.HostStateRequest fallback = handler.PublishedStates.Last(state =>
+            state.OutstandingWorkerRemovals.Count != 0);
+        Assert.Equal(AppServerHostStateClient.DrainingStatus, fallback.Status);
+        Assert.Equal(workerManager.FallbackAction, Assert.Single(fallback.OutstandingWorkerRemovals));
+        await Assert.ThrowsAsync<RuntimeDrainAdmissionException>(() => manager.AcceptAsync(
+            mode,
+            RuntimeDrainReason.Restart));
+    }
+
+    [Fact]
+    public async Task RuntimeDrainEscalationSelectionFailureKeepsPublishingLateFallback()
+    {
+        DrainManualTimeProvider timeProvider = new();
+        SelectionFailureWorkerManager workerManager = new(
+            timeProvider.GetUtcNow(),
+            failingWorkerId: null,
+            failAllRemainingSelection: true);
+        using AppVersionDrainHostStateHandler handler = new();
+        using HttpClient httpClient = new(handler);
+        Mock<IHttpClientFactory> factory = new();
+        factory.Setup(value => value.CreateClient(AppServerHostStateClient.HttpClientName))
+            .Returns(httpClient);
+        IConfiguration configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string>
+            {
+                [EnvironmentSettingNames.ContainerName] = "test-container",
+                [EnvironmentSettingNames.MeshInitURI] = "http://appserver.test/",
+            })
+            .Build();
+        AppServerHostStateClient client = new(
+            factory.Object,
+            workerManager,
+            workerManager,
+            timeProvider,
+            configuration);
+        using RuntimeRetirementStatePublisher publisher = new(
+            workerManager,
+            client,
+            timeProvider,
+            NullLogger<RuntimeRetirementStatePublisher>.Instance);
+        AppVersionRuntimeDrainManager manager = new(
+            workerManager,
+            workerManager,
+            client,
+            publisher,
+            timeProvider,
+            NullLogger<AppVersionRuntimeDrainManager>.Instance);
+
+        await manager.AcceptAsync(
+            RuntimeDrainMode.Phased,
+            RuntimeDrainReason.ConfigurationChange);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => manager.AcceptAsync(
+            RuntimeDrainMode.Immediate,
+            RuntimeDrainReason.Restart));
+        await workerManager.SelectionFailureTriggered.Task.WaitAsync(TestTimeout);
+
+        workerManager.PublishFallback();
+        await handler.FallbackRequestObserved.Task.WaitAsync(TestTimeout);
+
+        AppServerHostStateClient.HostStateRequest fallback = handler.PublishedStates.Last(state =>
+            state.OutstandingWorkerRemovals.Count != 0);
+        Assert.Equal(AppServerHostStateClient.DrainingStatus, fallback.Status);
+        Assert.Equal(workerManager.FallbackAction, Assert.Single(fallback.OutstandingWorkerRemovals));
+        await Assert.ThrowsAsync<RuntimeDrainAdmissionException>(() => manager.AcceptAsync(
+            RuntimeDrainMode.Immediate,
+            RuntimeDrainReason.Stop));
+    }
+
     private static string CreateDrainJson(string mode, string reason)
         => $$"""{"mode":"{{mode}}","reason":"{{reason}}"}""";
 
@@ -695,6 +991,151 @@ public sealed partial class WorkerChannelRegistryTests
     private sealed record DrainReceipt(
         string Mode,
         DateTimeOffset AcceptedAtUtc);
+
+    private sealed class SelectionFailureWorkerManager :
+        IAppVersionRuntimeDrainWorkerManager,
+        IHttpWorkerScaleInManager,
+        IRuntimeRetirementWorkerManager
+    {
+        private readonly bool _failAllRemainingSelection;
+        private readonly string _failingWorkerId;
+        private readonly Lock _stateLock = new();
+        private TaskCompletionSource<long> _stateChanged =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private HttpWorkerScaleInState _state;
+
+        internal SelectionFailureWorkerManager(
+            DateTimeOffset createdTime,
+            string failingWorkerId = "b-worker",
+            bool failAllRemainingSelection = false)
+        {
+            _failingWorkerId = failingWorkerId;
+            _failAllRemainingSelection = failAllRemainingSelection;
+            _state = new(createdTime, 0, 5, 0);
+        }
+
+        public FunctionsSplitWorkerRemovalAction FallbackAction { get; } = new(
+            new("test-namespace", "a-worker"),
+            "RuntimeUnlink");
+
+        public RuntimeIncarnation Incarnation { get; } = RuntimeIncarnation.Create();
+
+        public bool IsRetirementRequested { get; private set; }
+
+        public TaskCompletionSource SelectionFailureTriggered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public HttpWorkerScaleInState Current
+        {
+            get
+            {
+                lock (_stateLock)
+                {
+                    return _state;
+                }
+            }
+        }
+
+        public long Version => Current.Version;
+
+        public WorkerRemovalAcknowledgementResult AcknowledgeWorkerRemoval(
+            FunctionsSplitWorkerRemovalAction action)
+            => WorkerRemovalAcknowledgementResult.NotFound;
+
+        public bool CancelReservation(HttpWorkerScaleInReservation reservation) => false;
+
+        public Task<RuntimeRetirementDrainResult> DrainAllWorkersAsync(
+            RuntimeIncarnation incarnation,
+            CancellationToken cancellationToken)
+            => throw new NotSupportedException();
+
+        public void PublishFallback()
+        {
+            lock (_stateLock)
+            {
+                _state = new(
+                    _state.CreatedTime.AddTicks(1),
+                    0,
+                    0,
+                    _state.Version + 1)
+                {
+                    OutstandingWorkerRemovals = [FallbackAction],
+                };
+                TaskCompletionSource<long> changed = _stateChanged;
+                _stateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                changed.TrySetResult(_state.Version);
+            }
+        }
+
+        public AppVersionRuntimeDrainSelection SelectAllRemainingWorkers(
+            RuntimeIncarnation incarnation,
+            DateTimeOffset invocationGraceDeadline)
+        {
+            Assert.Equal(Incarnation, incarnation);
+            if (_failAllRemainingSelection)
+            {
+                SelectionFailureTriggered.TrySetResult();
+                throw new InvalidOperationException("all remaining selection failed");
+            }
+
+            return new([]);
+        }
+
+        public AppVersionRuntimeDrainSelection SelectWorkers(
+            RuntimeIncarnation incarnation,
+            IReadOnlyList<string> workerIds,
+            DateTimeOffset invocationGraceDeadline)
+        {
+            Assert.Equal(Incarnation, incarnation);
+            if (_failingWorkerId is not null &&
+                workerIds.Contains(_failingWorkerId, StringComparer.Ordinal))
+            {
+                SelectionFailureTriggered.TrySetResult();
+                throw new InvalidOperationException("worker selection failed");
+            }
+
+            return new([]);
+        }
+
+        public bool TryCloseAdmission(SplitScriptHostActivationFaulted condition) => false;
+
+        public bool TryCommitReservation(
+            HttpWorkerScaleInReservation reservation,
+            out Task<bool> drainCompletion)
+        {
+            drainCompletion = null;
+            return false;
+        }
+
+        public HttpWorkerScaleInReservation TryReserveIdleWorker(
+            TimeSpan minimumIdleDuration)
+            => null;
+
+        public bool TryStartAppVersionDrain(out AppVersionRuntimeDrainStart start)
+        {
+            IsRetirementRequested = true;
+            start = new(
+                Incarnation,
+                ["a-worker", "b-worker", "c-worker", "d-worker", "e-worker"],
+                [],
+                [],
+                []);
+            return true;
+        }
+
+        public Task<long> WaitForChangeAsync(
+            long version,
+            CancellationToken cancellationToken = default)
+        {
+            lock (_stateLock)
+            {
+                return version != _state.Version
+                    ? Task.FromResult(_state.Version)
+                    : _stateChanged.Task.WaitAsync(cancellationToken);
+            }
+        }
+    }
 
     private sealed class AppVersionDrainApiHost : IAsyncDisposable
     {
@@ -754,6 +1195,9 @@ public sealed partial class WorkerChannelRegistryTests
                             services.AddSingleton(configuration);
                             services.AddSingleton<TimeProvider>(timeProvider);
                             services.AddSingleton<AppServerHostStateClient>();
+                            services.AddSingleton<RuntimeRetirementStatePublisher>();
+                            services.AddSingleton<IHostedService>(
+                                provider => provider.GetRequiredService<RuntimeRetirementStatePublisher>());
                             services.AddSingleton<AppVersionRuntimeDrainManager>();
                             services.AddSingleton<IAppVersionRuntimeDrainManager>(
                                 provider => provider.GetRequiredService<AppVersionRuntimeDrainManager>());
@@ -824,6 +1268,7 @@ public sealed partial class WorkerChannelRegistryTests
         bool failDrainProgress = false) : HttpMessageHandler
     {
         private bool _drainFenceBlocked;
+        private bool _drainProgressFailed;
         private int _drainingPublishCount;
 
         internal TaskCompletionSource AllowDrainFence { get; } =
@@ -833,6 +1278,9 @@ public sealed partial class WorkerChannelRegistryTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         internal TaskCompletionSource DrainProgressFailureObserved { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource FallbackRequestObserved { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         internal List<AppServerHostStateClient.HostStateRequest> PublishedStates { get; } = [];
@@ -859,10 +1307,18 @@ public sealed partial class WorkerChannelRegistryTests
                     await AllowDrainFence.Task.WaitAsync(cancellationToken);
                 }
 
-                if (failDrainProgress && _drainingPublishCount > 1)
+                if (failDrainProgress &&
+                    _drainingPublishCount > 1 &&
+                    !_drainProgressFailed)
                 {
+                    _drainProgressFailed = true;
                     DrainProgressFailureObserved.TrySetResult();
                     return new(HttpStatusCode.Conflict);
+                }
+
+                if (state.OutstandingWorkerRemovals.Count != 0)
+                {
+                    FallbackRequestObserved.TrySetResult();
                 }
 
                 if (drainFenceStatus != HttpStatusCode.OK)

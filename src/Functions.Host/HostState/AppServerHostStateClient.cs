@@ -123,18 +123,27 @@ internal sealed class AppServerHostStateClient(
             capacityFence: CapacityFenceRequired,
             cancellationToken);
 
-    internal Task<AppServerHostStatePublishResult> PublishRetirementPendingAsync(
+    internal Task<AppServerHostStatePublishResult> PublishRetirementStateAsync(
         HttpWorkerScaleInState state,
+        RuntimeLifecycleStatus? status,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(state);
+        if (status is RuntimeLifecycleStatus.RemovalRequested)
+        {
+            throw new ArgumentOutOfRangeException(nameof(status));
+        }
+
+        string capacityFence = status is null
+            ? CapacityFenceRequired
+            : LifecycleCapacityFenceRequired;
         return PublishAsync(
             state,
-            status: null,
-            acquireClosed: null,
+            status,
+            acquireClosed: status is null ? null : true,
             allowDuringRetirement: true,
             advanceCreatedTime: true,
-            capacityFence: CapacityFenceRequired,
+            capacityFence,
             cancellationToken);
     }
 

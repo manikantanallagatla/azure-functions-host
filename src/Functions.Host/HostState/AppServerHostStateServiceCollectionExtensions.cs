@@ -22,6 +22,9 @@ internal static class AppServerHostStateServiceCollectionExtensions
         services.AddSingleton<AppServerHostStateClient>();
         services.AddSingleton<IWorkerScaleInStatePublisher>(
             provider => provider.GetRequiredService<AppServerHostStateClient>());
+        services.AddSingleton<RuntimeRetirementStatePublisher>();
+        services.AddSingleton<IHostedService>(
+            provider => provider.GetRequiredService<RuntimeRetirementStatePublisher>());
         services.AddSingleton<RuntimeRetirementManager>();
         services.AddSingleton<IRuntimeRetirementManager>(
             provider => provider.GetRequiredService<RuntimeRetirementManager>());

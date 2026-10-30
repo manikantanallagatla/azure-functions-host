@@ -31,29 +31,6 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
     private readonly CancellationTokenSource _shutdownSource = new();
     private readonly Task _writePump;
 
-    bool IWorkerRemovalHandoffChannel.IsWorkerRemovalHandoffConfirmed
-    {
-        get
-        {
-            foreach (Metadata.Entry trailer in _call.GetTrailers())
-            {
-                if (string.Equals(
-                    trailer.Key,
-                    FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
-                    StringComparison.Ordinal) &&
-                    string.Equals(
-                        trailer.Value,
-                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue,
-                        StringComparison.Ordinal))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-    }
-
     /// <summary>
     /// Initializes a new instance of the <see cref="GrpcDuplexChannel{T}"/> class.
     /// </summary>
@@ -79,6 +56,29 @@ internal sealed class GrpcDuplexChannel<T> : DuplexChannel<T>, IWorkerRemovalHan
 
         _readPump = PumpResponsesAsync();
         _writePump = PumpRequestsAsync();
+    }
+
+    bool IWorkerRemovalHandoffChannel.IsWorkerRemovalHandoffConfirmed
+    {
+        get
+        {
+            foreach (Metadata.Entry trailer in _call.GetTrailers())
+            {
+                if (string.Equals(
+                    trailer.Key,
+                    FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerName,
+                    StringComparison.Ordinal) &&
+                    string.Equals(
+                        trailer.Value,
+                        FunctionRpcRelayConstants.WorkerRemovalRequestedTrailerValue,
+                        StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
 
     protected override async ValueTask DisposeAsyncCore()

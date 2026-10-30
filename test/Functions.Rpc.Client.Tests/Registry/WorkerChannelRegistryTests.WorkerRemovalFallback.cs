@@ -15,6 +15,7 @@ using Azure.Functions.Host.Controllers;
 using Azure.Functions.Host.HostState;
 using Azure.Functions.Host.Models;
 using Azure.Functions.Host.WorkerLink;
+using Grpc.Core;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.WebJobs.Script;
 using Microsoft.Azure.WebJobs.Script.Grpc;

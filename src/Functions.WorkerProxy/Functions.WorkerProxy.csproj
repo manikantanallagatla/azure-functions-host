@@ -29,6 +29,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile
+      Include="..\WebJobs.Script.Grpc\FunctionRpcRelayConstants.cs"
+      Link="Grpc\FunctionRpcRelayConstants.cs" />
     <Protobuf
       Include="..\WebJobs.Script.Grpc\azure-functions-language-worker-protobuf\src\proto\**\*.proto"
       GrpcServices="server"

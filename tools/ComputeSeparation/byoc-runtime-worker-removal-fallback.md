@@ -82,6 +82,10 @@ stateDiagram-v2
 - Only the exact WorkerProxy removal trailer confirms primary ownership and avoids a fallback action.
 - Clean, faulted, canceled, timed-out, or disposed streams without the trailer create the exact
   fallback action.
+- After Runtime retirement closes admission, the channel monitor applies the same rule before
+  removing a channel that terminates or reports a function-load failure ahead of delayed Worker
+  selection. Function-load failure alone cannot expose transport trailers and is therefore not
+  primary-handoff evidence.
 - Runtime publishes each action until an exact acknowledgement is committed.
 - Matching uses the full action: resource namespace, pod name, and reason.
 - Malformed acknowledgements return `400`; valid unknown or non-exact actions return `404`.

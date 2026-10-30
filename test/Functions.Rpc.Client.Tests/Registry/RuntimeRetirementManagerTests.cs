@@ -22,16 +22,25 @@ public sealed class RuntimeRetirementManagerTests
 {
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(10);
 
+    public enum RetirementFailurePhase
+    {
+        Bind,
+        Fence,
+        Progress,
+    }
+
     [Fact]
     public async Task RequestRetirementAsync_RejectsStaleThenOrdersAcknowledgedRetirementOnce()
     {
         TestRetirementWorkerManager workerManager = new();
         using RetirementHostStateHandler handler = new(blockFirstDrainingResponse: true);
         AppServerHostStateClient client = CreateClient(workerManager, handler);
+        using RuntimeRetirementStatePublisher publisher = CreatePublisher(workerManager, client);
         RuntimeRetirementManager manager = new(
             workerManager,
             workerManager,
             client,
+            publisher,
             NullLogger<RuntimeRetirementManager>.Instance);
         SplitScriptHostActivationFaulted staleCondition = new(
             RuntimeIncarnation.Create(),
@@ -118,6 +127,46 @@ public sealed class RuntimeRetirementManagerTests
             });
     }
 
+    [Theory]
+    [InlineData(RetirementFailurePhase.Bind, null)]
+    [InlineData(RetirementFailurePhase.Fence, null)]
+    [InlineData(RetirementFailurePhase.Progress, AppServerHostStateClient.DrainingStatus)]
+    public async Task RequestRetirementAsync_FailureKeepsPublishingLateFallback(
+        RetirementFailurePhase failurePhase,
+        string expectedStatus)
+    {
+        TestRetirementWorkerManager workerManager = new();
+        using RetirementHostStateHandler handler = new(failurePhase: failurePhase);
+        AppServerHostStateClient client = CreateClient(workerManager, handler);
+        using RuntimeRetirementStatePublisher publisher = CreatePublisher(workerManager, client);
+        RuntimeRetirementManager manager = new(
+            workerManager,
+            workerManager,
+            client,
+            publisher,
+            NullLogger<RuntimeRetirementManager>.Instance);
+        SplitScriptHostActivationFaulted condition = new(
+            workerManager.Incarnation,
+            new InvalidOperationException("activation failed"));
+
+        Task retirement = manager.RequestRetirementAsync(condition);
+        if (failurePhase is RetirementFailurePhase.Progress)
+        {
+            await workerManager.DrainStarted.Task.WaitAsync(TestTimeout);
+            workerManager.AdvanceState();
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => retirement.WaitAsync(TestTimeout));
+        workerManager.PublishFallback();
+        await handler.FallbackRequestObserved.Task.WaitAsync(TestTimeout);
+
+        AppServerHostStateClient.HostStateRequest fallback = handler.PublishedStates.Last(state =>
+            state.OutstandingWorkerRemovals.Count != 0);
+        Assert.Equal(expectedStatus, fallback.Status);
+        Assert.Equal(workerManager.FallbackAction, Assert.Single(fallback.OutstandingWorkerRemovals));
+    }
+
     private static AppServerHostStateClient CreateClient(
         TestRetirementWorkerManager workerManager,
         RetirementHostStateHandler handler)
@@ -142,6 +191,15 @@ public sealed class RuntimeRetirementManagerTests
             TimeProvider.System,
             configuration);
     }
+
+    private static RuntimeRetirementStatePublisher CreatePublisher(
+        TestRetirementWorkerManager workerManager,
+        AppServerHostStateClient client)
+        => new(
+            workerManager,
+            client,
+            TimeProvider.System,
+            NullLogger<RuntimeRetirementStatePublisher>.Instance);
 
     private sealed class TestRetirementWorkerManager :
         IHttpWorkerScaleInManager,
@@ -216,6 +274,30 @@ public sealed class RuntimeRetirementManagerTests
 
         public void CompleteDrain()
         {
+            PublishFallback();
+            DrainCompletion.TrySetResult(new(true, null));
+        }
+
+        public void AdvanceState()
+        {
+            lock (_stateLock)
+            {
+                _state = new(
+                    _state.CreatedTime.AddTicks(1),
+                    _state.HttpCapacity,
+                    _state.LinkedWorkerCount,
+                    _state.Version + 1)
+                {
+                    OutstandingWorkerRemovals = _state.OutstandingWorkerRemovals,
+                };
+                TaskCompletionSource<long> changed = _stateChanged;
+                _stateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                changed.TrySetResult(_state.Version);
+            }
+        }
+
+        public void PublishFallback()
+        {
             lock (_stateLock)
             {
                 _state = new(
@@ -230,8 +312,6 @@ public sealed class RuntimeRetirementManagerTests
                 _stateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 changed.TrySetResult(_state.Version);
             }
-
-            DrainCompletion.TrySetResult(new(true, null));
         }
 
         public Task<RuntimeRetirementDrainResult> DrainAllWorkersAsync(
@@ -289,9 +369,13 @@ public sealed class RuntimeRetirementManagerTests
         }
     }
 
-    private sealed class RetirementHostStateHandler(bool blockFirstDrainingResponse = false) : HttpMessageHandler
+    private sealed class RetirementHostStateHandler(
+        bool blockFirstDrainingResponse = false,
+        RetirementFailurePhase? failurePhase = null) : HttpMessageHandler
     {
         private bool _drainingResponseBlocked;
+        private bool _failureReturned;
+        private int _drainingRequestCount;
 
         public TaskCompletionSource AllowDrainingResponse { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -329,10 +413,38 @@ public sealed class RuntimeRetirementManagerTests
                 await AllowDrainingResponse.Task.WaitAsync(cancellationToken);
             }
 
+            if (string.Equals(state.Status, AppServerHostStateClient.DrainingStatus, StringComparison.Ordinal))
+            {
+                _drainingRequestCount++;
+            }
+
             if (string.Equals(state.Status, AppServerHostStateClient.DrainingStatus, StringComparison.Ordinal) &&
                 state.OutstandingWorkerRemovals.Count != 0)
             {
                 FallbackRequestObserved.TrySetResult();
+            }
+
+            bool failRequest = !_failureReturned && failurePhase switch
+            {
+                RetirementFailurePhase.Bind => state.Status is null,
+                RetirementFailurePhase.Fence =>
+                    string.Equals(
+                        state.Status,
+                        AppServerHostStateClient.DrainingStatus,
+                        StringComparison.Ordinal) &&
+                    _drainingRequestCount == 1,
+                RetirementFailurePhase.Progress =>
+                    string.Equals(
+                        state.Status,
+                        AppServerHostStateClient.DrainingStatus,
+                        StringComparison.Ordinal) &&
+                    _drainingRequestCount == 2,
+                _ => false,
+            };
+            if (failRequest)
+            {
+                _failureReturned = true;
+                return new(HttpStatusCode.Conflict);
             }
 
             HttpResponseMessage response = new(HttpStatusCode.OK);

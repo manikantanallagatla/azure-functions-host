@@ -17,11 +17,11 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     IAppVersionRuntimeDrainWorkerManager workerManager,
     IHttpWorkerScaleInManager scaleInManager,
     AppServerHostStateClient appServerClient,
+    RuntimeRetirementStatePublisher retirementStatePublisher,
     TimeProvider timeProvider,
     ILogger<AppVersionRuntimeDrainManager> logger) : IAppVersionRuntimeDrainManager
 {
     internal static readonly TimeSpan InvocationGracePeriod = TimeSpan.FromMinutes(60);
-    private static readonly TimeSpan FailedAdmissionPublishInterval = TimeSpan.FromMinutes(1);
 
     private static readonly TimeSpan[] NonHttpBatchOffsets =
     [
@@ -44,6 +44,9 @@ internal sealed partial class AppVersionRuntimeDrainManager(
     private readonly IHttpWorkerScaleInManager _scaleInManager =
         scaleInManager ?? throw new ArgumentNullException(nameof(scaleInManager));
 
+    private readonly RuntimeRetirementStatePublisher _retirementStatePublisher =
+        retirementStatePublisher ?? throw new ArgumentNullException(nameof(retirementStatePublisher));
+
     private readonly TimeProvider _timeProvider =
         timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
 
@@ -61,7 +64,6 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private CancellationTokenSource? _phasedScheduleSource;
-    private Task? _failedAdmissionPublisherTask;
     private Exception? _drainFailure;
     private Exception? _lifecycleFailure;
     private Exception? _selectionFailure;
@@ -144,7 +146,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         }
         catch (Exception exception)
         {
-            StartFailedAdmissionPublisher();
+            _retirementStatePublisher.RetainOwnership(status: null);
             if (exception is HttpRequestException)
             {
                 throw new RuntimeDrainAdmissionException(
@@ -169,28 +171,36 @@ internal sealed partial class AppVersionRuntimeDrainManager(
 
         CancellationTokenSource? phasedScheduleSource = null;
         int phasedBatchSize = 0;
-        lock (_operationLock)
+        try
         {
-            TrackDrainsLocked(start.ExistingDrains);
-
-            TrackSelectionLocked(_workerManager.SelectWorkers(
-                start.Incarnation,
-                start.NonReadyWorkerIds,
-                acceptedAtUtc + InvocationGracePeriod));
-
-            if (operation.Mode is RuntimeDrainMode.Phased)
+            lock (_operationLock)
             {
-                phasedBatchSize = Math.Max(1, (start.NonHttpWorkerIds.Count + 4) / 5);
-                SelectPhasedBatchLocked(start, phasedBatchSize, batchIndex: 0);
-                _phasedScheduleSource = new();
-                phasedScheduleSource = _phasedScheduleSource;
+                TrackDrainsLocked(start.ExistingDrains);
+
+                TrackSelectionLocked(_workerManager.SelectWorkers(
+                    start.Incarnation,
+                    start.NonReadyWorkerIds,
+                    acceptedAtUtc + InvocationGracePeriod));
+
+                if (operation.Mode is RuntimeDrainMode.Phased)
+                {
+                    phasedBatchSize = Math.Max(1, (start.NonHttpWorkerIds.Count + 4) / 5);
+                    SelectPhasedBatchLocked(start, phasedBatchSize, batchIndex: 0);
+                    _phasedScheduleSource = new();
+                    phasedScheduleSource = _phasedScheduleSource;
+                }
+                else
+                {
+                    SelectAllRemainingLocked(acceptedAtUtc);
+                    _selectionFinalized = true;
+                    SignalOperationChangedLocked();
+                }
             }
-            else
-            {
-                SelectAllRemainingLocked(acceptedAtUtc);
-                _selectionFinalized = true;
-                SignalOperationChangedLocked();
-            }
+        }
+        catch (Exception exception)
+        {
+            LatchSelectionFailure(exception);
+            throw;
         }
 
         Task lifecycle = RunLifecycleWithFailureLatchAsync(fencedState);
@@ -222,20 +232,36 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         await initialAdmission;
         DateTimeOffset acceptedAtUtc = _timeProvider.GetUtcNow();
 
-        lock (_operationLock)
+        try
         {
-            ThrowIfDrainFailedLocked();
-            if (_finalizationStarted)
+            lock (_operationLock)
             {
-                throw new RuntimeDrainConflictException(
-                    "The phased Runtime drain has already entered final removal publication.");
-            }
+                ThrowIfDrainFailedLocked();
+                if (_finalizationStarted)
+                {
+                    throw new RuntimeDrainConflictException(
+                        "The phased Runtime drain has already entered final removal publication.");
+                }
 
-            _activeMode = RuntimeDrainMode.Immediate;
-            _phasedScheduleSource?.Cancel();
-            SelectAllRemainingLocked(acceptedAtUtc);
-            _selectionFinalized = true;
-            SignalOperationChangedLocked();
+                _activeMode = RuntimeDrainMode.Immediate;
+                _phasedScheduleSource?.Cancel();
+                SelectAllRemainingLocked(acceptedAtUtc);
+                _selectionFinalized = true;
+                SignalOperationChangedLocked();
+            }
+        }
+        catch (RuntimeDrainConflictException)
+        {
+            throw;
+        }
+        catch (RuntimeDrainAdmissionException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            LatchSelectionFailure(exception);
+            throw;
         }
 
         Log.Escalated(
@@ -262,6 +288,7 @@ internal sealed partial class AppVersionRuntimeDrainManager(
                 _lifecycleFailure = exception;
             }
 
+            _retirementStatePublisher.RetainOwnership(RuntimeLifecycleStatus.Draining);
             throw;
         }
     }
@@ -320,15 +347,21 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         }
         catch (Exception exception)
         {
-            lock (_operationLock)
-            {
-                _selectionFailure = exception;
-                _selectionFinalized = true;
-                SignalOperationChangedLocked();
-            }
-
+            LatchSelectionFailure(exception);
             throw;
         }
+    }
+
+    private void LatchSelectionFailure(Exception exception)
+    {
+        lock (_operationLock)
+        {
+            _selectionFailure ??= exception;
+            _selectionFinalized = true;
+            SignalOperationChangedLocked();
+        }
+
+        _retirementStatePublisher.RetainOwnership(RuntimeLifecycleStatus.Draining);
     }
 
     private async Task RunLifecycleAsync(HttpWorkerScaleInState fencedState)
@@ -612,73 +645,6 @@ internal sealed partial class AppVersionRuntimeDrainManager(
         }
     }
 
-    private void StartFailedAdmissionPublisher()
-    {
-        Task publisher;
-        lock (_operationLock)
-        {
-            publisher = _failedAdmissionPublisherTask ??= RunFailedAdmissionPublisherAsync();
-        }
-
-        _ = ObserveFailedAdmissionPublisherAsync(publisher);
-    }
-
-    private async Task RunFailedAdmissionPublisherAsync()
-    {
-        while (true)
-        {
-            HttpWorkerScaleInState state;
-            try
-            {
-                state = _scaleInManager.Current;
-            }
-            catch (ObjectDisposedException)
-            {
-                return;
-            }
-
-            try
-            {
-                AppServerHostStatePublishResult result =
-                    await _appServerClient.PublishRetirementPendingAsync(state, CancellationToken.None);
-                if (result is not AppServerHostStatePublishResult.Applied)
-                {
-                    Log.FailedAdmissionPublicationUnavailable(_logger, result);
-                }
-            }
-            catch (Exception exception)
-            {
-                Log.FailedAdmissionPublicationFailed(_logger, exception);
-            }
-
-            using CancellationTokenSource intervalSource =
-                new(FailedAdmissionPublishInterval, _timeProvider);
-            try
-            {
-                await _scaleInManager.WaitForChangeAsync(state.Version, intervalSource.Token);
-            }
-            catch (OperationCanceledException) when (intervalSource.IsCancellationRequested)
-            {
-            }
-            catch (ObjectDisposedException)
-            {
-                return;
-            }
-        }
-    }
-
-    private async Task ObserveFailedAdmissionPublisherAsync(Task publisher)
-    {
-        try
-        {
-            await publisher;
-        }
-        catch (Exception exception)
-        {
-            Log.FailedAdmissionPublisherStopped(_logger, exception);
-        }
-    }
-
     private async Task ObserveLifecycleAsync(Task lifecycle)
     {
         try
@@ -760,24 +726,6 @@ internal sealed partial class AppVersionRuntimeDrainManager(
             ILogger logger,
             Exception exception,
             Guid runtimeIncarnation);
-
-        [LoggerMessage(1215, LogLevel.Warning,
-            "Runtime drain admission failed and pending Host-state publication returned {Result}.")]
-        public static partial void FailedAdmissionPublicationUnavailable(
-            ILogger logger,
-            AppServerHostStatePublishResult result);
-
-        [LoggerMessage(1216, LogLevel.Warning,
-            "Runtime drain admission failed and pending Host-state publication failed.")]
-        public static partial void FailedAdmissionPublicationFailed(
-            ILogger logger,
-            Exception exception);
-
-        [LoggerMessage(1217, LogLevel.Error,
-            "Runtime drain admission failure publisher stopped unexpectedly.")]
-        public static partial void FailedAdmissionPublisherStopped(
-            ILogger logger,
-            Exception exception);
     }
 }
 

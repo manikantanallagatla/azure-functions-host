@@ -13,6 +13,7 @@ internal sealed partial class RuntimeRetirementManager(
     IRuntimeRetirementWorkerManager workerManager,
     IHttpWorkerScaleInManager scaleInManager,
     AppServerHostStateClient appServerClient,
+    RuntimeRetirementStatePublisher retirementStatePublisher,
     ILogger<RuntimeRetirementManager> logger) : IRuntimeRetirementManager
 {
     private readonly AppServerHostStateClient _appServerClient =
@@ -24,6 +25,9 @@ internal sealed partial class RuntimeRetirementManager(
 
     private readonly IHttpWorkerScaleInManager _scaleInManager =
         scaleInManager ?? throw new ArgumentNullException(nameof(scaleInManager));
+
+    private readonly RuntimeRetirementStatePublisher _retirementStatePublisher =
+        retirementStatePublisher ?? throw new ArgumentNullException(nameof(retirementStatePublisher));
 
     private readonly IRuntimeRetirementWorkerManager _workerManager =
         workerManager ?? throw new ArgumentNullException(nameof(workerManager));
@@ -56,94 +60,104 @@ internal sealed partial class RuntimeRetirementManager(
             return;
         }
 
-        AppServerHostStatePublishResult bindResult =
-            await _appServerClient.BindRuntimeIncarnationAsync(CancellationToken.None);
-        EnsureApplied(bindResult, "bind the Runtime incarnation");
-
-        HttpWorkerScaleInState state = _scaleInManager.Current;
-        AppServerHostStatePublishResult drainFenceResult = await _appServerClient.PublishLifecycleAsync(
-            RuntimeLifecycleStatus.Draining,
-            state,
-            CancellationToken.None);
-        EnsureApplied(drainFenceResult, "apply the Runtime drain fence");
-        Log.DrainFenceApplied(_logger, condition.Incarnation.Value);
-
-        long lastPublishedVersion = state.Version;
-        Task<RuntimeRetirementDrainResult> drainTask = _workerManager.DrainAllWorkersAsync(
-            condition.Incarnation,
-            CancellationToken.None);
-        long observedVersion = state.Version;
-        while (!drainTask.IsCompleted)
+        RuntimeLifecycleStatus? retainedStatus = null;
+        try
         {
-            Task<long> stateChanged = _scaleInManager.WaitForChangeAsync(observedVersion);
-            Task completed = await Task.WhenAny(drainTask, stateChanged);
-            if (ReferenceEquals(completed, drainTask))
-            {
-                break;
-            }
+            AppServerHostStatePublishResult bindResult =
+                await _appServerClient.BindRuntimeIncarnationAsync(CancellationToken.None);
+            EnsureApplied(bindResult, "bind the Runtime incarnation");
 
-            observedVersion = await stateChanged;
-            state = _scaleInManager.Current;
-            AppServerHostStatePublishResult progressResult = await _appServerClient.PublishLifecycleAsync(
+            HttpWorkerScaleInState state = _scaleInManager.Current;
+            AppServerHostStatePublishResult drainFenceResult = await _appServerClient.PublishLifecycleAsync(
                 RuntimeLifecycleStatus.Draining,
                 state,
                 CancellationToken.None);
-            EnsureApplied(progressResult, "publish Runtime drain progress");
-            lastPublishedVersion = state.Version;
-        }
+            EnsureApplied(drainFenceResult, "apply the Runtime drain fence");
+            retainedStatus = RuntimeLifecycleStatus.Draining;
+            Log.DrainFenceApplied(_logger, condition.Incarnation.Value);
 
-        RuntimeRetirementDrainResult drainResult = await drainTask;
-        if (!drainResult.IsComplete)
-        {
-            throw new InvalidOperationException(
-                drainResult.Failure ?? "Runtime retirement drain did not complete.");
-        }
-
-        state = _scaleInManager.Current;
-        if (state.LinkedWorkerCount != 0)
-        {
-            throw new InvalidOperationException(
-                "Runtime retirement drain completed before local links were cleared.");
-        }
-
-        bool hadFallbackHandoffs = state.OutstandingWorkerRemovals.Count != 0;
-        while (state.OutstandingWorkerRemovals.Count != 0)
-        {
-            if (state.Version != lastPublishedVersion)
+            long lastPublishedVersion = state.Version;
+            Task<RuntimeRetirementDrainResult> drainTask = _workerManager.DrainAllWorkersAsync(
+                condition.Incarnation,
+                CancellationToken.None);
+            long observedVersion = state.Version;
+            while (!drainTask.IsCompleted)
             {
-                AppServerHostStatePublishResult fallbackResult = await _appServerClient.PublishLifecycleAsync(
+                Task<long> stateChanged = _scaleInManager.WaitForChangeAsync(observedVersion);
+                Task completed = await Task.WhenAny(drainTask, stateChanged);
+                if (ReferenceEquals(completed, drainTask))
+                {
+                    break;
+                }
+
+                observedVersion = await stateChanged;
+                state = _scaleInManager.Current;
+                AppServerHostStatePublishResult progressResult = await _appServerClient.PublishLifecycleAsync(
                     RuntimeLifecycleStatus.Draining,
                     state,
                     CancellationToken.None);
-                EnsureApplied(fallbackResult, "publish Runtime worker-removal fallback");
+                EnsureApplied(progressResult, "publish Runtime drain progress");
                 lastPublishedVersion = state.Version;
             }
 
-            long fallbackVersion = state.Version;
-            await _scaleInManager.WaitForChangeAsync(fallbackVersion);
+            RuntimeRetirementDrainResult drainResult = await drainTask;
+            if (!drainResult.IsComplete)
+            {
+                throw new InvalidOperationException(
+                    drainResult.Failure ?? "Runtime retirement drain did not complete.");
+            }
+
             state = _scaleInManager.Current;
             if (state.LinkedWorkerCount != 0)
             {
                 throw new InvalidOperationException(
-                    "A local Worker Link appeared after Runtime retirement admission closed.");
+                    "Runtime retirement drain completed before local links were cleared.");
             }
-        }
 
-        if (hadFallbackHandoffs && state.Version != lastPublishedVersion)
-        {
-            AppServerHostStatePublishResult clearedFallbackResult = await _appServerClient.PublishLifecycleAsync(
-                RuntimeLifecycleStatus.Draining,
+            bool hadFallbackHandoffs = state.OutstandingWorkerRemovals.Count != 0;
+            while (state.OutstandingWorkerRemovals.Count != 0)
+            {
+                if (state.Version != lastPublishedVersion)
+                {
+                    AppServerHostStatePublishResult fallbackResult = await _appServerClient.PublishLifecycleAsync(
+                        RuntimeLifecycleStatus.Draining,
+                        state,
+                        CancellationToken.None);
+                    EnsureApplied(fallbackResult, "publish Runtime worker-removal fallback");
+                    lastPublishedVersion = state.Version;
+                }
+
+                long fallbackVersion = state.Version;
+                await _scaleInManager.WaitForChangeAsync(fallbackVersion);
+                state = _scaleInManager.Current;
+                if (state.LinkedWorkerCount != 0)
+                {
+                    throw new InvalidOperationException(
+                        "A local Worker Link appeared after Runtime retirement admission closed.");
+                }
+            }
+
+            if (hadFallbackHandoffs && state.Version != lastPublishedVersion)
+            {
+                AppServerHostStatePublishResult clearedFallbackResult = await _appServerClient.PublishLifecycleAsync(
+                    RuntimeLifecycleStatus.Draining,
+                    state,
+                    CancellationToken.None);
+                EnsureApplied(clearedFallbackResult, "publish cleared Runtime drain state");
+            }
+
+            AppServerHostStatePublishResult removalResult = await _appServerClient.PublishLifecycleAsync(
+                RuntimeLifecycleStatus.RemovalRequested,
                 state,
                 CancellationToken.None);
-            EnsureApplied(clearedFallbackResult, "publish cleared Runtime drain state");
+            EnsureApplied(removalResult, "publish Runtime removal");
+            Log.RemovalRequested(_logger, condition.Incarnation.Value);
         }
-
-        AppServerHostStatePublishResult removalResult = await _appServerClient.PublishLifecycleAsync(
-            RuntimeLifecycleStatus.RemovalRequested,
-            state,
-            CancellationToken.None);
-        EnsureApplied(removalResult, "publish Runtime removal");
-        Log.RemovalRequested(_logger, condition.Incarnation.Value);
+        catch
+        {
+            _retirementStatePublisher.RetainOwnership(retainedStatus);
+            throw;
+        }
     }
 
     private static void EnsureApplied(AppServerHostStatePublishResult result, string operation)

@@ -185,6 +185,7 @@ stateDiagram-v2
 | Incarnation binding fails | Host remains locally closed; no Worker selection; R4 is incomplete. |
 | AppServer rejects or does not acknowledge the drain fence | Host remains locally closed; no Worker selection; R4 is incomplete. |
 | AppServer returns 400, 409, or 412 | The request is mutation-free and unacknowledged; Host remains locally closed and R4 is incomplete. |
+| Bind, fence, or progress publication fails while a committed Worker drain remains | A root-owned publisher keeps observing and publishing later exact fallback changes without reopening admission or reporting R4 success. |
 | A committed invocation does not finish | Runtime remains fenced in `Draining`; no forced deadline or cancellation is added. |
 | Graceful unlink is uncertain and exact Worker identity exists | Runtime waits for the existing fallback handoff acknowledgement. |
 | Graceful unlink is uncertain and exact Worker identity is absent | Runtime remains fenced and R4 is incomplete. |

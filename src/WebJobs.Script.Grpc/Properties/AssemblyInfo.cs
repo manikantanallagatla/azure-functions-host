@@ -1,9 +1,10 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System.Runtime.CompilerServices;
 
 [assembly: InternalsVisibleTo("Azure.Functions.Rpc.Client")]
+[assembly: InternalsVisibleTo("Azure.Functions.Rpc.Client.Tests")]
 [assembly: InternalsVisibleTo("Azure.Functions.Rpc.Server")]
 [assembly: InternalsVisibleTo("Microsoft.Azure.WebJobs.Script.Benchmarks")]
 [assembly: InternalsVisibleTo("Microsoft.Azure.WebJobs.Script.Tests")]

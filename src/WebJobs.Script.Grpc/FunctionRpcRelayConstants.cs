@@ -6,7 +6,7 @@ namespace Microsoft.Azure.WebJobs.Script.Grpc;
 /// <summary>
 /// Defines application-level FunctionRpc relay signals.
 /// </summary>
-public static class FunctionRpcRelayConstants
+internal static class FunctionRpcRelayConstants
 {
     /// <summary>
     /// Identifies the response trailer that confirms WorkerProxy accepted sticky worker-removal ownership.

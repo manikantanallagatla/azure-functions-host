@@ -1206,8 +1206,16 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                 // LinkAsync holds this gate until the monitor is tracked and publication completes. It also serializes this
                 // cleanup with unlink and shutdown.
                 RpcClientWorkerChannel removedChannel;
+                bool fallbackAdded = false;
                 lock (_stateLock)
                 {
+                    if (_runtimeRetirementRequested &&
+                        !channel.IsWorkerRemovalHandoffConfirmed &&
+                        !AddOutstandingWorkerRemovalLocked(slot, out fallbackAdded))
+                    {
+                        return;
+                    }
+
                     // Only detach the channel associated with this completion signal.
                     removedChannel = DetachChannelLocked(slot, channel);
                 }
@@ -1215,6 +1223,14 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                 if (removedChannel is null)
                 {
                     return;
+                }
+
+                if (fallbackAdded)
+                {
+                    Log.WorkerRemovalFallbackAdded(
+                        _logger,
+                        slot.Worker!.PodName,
+                        slot.Worker.ResourceNamespace);
                 }
 
                 if (terminalException is null)
@@ -1528,6 +1544,27 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
     private bool AddOutstandingWorkerRemoval(WorkerSlot slot)
     {
+        bool added;
+        bool owned;
+        lock (_stateLock)
+        {
+            owned = AddOutstandingWorkerRemovalLocked(slot, out added);
+        }
+
+        if (added)
+        {
+            Log.WorkerRemovalFallbackAdded(
+                _logger,
+                slot.Worker!.PodName,
+                slot.Worker.ResourceNamespace);
+        }
+
+        return owned;
+    }
+
+    private bool AddOutstandingWorkerRemovalLocked(WorkerSlot slot, out bool added)
+    {
+        added = false;
         if (slot.Worker is null)
         {
             Log.WorkerRemovalFallbackUnavailable(_logger, slot.Endpoint);
@@ -1535,24 +1572,17 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         }
 
         FunctionsSplitWorkerRemovalAction action = new(slot.Worker, UnlinkRemovalReason);
-        lock (_stateLock)
+        if (_completedWorkerRemovals.Contains(action) || _outstandingWorkerRemovalSet.Contains(action))
         {
-            if (_completedWorkerRemovals.Contains(action) || _outstandingWorkerRemovalSet.Contains(action))
-            {
-                slot.RemovalFallbackRecorded = true;
-                return true;
-            }
-
-            _outstandingWorkerRemovalSet.Add(action);
-            _outstandingWorkerRemovals.Add(action);
             slot.RemovalFallbackRecorded = true;
-            SignalScaleInStateChangedLocked();
+            return true;
         }
 
-        Log.WorkerRemovalFallbackAdded(
-            _logger,
-            slot.Worker.PodName,
-            slot.Worker.ResourceNamespace);
+        _outstandingWorkerRemovalSet.Add(action);
+        _outstandingWorkerRemovals.Add(action);
+        slot.RemovalFallbackRecorded = true;
+        added = true;
+        SignalScaleInStateChangedLocked();
         return true;
     }
 
