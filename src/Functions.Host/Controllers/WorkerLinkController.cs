@@ -95,7 +95,6 @@ public sealed partial class WorkerLinkController : Controller
             workerId,
             grpcEndpoint,
             request!.Worker,
-            request.WorkerProxyStartupTime,
             started,
             cancellationToken);
     }
@@ -138,10 +137,6 @@ public sealed partial class WorkerLinkController : Controller
                 errors.Add(new(ErrorCodes.WorkerIdentityMismatch, "worker.podName"));
             }
         }
-        else if (request.WorkerProxyStartupTime is not null)
-        {
-            errors.Add(new(ErrorCodes.InvalidWorkerProxyStartupTime, "workerProxyStartupTime"));
-        }
 
         return errors;
     }
@@ -151,7 +146,6 @@ public sealed partial class WorkerLinkController : Controller
         string workerId,
         Uri grpcEndpoint,
         FunctionsSplitPodIdentity? worker,
-        DateTimeOffset? workerProxyStartupTime,
         long started,
         CancellationToken cancellationToken)
     {
@@ -161,8 +155,6 @@ public sealed partial class WorkerLinkController : Controller
             WorkerLinkResult result = worker switch
             {
                 null => await _registry.LinkAsync(workerId, grpcEndpoint, cancellationToken),
-                _ when workerProxyStartupTime is { } authoritativeStartupTime =>
-                    await _registry.LinkAsync(workerId, grpcEndpoint, worker, authoritativeStartupTime, cancellationToken),
                 _ => await _registry.LinkAsync(workerId, grpcEndpoint, worker, cancellationToken),
             };
             Log.LinkAccepted(_logger, workerId, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
@@ -200,7 +192,7 @@ public sealed partial class WorkerLinkController : Controller
         (int statusCode, string code, string detail) = reason switch
         {
             WorkerLinkFailureReason.Conflict => (StatusCodes.Status409Conflict, ErrorCodes.LinkConflict,
-                "The worker link conflicts with the existing endpoint or authoritative metadata."),
+                "The worker link conflicts with the existing endpoint or physical identity."),
             WorkerLinkFailureReason.WorkerTerminated => (StatusCodes.Status409Conflict, ErrorCodes.WorkerTerminated,
                 "The worker's initialized channel has terminated."),
             WorkerLinkFailureReason.RuntimeStopping => (StatusCodes.Status503ServiceUnavailable, ErrorCodes.RuntimeStopping,
@@ -233,7 +225,6 @@ public sealed partial class WorkerLinkController : Controller
     {
         public const string InvalidBody = nameof(InvalidBody);
         public const string InvalidEndpoint = nameof(InvalidEndpoint);
-        public const string InvalidWorkerProxyStartupTime = nameof(InvalidWorkerProxyStartupTime);
         public const string InvalidWorkerIdentity = nameof(InvalidWorkerIdentity);
         public const string LinkConflict = nameof(LinkConflict);
         public const string LinkTimeout = nameof(LinkTimeout);

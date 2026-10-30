@@ -132,7 +132,6 @@ public class WorkerLinkContractTests
             $$"""
             {
               "workerGrpcEndpoint": "http://worker-pod-abc123:5001",
-              "workerProxyStartupTime": "2026-10-30T01:02:03.4567890+00:00",
               "{{propertyName}}": null,
               "worker": {
                 "resourceNamespace": "resource-namespace",
@@ -155,12 +154,8 @@ public class WorkerLinkContractTests
             JsonConvert.DeserializeObject<WorkerLinkRequest>(json));
 
         Assert.Equal("http://worker-pod-abc123:5001", request.WorkerGrpcEndpoint);
-        Assert.Equal(
-            new DateTimeOffset(2026, 10, 30, 1, 2, 3, 456, TimeSpan.Zero).AddTicks(7890),
-            request.WorkerProxyStartupTime);
         Assert.True(request.Worker!.IsValid());
         Assert.Equal(request.Worker, roundTrip.Worker);
-        Assert.Equal(request.WorkerProxyStartupTime, roundTrip.WorkerProxyStartupTime);
         Assert.Null(body.Property(propertyName));
     }
 
@@ -172,7 +167,7 @@ public class WorkerLinkContractTests
 
         JObject body = JObject.Parse(JsonConvert.SerializeObject(request));
 
-        Assert.Equal(new[] { "worker", "workerContainerEncryptionKey", "workerGrpcEndpoint", "workerProxyStartupTime" },
+        Assert.Equal(new[] { "worker", "workerContainerEncryptionKey", "workerGrpcEndpoint" },
             body.Properties().Select(property => property.Name).Order(StringComparer.Ordinal));
     }
 }

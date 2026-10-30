@@ -99,14 +99,13 @@ internal sealed class RuntimeDrainRequestJsonConverter : JsonConverter
                 DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error,
             });
 
-        if (body.Count != 3 ||
-            body.Property(OperationIdPropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } operationIdProperty ||
+        if (body.Property(OperationIdPropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } operationIdProperty ||
             body.Property(ModePropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } modeProperty ||
             body.Property(ReasonPropertyName, StringComparison.Ordinal) is not { Value.Type: JTokenType.String } reasonProperty ||
             !Guid.TryParse(operationIdProperty.Value.Value<string>(), out Guid operationId))
         {
             throw new JsonSerializationException(
-                "The Runtime drain request must contain exactly operationId, mode, and reason.");
+                "The Runtime drain request must contain string operationId, mode, and reason properties.");
         }
 
         return new RuntimeDrainRequest

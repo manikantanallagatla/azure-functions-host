@@ -36,7 +36,7 @@ public sealed partial class WorkerChannelRegistryTests
     private static readonly TimeSpan AppVersionUnlinkTimeout = TimeSpan.FromMilliseconds(100);
 
     [Fact]
-    public async Task PostRuntimeDrain_PhasedCommitsFenceReturnsExactReceiptAndEnforcesReplayConflictAndStrictJson()
+    public async Task PostRuntimeDrain_PhasedCommitsFenceReturnsExactReceiptAndValidatesKnownFields()
     {
         DrainManualTimeProvider timeProvider = new();
         RegistryHarness harness = new(timeProvider, AppVersionUnlinkTimeout);
@@ -68,10 +68,8 @@ public sealed partial class WorkerChannelRegistryTests
             handler,
             timeProvider);
         Guid operationId = Guid.Parse("47bf3a08-900a-48b3-a0f1-f6baa87191f0");
-        Task<HttpResponseMessage> request = host.PostAsync(CreateDrainJson(
-            operationId,
-            "Phased",
-            "ConfigurationChange"));
+        Task<HttpResponseMessage> request = host.PostAsync(
+            $$"""{"operationId":"{{operationId}}","mode":"Phased","reason":"ConfigurationChange","extra":true}""");
         await handler.DrainFenceObserved.Task.WaitAsync(TestTimeout);
 
         Assert.False(request.IsCompleted);
@@ -125,10 +123,6 @@ public sealed partial class WorkerChannelRegistryTests
             "ConfigurationChange"));
         Assert.Equal(HttpStatusCode.BadRequest, unsupportedMode.StatusCode);
 
-        using HttpResponseMessage extraField = await host.PostAsync(
-            $$"""{"operationId":"{{Guid.NewGuid()}}","mode":"Phased","reason":"ConfigurationChange","extra":true}""");
-        Assert.Equal(HttpStatusCode.BadRequest, extraField.StatusCode);
-
         using HttpResponseMessage caseVariant = await host.PostAsync(
             $$"""{"OperationId":"{{Guid.NewGuid()}}","mode":"Phased","reason":"ConfigurationChange"}""");
         Assert.Equal(HttpStatusCode.BadRequest, caseVariant.StatusCode);
@@ -140,6 +134,25 @@ public sealed partial class WorkerChannelRegistryTests
         using HttpResponseMessage invalidTokenType = await host.PostAsync(
             $$"""{"operationId":"{{Guid.NewGuid()}}","mode":1,"reason":"ConfigurationChange"}""");
         Assert.Equal(HttpStatusCode.BadRequest, invalidTokenType.StatusCode);
+
+        using HttpResponseMessage missingProperty = await host.PostAsync(
+            $$"""{"operationId":"{{Guid.NewGuid()}}","mode":"Phased"}""");
+        Assert.Equal(HttpStatusCode.BadRequest, missingProperty.StatusCode);
+
+        using HttpResponseMessage zeroOperationId = await host.PostAsync(
+            """{"operationId":"00000000-0000-0000-0000-000000000000","mode":"Phased","reason":"ConfigurationChange"}""");
+        Assert.Equal(HttpStatusCode.BadRequest, zeroOperationId.StatusCode);
+
+        using HttpResponseMessage invalidOperationId = await host.PostAsync(
+            """{"operationId":"not-a-guid","mode":"Phased","reason":"ConfigurationChange"}""");
+        Assert.Equal(HttpStatusCode.BadRequest, invalidOperationId.StatusCode);
+
+        using HttpResponseMessage invalidReason = await host.PostAsync(
+            $$"""{"operationId":"{{Guid.NewGuid()}}","mode":"Phased","reason":"configurationchange"}""");
+        Assert.Equal(HttpStatusCode.BadRequest, invalidReason.StatusCode);
+
+        using HttpResponseMessage malformed = await host.PostAsync("""{"operationId":""");
+        Assert.Equal(HttpStatusCode.BadRequest, malformed.StatusCode);
 
         DrainManualTimeProvider rejectedTimeProvider = new();
         RegistryHarness rejectedHarness = new(rejectedTimeProvider);

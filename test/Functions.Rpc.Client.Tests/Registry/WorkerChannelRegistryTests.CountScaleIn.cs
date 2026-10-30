@@ -112,6 +112,8 @@ public sealed partial class WorkerChannelRegistryTests
         Assert.Equal(0, await ReadNewlyDrainingWorkerCountAsync(retained));
         Assert.Equal(1, await ReadNewlyDrainingWorkerCountAsync(reduced));
         Assert.Equal(0, await ReadNewlyDrainingWorkerCountAsync(repeated));
+        await WaitUntilAsync(() => first.DisposeCount == 1);
+        Assert.Equal(0, second.DisposeCount);
         CountScaleInPublication publication = Assert.Single(handler.Publications);
         Assert.Equal(16L, publication.HttpCapacity);
         Assert.All(handler.Publications, publication => Assert.False(publication.HasCapacityFence));
@@ -122,7 +124,7 @@ public sealed partial class WorkerChannelRegistryTests
     }
 
     [Fact]
-    public async Task PostScaleIn_ZeroTarget_DrainsAllMatchingWorkersWithoutStartupMetadata()
+    public async Task PostScaleIn_ZeroTarget_DrainsAllMatchingWorkers()
     {
         RegistryHarness harness = new();
         await using WorkerChannelRegistry registry = harness.Registry;
@@ -148,37 +150,35 @@ public sealed partial class WorkerChannelRegistryTests
     }
 
     [Fact]
-    public async Task PostScaleIn_PositiveDurableTarget_PreservesNewestAndPrefersIdleWorker()
+    public async Task PostScaleIn_PositiveDurableTarget_PrefersIdleThenWorkerId()
     {
         RegistryHarness harness = new();
         await using WorkerChannelRegistry registry = harness.Registry;
         FunctionMetadata function = CreateFunction("DurableFunction");
         const string mixedCaseDurable = "Durable";
-        ChannelControl oldest = new("oldest", functionGroupName: mixedCaseDurable, isAlwaysReady: false);
-        ChannelControl middle = new("middle", functionGroupName: mixedCaseDurable, isAlwaysReady: false);
-        ChannelControl newest = new("newest", functionGroupName: mixedCaseDurable, isAlwaysReady: false);
-        DateTimeOffset startup = new(2026, 10, 30, 0, 0, 0, TimeSpan.Zero);
-        (ChannelControl Worker, DateTimeOffset StartupTime)[] workers =
+        ChannelControl busy = new("a-busy", functionGroupName: mixedCaseDurable, isAlwaysReady: false);
+        ChannelControl firstIdle = new("b-idle", functionGroupName: mixedCaseDurable, isAlwaysReady: false);
+        ChannelControl secondIdle = new("c-idle", functionGroupName: mixedCaseDurable, isAlwaysReady: false);
+        ChannelControl[] workers =
         [
-            (oldest, startup),
-            (middle, startup.AddMinutes(1)),
-            (newest, startup.AddMinutes(2)),
+            busy,
+            firstIdle,
+            secondIdle,
         ];
-        foreach ((ChannelControl worker, DateTimeOffset startupTime) in workers)
+        foreach (ChannelControl worker in workers)
         {
             harness.Enqueue(worker);
             await registry.LinkAsync(
                 worker.Id,
                 CreateEndpoint(worker.Id),
-                CreateWorkerIdentity(worker.Id, Guid.NewGuid()),
-                startupTime);
+                CreateWorkerIdentity(worker.Id, Guid.NewGuid()));
         }
 
-        await MakeWorkersReadyAsync(registry, function, oldest, middle, newest);
+        await MakeWorkersReadyAsync(registry, function, workers);
         ScriptInvocationContext invocation = CreateScaleInInvocation(function);
-        Assert.True(oldest.Channel.TryDispatchInvocation(invocation));
+        Assert.True(busy.Channel.TryDispatchInvocation(invocation));
         StreamingMessage request =
-            await oldest.ReadRequestAsync(StreamingMessage.ContentOneofCase.InvocationRequest);
+            await busy.ReadRequestAsync(StreamingMessage.ContentOneofCase.InvocationRequest);
 
         using CountScaleInHostStateHandler handler = new();
         await using CountScaleInApiHost host = await CountScaleInApiHost.StartAsync(registry, handler);
@@ -186,18 +186,18 @@ public sealed partial class WorkerChannelRegistryTests
             """{"functionGroup":"Durable","isAlwaysReady":false,"desiredWorkerCount":2}""");
 
         Assert.Equal(1, await ReadNewlyDrainingWorkerCountAsync(response));
-        await WaitUntilAsync(() => middle.DisposeCount == 1);
-        Assert.Equal(0, oldest.DisposeCount);
-        Assert.Equal(0, newest.DisposeCount);
-        Assert.Contains(oldest.Channel, registry.GetInitializedChannels());
-        Assert.Contains(newest.Channel, registry.GetInitializedChannels());
+        await WaitUntilAsync(() => firstIdle.DisposeCount == 1);
+        Assert.Equal(0, busy.DisposeCount);
+        Assert.Equal(0, secondIdle.DisposeCount);
+        Assert.Contains(busy.Channel, registry.GetInitializedChannels());
+        Assert.Contains(secondIdle.Channel, registry.GetInitializedChannels());
 
-        await SendInvocationResponseAsync(oldest, request.InvocationRequest.InvocationId);
+        await SendInvocationResponseAsync(busy, request.InvocationRequest.InvocationId);
         Assert.NotNull(await invocation.ResultSource.Task.WaitAsync(TestTimeout));
     }
 
     [Fact]
-    public async Task PostScaleIn_InvalidRequestAndUnavailableDurableOrderingMetadata_FailClosed()
+    public async Task PostScaleIn_InvalidRequestAndPositiveDurableTargetWithoutLinkMetadata_UseNormalOrdering()
     {
         RegistryHarness harness = new();
         await using WorkerChannelRegistry registry = harness.Registry;
@@ -216,7 +216,7 @@ public sealed partial class WorkerChannelRegistryTests
         await using CountScaleInApiHost host = await CountScaleInApiHost.StartAsync(registry, handler);
         using HttpResponseMessage invalid = await host.PostAsync(
             """{"functionGroup":"durable","isAlwaysReady":false,"desiredWorkerCount":-1}""");
-        using HttpResponseMessage unordered = await host.PostAsync(
+        using HttpResponseMessage reduced = await host.PostAsync(
             """{"functionGroup":"durable","isAlwaysReady":false,"desiredWorkerCount":1}""");
 
         Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
@@ -224,37 +224,10 @@ public sealed partial class WorkerChannelRegistryTests
             "\"code\":\"InvalidValue\",\"target\":\"desiredWorkerCount\"",
             await invalid.Content.ReadAsStringAsync(),
             StringComparison.Ordinal);
-        Assert.Equal(0, await ReadNewlyDrainingWorkerCountAsync(unordered));
-        Assert.Equal(0, first.DisposeCount);
+        Assert.Equal(1, await ReadNewlyDrainingWorkerCountAsync(reduced));
+        await WaitUntilAsync(() => first.DisposeCount == 1);
         Assert.Equal(0, second.DisposeCount);
-        Assert.Equal(2, registry.GetInitializedChannels().Count);
-
-        using HttpResponseMessage clearLegacyWorkers = await host.PostAsync(
-            """{"functionGroup":"durable","isAlwaysReady":false,"desiredWorkerCount":0}""");
-        Assert.Equal(2, await ReadNewlyDrainingWorkerCountAsync(clearLegacyWorkers));
-        await WaitUntilAsync(() => first.DisposeCount == 1 && second.DisposeCount == 1);
-
-        DateTimeOffset tiedStartupTime = new(2026, 10, 30, 0, 0, 0, TimeSpan.Zero);
-        ChannelControl tiedFirst = new("tied-first", functionGroupName: FunctionGroups.Durable, isAlwaysReady: false);
-        ChannelControl tiedSecond = new("tied-second", functionGroupName: FunctionGroups.Durable, isAlwaysReady: false);
-        foreach (ChannelControl worker in new[] { tiedFirst, tiedSecond })
-        {
-            harness.Enqueue(worker);
-            await registry.LinkAsync(
-                worker.Id,
-                CreateEndpoint(worker.Id),
-                CreateWorkerIdentity(worker.Id, Guid.NewGuid()),
-                tiedStartupTime);
-            await worker.ReadRequestAsync(StreamingMessage.ContentOneofCase.FunctionLoadRequest);
-            await SendFunctionLoadResponseAsync(worker, function.GetFunctionId());
-        }
-
-        await WaitUntilAsync(() => tiedFirst.Channel.IsReadyForInvocations && tiedSecond.Channel.IsReadyForInvocations);
-        using HttpResponseMessage ambiguous = await host.PostAsync(
-            """{"functionGroup":"durable","isAlwaysReady":false,"desiredWorkerCount":1}""");
-        Assert.Equal(0, await ReadNewlyDrainingWorkerCountAsync(ambiguous));
-        Assert.Equal(0, tiedFirst.DisposeCount);
-        Assert.Equal(0, tiedSecond.DisposeCount);
+        Assert.Single(registry.GetInitializedChannels());
     }
 
     private static async Task MakeWorkersReadyAsync(

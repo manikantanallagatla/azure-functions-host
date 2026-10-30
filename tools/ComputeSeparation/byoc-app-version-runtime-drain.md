@@ -22,10 +22,11 @@ This change does not add:
 - generalized operation history or Immediate-to-Phased downgrade;
 - Host-process schedule recovery.
 
-## 2. Strict shared contract
+## 2. Shared contract
 
-The request contains exactly three fields. Unknown fields, malformed values, missing fields, and a
-zero operation ID return HTTP `400`.
+The request requires three known fields. Additive unknown fields are accepted for forward
+compatibility. Missing known fields, wrong JSON types, case-variant known field names, duplicate
+properties, malformed JSON, invalid values, and a zero operation ID return HTTP `400`.
 
 ```http
 POST /admin/functions/drain
@@ -65,7 +66,7 @@ remain private Host state.
 | Same operation ID with different payload | `409`. |
 | Different operation while Phased is active | `409`, except for the one allowed Immediate escalation. |
 | Different operation after Immediate is active | `409`. |
-| Invalid mode, reason, body, extra field, or zero GUID | `400`. |
+| Invalid mode, reason, required field, body, duplicate property, or zero GUID | `400`. |
 | AppServer admission fence cannot be committed | Non-success response with no receipt. |
 
 The coordinated Go relay at commit `7350d9e1e6273810569d1320df140576c3098804`
@@ -253,8 +254,8 @@ A timer alone cannot bypass fallback ownership.
 
 | File | Review purpose |
 | --- | --- |
-| `Functions.Host/Controllers/RuntimeDrainController.cs` | Authenticated strict API, validation, exact receipt, `400`/`409`/failure mapping. |
-| `Functions.Host/Models/RuntimeDrainRequest.cs` | Exact request, receipt, enum, and error wire shapes. |
+| `Functions.Host/Controllers/RuntimeDrainController.cs` | Authenticated API, validation, exact receipt, `400`/`409`/failure mapping. |
+| `Functions.Host/Models/RuntimeDrainRequest.cs` | Required known request fields with additive-field compatibility, receipt, enum, and error wire shapes. |
 | `Functions.Host/HostState/IAppVersionRuntimeDrainManager.cs` | Narrow public controller dependency. |
 | `Functions.Host/HostState/AppVersionRuntimeDrainManager.cs` | One in-memory P2/P3 coordinator, replay, escalation, timers, progress, and final lifecycle. |
 | `Functions.Host/HostState/AppServerHostStateServiceCollectionExtensions.cs` | Root coordinator registration. |
@@ -269,8 +270,8 @@ A timer alone cannot bypass fallback ownership.
 The six focused in-memory public-API methods prove:
 
 1. synchronous lifecycle fence commitment, exact three-field receipt, exact replay, conflict,
-   ordinal property names, duplicate/unknown/type rejection, non-ready linked-Worker ownership, and
-   closed late Link admission;
+   additive-field compatibility, ordinal required property names, duplicate/type/malformed
+   rejection, non-ready linked-Worker ownership, and closed late Link admission;
 2. deterministic 20% non-HTTP batches at 0/10/20/30/40 seconds, HTTP selection at 35 seconds, and
    replay without schedule reset;
 3. per-selection 60-minute deadline fallback plus completion ownership for a pre-existing P1 drain;

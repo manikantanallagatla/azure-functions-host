@@ -182,7 +182,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
         string workerId,
         Uri grpcEndpoint,
         CancellationToken cancellationToken = default)
-        => LinkAsyncCore(workerId, grpcEndpoint, worker: null, workerProxyStartupTime: null, cancellationToken);
+        => LinkAsyncCore(workerId, grpcEndpoint, worker: null, cancellationToken);
 
     public Task<WorkerLinkResult> LinkAsync(
         string workerId,
@@ -201,35 +201,13 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             throw new ArgumentException("The route worker ID must exactly match the worker pod name.", nameof(worker));
         }
 
-        return LinkAsyncCore(workerId, grpcEndpoint, worker, workerProxyStartupTime: null, cancellationToken);
-    }
-
-    public Task<WorkerLinkResult> LinkAsync(
-        string workerId,
-        Uri grpcEndpoint,
-        FunctionsSplitPodIdentity worker,
-        DateTimeOffset workerProxyStartupTime,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(worker);
-        if (!worker.IsValid())
-        {
-            throw new ArgumentException("The worker identity is incomplete or invalid.", nameof(worker));
-        }
-
-        if (!string.Equals(workerId, worker.PodName, StringComparison.Ordinal))
-        {
-            throw new ArgumentException("The route worker ID must exactly match the worker pod name.", nameof(worker));
-        }
-
-        return LinkAsyncCore(workerId, grpcEndpoint, worker, workerProxyStartupTime, cancellationToken);
+        return LinkAsyncCore(workerId, grpcEndpoint, worker, cancellationToken);
     }
 
     private Task<WorkerLinkResult> LinkAsyncCore(
         string workerId,
         Uri grpcEndpoint,
         FunctionsSplitPodIdentity worker,
-        DateTimeOffset? workerProxyStartupTime,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerId);
@@ -265,18 +243,6 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                     }
                 }
 
-                if (workerProxyStartupTime is not null)
-                {
-                    if (existing.WorkerProxyStartupTime is not null &&
-                        existing.WorkerProxyStartupTime != workerProxyStartupTime)
-                    {
-                        throw new WorkerLinkException(WorkerLinkFailureReason.Conflict,
-                            "The worker is already associated with a different original startup time.");
-                    }
-
-                    existing.WorkerProxyStartupTime ??= workerProxyStartupTime;
-                }
-
                 if (existing.Terminal || existing.Channel is { IsTerminated: true })
                 {
                     throw new WorkerLinkException(WorkerLinkFailureReason.WorkerTerminated,
@@ -292,7 +258,6 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                 Endpoint = grpcEndpoint,
                 LinkTask = linkCompletion.Task,
                 Worker = worker,
-                WorkerProxyStartupTime = workerProxyStartupTime,
             };
             _slots.Add(workerId, slot);
             _linkAttempts.Add(workerId, slot);
@@ -440,7 +405,7 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                     continue;
                 }
 
-                candidates.Add(new(workerId, slot, isIdle, slot.WorkerProxyStartupTime));
+                candidates.Add(new(workerId, slot, isIdle));
             }
 
             int excess = Math.Max(0, candidates.Count - desiredWorkerCount);
@@ -449,41 +414,8 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
                 return new(0, GetScaleInStateLocked());
             }
 
-            string retainedWorkerId = null;
-            if (desiredWorkerCount > 0 &&
-                string.Equals(functionGroup, FunctionGroups.Durable, StringComparison.OrdinalIgnoreCase))
-            {
-                if (candidates.Any(static candidate => candidate.WorkerProxyStartupTime is null))
-                {
-                    Log.CountScaleInOrderingUnavailable(
-                        _logger,
-                        functionGroup,
-                        isAlwaysReady,
-                        candidates.Count);
-                    return new(0, GetScaleInStateLocked());
-                }
-
-                long newestStartupTicks = candidates.Max(
-                    static candidate => candidate.WorkerProxyStartupTime.Value.UtcTicks);
-                CountScaleInCandidate[] newestCandidates = [.. candidates.Where(
-                    candidate => candidate.WorkerProxyStartupTime.Value.UtcTicks == newestStartupTicks)];
-                if (newestCandidates.Length != 1)
-                {
-                    Log.CountScaleInOrderingAmbiguous(
-                        _logger,
-                        functionGroup,
-                        isAlwaysReady,
-                        newestCandidates.Length);
-                    return new(0, GetScaleInStateLocked());
-                }
-
-                retainedWorkerId = newestCandidates[0].WorkerId;
-            }
-
             CountScaleInCandidate[] orderedCandidates = [.. candidates
-                .Where(candidate => !string.Equals(candidate.WorkerId, retainedWorkerId, StringComparison.Ordinal))
                 .OrderByDescending(static candidate => candidate.IsIdle)
-                .ThenBy(static candidate => candidate.WorkerProxyStartupTime?.UtcTicks ?? long.MinValue)
                 .ThenBy(static candidate => candidate.WorkerId, StringComparer.Ordinal)];
             HashSet<string> selectedWorkerIds = new(StringComparer.Ordinal);
 
@@ -1773,16 +1705,12 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         // The authoritative physical identity is set at most once and retained after channel withdrawal.
         public FunctionsSplitPodIdentity Worker { get; set; }
-
-        // The authoritative original WorkerProxy startup time is retained beside exact identity.
-        public DateTimeOffset? WorkerProxyStartupTime { get; set; }
     }
 
     private sealed record CountScaleInCandidate(
         string WorkerId,
         WorkerSlot Slot,
-        bool IsIdle,
-        DateTimeOffset? WorkerProxyStartupTime);
+        bool IsIdle);
 
     private sealed record CountScaleInSelection(
         string WorkerId,
@@ -1845,22 +1773,6 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             ILogger logger,
             string functionGroup,
             bool isAlwaysReady);
-
-        [LoggerMessage(12, LogLevel.Warning,
-            "Skipped positive Durable count scale-in for function group {FunctionGroup} and always-ready class {IsAlwaysReady} because authoritative startup time is unavailable for one or more of {CandidateCount} eligible Workers.")]
-        public static partial void CountScaleInOrderingUnavailable(
-            ILogger logger,
-            string functionGroup,
-            bool isAlwaysReady,
-            int candidateCount);
-
-        [LoggerMessage(13, LogLevel.Warning,
-            "Skipped positive Durable count scale-in for function group {FunctionGroup} and always-ready class {IsAlwaysReady} because {NewestCandidateCount} eligible Workers share the newest authoritative startup time.")]
-        public static partial void CountScaleInOrderingAmbiguous(
-            ILogger logger,
-            string functionGroup,
-            bool isAlwaysReady,
-            int newestCandidateCount);
 
         [LoggerMessage(14, LogLevel.Information,
             "Selected worker {WorkerId} for app-version Runtime drain with committed-invocation grace deadline {InvocationGraceDeadline}.")]
