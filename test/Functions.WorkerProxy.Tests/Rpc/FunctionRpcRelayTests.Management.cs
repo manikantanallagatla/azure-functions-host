@@ -143,7 +143,10 @@ public partial class FunctionRpcRelayTests
             StreamingMessage initialized = CreateInitResponse(init.RequestId, "http://localhost:1234/");
             StreamingMessage expected = initialized.Clone();
             expected.WorkerInitResponse.Capabilities["HttpUri"] = proxyEndpoint;
+            expected.WorkerInitResponse.Capabilities[WorkerAssignmentMetadataVersionCapability] =
+                WorkerAssignmentMetadataVersion;
             expected.WorkerInitResponse.Capabilities["FunctionGroupName"] = "test-group";
+            expected.WorkerInitResponse.Capabilities["IsAlwaysReady"] = bool.FalseString;
             await worker.WriteAsync(initialized, timeout.Token);
             Assert.Equal(expected, await runtime.ReadAsync(timeout.Token));
             Assert.Equal(3, manager.State.Revision);

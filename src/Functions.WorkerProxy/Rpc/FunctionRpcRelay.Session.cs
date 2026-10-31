@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Frozen;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Threading;
 using System.Threading.Channels;
@@ -27,6 +28,10 @@ internal sealed partial class FunctionRpcRelay
         WorkerPodStateManager stateManager)
     {
         private const string FunctionGroupNameCapability = "FunctionGroupName";
+        private const string IsAlwaysReadyCapability = "IsAlwaysReady";
+        private const string MaxHttpConcurrencyCapability = "MaxHttpConcurrency";
+        private const string WorkerAssignmentMetadataVersionCapability = "WorkerAssignmentMetadataVersion";
+        private const string WorkerAssignmentMetadataVersion = "1";
         private readonly Lock _stateLock = new();
         private readonly Channel<StreamingMessage> _toRuntime = CreateChannel();
         private readonly Channel<StreamingMessage> _toWorker = CreateChannel();
@@ -275,7 +280,7 @@ internal sealed partial class FunctionRpcRelay
             if (capabilities is null)
             {
                 Uri? destination = capabilityFinalizer.FinalizeCapabilities(finalized.WorkerInitResponse.Capabilities);
-                ApplyFunctionGroupCapability(finalized.WorkerInitResponse.Capabilities);
+                ApplyAssignmentCapabilities(finalized.WorkerInitResponse.Capabilities);
                 capabilities = finalized.WorkerInitResponse.Capabilities.ToFrozenDictionary(StringComparer.Ordinal);
                 lock (_stateLock)
                 {
@@ -299,23 +304,37 @@ internal sealed partial class FunctionRpcRelay
         }
 
         /// <summary>
-        /// Advertises the function group assigned to this session's worker, replacing any worker-supplied value.
+        /// Advertises platform-owned assignment capabilities, replacing any worker-supplied values.
         /// </summary>
         /// <remarks>
-        /// Only WorkerProxy sets this capability, so any worker-supplied value is always discarded.
+        /// Only WorkerProxy sets these capabilities, so worker-supplied values are always discarded.
         /// The platform assigns the worker before the runtime initializes it. Without a live assignment for this session,
-        /// the capability is omitted so the runtime never receives an unassigned or stale group.
+        /// the capabilities are omitted so the runtime never receives unassigned or stale scale-in metadata.
         /// </remarks>
-        private void ApplyFunctionGroupCapability(IDictionary<string, string> capabilities)
+        private void ApplyAssignmentCapabilities(IDictionary<string, string> capabilities)
         {
-            // Only WorkerProxy sets this capability; discard any worker-supplied value.
             capabilities.Remove(FunctionGroupNameCapability);
+            capabilities.Remove(IsAlwaysReadyCapability);
+            capabilities.Remove(MaxHttpConcurrencyCapability);
+            capabilities.Remove(WorkerAssignmentMetadataVersionCapability);
 
             WorkerPodState state = stateManager.State;
             if (state is { AssignmentState: WorkerAssignmentState.Ready, FunctionGroupName: { } functionGroupName }
                 && state.SessionId == id)
             {
+                capabilities[WorkerAssignmentMetadataVersionCapability] = WorkerAssignmentMetadataVersion;
                 capabilities[FunctionGroupNameCapability] = functionGroupName;
+                if (state.IsAlwaysReady is { } isAlwaysReady)
+                {
+                    capabilities[IsAlwaysReadyCapability] = isAlwaysReady.ToString();
+                }
+
+                if (state.MaxHttpConcurrency is > 0 and { } maxHttpConcurrency)
+                {
+                    capabilities[MaxHttpConcurrencyCapability] =
+                        maxHttpConcurrency.ToString(CultureInfo.InvariantCulture);
+                }
+
                 return;
             }
 
