@@ -48,6 +48,6 @@ internal sealed record SplitWorkerOriginState(
             checked((int)state.Revision),
             status,
             link,
-            state.AssignmentState == WorkerAssignmentState.Failed);
+            state.RemovalRequested || state.AssignmentState == WorkerAssignmentState.Failed);
     }
 }

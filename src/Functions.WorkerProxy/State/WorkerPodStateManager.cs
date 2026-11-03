@@ -27,6 +27,8 @@ internal sealed class WorkerPodStateManager
     private readonly TimeProvider _timeProvider;
     private WorkerPodState _state;
     private WorkerAssignment? _assignment;
+    private bool _applicationStopping;
+
     // High-water mark for accepted or terminated sessions, including sessions that never had a worker.
     private long _lastSessionId;
     private int _assignmentClaimed;
@@ -133,7 +135,9 @@ internal sealed class WorkerPodStateManager
         lock (_stateLock)
         {
             // Pre-assignment transport sessions may be replaced; an assigned pod's failure is terminal.
-            if (sessionId <= _lastSessionId || _state.AssignmentState == WorkerAssignmentState.Failed || _state.RemovalRequested)
+            if (sessionId <= _lastSessionId ||
+                _state.AssignmentState == WorkerAssignmentState.Failed ||
+                _state.RemovalRequested)
             {
                 return false;
             }
@@ -260,6 +264,9 @@ internal sealed class WorkerPodStateManager
     /// Withdraws readiness on relay termination or worker detachment. Old notifications have no effect.
     /// </summary>
     public bool OnSessionTerminated(long sessionId)
+        => OnSessionTerminated(sessionId, workerStreamFailed: false);
+
+    internal bool OnSessionTerminated(long sessionId, bool workerStreamFailed)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sessionId);
 
@@ -279,6 +286,10 @@ internal sealed class WorkerPodStateManager
             {
                 throw new InvalidOperationException("A different worker session is still attached.");
             }
+
+            bool establishedWorkerSession = _state.IsWorkerAttached &&
+                _state.SessionId == sessionId &&
+                _state.WorkerId is not null;
 
             // A runtime-only session can terminate before any worker attaches. Fence off its late notifications.
             _lastSessionId = sessionId;
@@ -304,6 +315,8 @@ internal sealed class WorkerPodStateManager
                 IsWorkerAttached = false,
                 RuntimeIdentity = null,
                 RuntimeInitialized = false,
+                RemovalRequested = _state.RemovalRequested ||
+                    (workerStreamFailed && establishedWorkerSession && !_applicationStopping),
                 // Any assigned worker-session loss requires the pod owner to replace this unhealthy pod.
                 AssignmentState = _assignment is null
                     ? WorkerAssignmentState.Unassigned
@@ -355,11 +368,6 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
-            if (_state.RemovalRequested)
-            {
-                return WorkerAssignmentResult.WorkerNotReady;
-            }
-
             // Replay/conflict takes precedence over current readiness, including after the assigned stream terminates.
             if (_assignment is not null)
             {
@@ -371,6 +379,11 @@ internal sealed class WorkerPodStateManager
                 return _state.AssignmentState == WorkerAssignmentState.Failed
                     ? WorkerAssignmentResult.WorkerTerminated
                     : WorkerAssignmentResult.AlreadyAssigned;
+            }
+
+            if (_state.RemovalRequested)
+            {
+                return WorkerAssignmentResult.WorkerNotReady;
             }
 
             if (_state.RuntimeIdentity is { } runtime &&
@@ -401,6 +414,17 @@ internal sealed class WorkerPodStateManager
             _assignment = assignment;
             UpdateStateAndNotifyWaitersLocked(assigned);
             return WorkerAssignmentResult.Created;
+        }
+    }
+
+    /// <summary>
+    /// Prevents intentional application shutdown from being classified as worker loss.
+    /// </summary>
+    public void OnApplicationStopping()
+    {
+        lock (_stateLock)
+        {
+            _applicationStopping = true;
         }
     }
 
