@@ -1909,6 +1909,7 @@ public sealed partial class WorkerChannelRegistryTests
             TimeProvider timeProvider = null)
         {
             HostConfigurationLogger.Setup(logger => logger.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
+            RegistryLogger.Setup(logger => logger.IsEnabled(LogLevel.Information)).Returns(true);
             workerHostConfigurationParser ??= new WorkerHostConfigurationParser(
                 configuration ?? new ConfigurationBuilder().Build(),
                 HostConfigurationLogger.Object);
@@ -1949,9 +1950,9 @@ public sealed partial class WorkerChannelRegistryTests
                     return channel;
                 });
             Registry = linkTimeout.HasValue
-                ? new(DuplexFactory.Object, ChannelFactory.Object, NullLogger<WorkerChannelRegistry>.Instance,
+                ? new(DuplexFactory.Object, ChannelFactory.Object, RegistryLogger.Object,
                     linkTimeout.Value, workerHostConfigurationParser, registryOwnedAttempt, timeProvider)
-                : new(DuplexFactory.Object, ChannelFactory.Object, NullLogger<WorkerChannelRegistry>.Instance, workerHostConfigurationParser);
+                : new(DuplexFactory.Object, ChannelFactory.Object, RegistryLogger.Object, workerHostConfigurationParser);
         }
 
         internal Mock<IRpcClientWorkerChannelFactory> ChannelFactory { get; } = new();
@@ -1959,6 +1960,8 @@ public sealed partial class WorkerChannelRegistryTests
         internal Mock<IDuplexChannelFactory<StreamingMessage>> DuplexFactory { get; } = new();
 
         internal Mock<ILogger<WorkerHostConfigurationParser>> HostConfigurationLogger { get; } = new();
+
+        internal Mock<ILogger<WorkerChannelRegistry>> RegistryLogger { get; } = new();
 
         internal WorkerChannelRegistry Registry { get; }
 
@@ -1984,6 +1987,8 @@ public sealed partial class WorkerChannelRegistryTests
         private readonly TaskCompletionSource _setupEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _setupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly Exception _setupFailure;
+        private readonly string _functionGroupName;
+        private readonly bool? _isAlwaysReady;
         private int _remainingSetupFailures;
         private int _setupAttempts;
         private Exception _startFailure;
@@ -1995,12 +2000,16 @@ public sealed partial class WorkerChannelRegistryTests
             bool blockDisposal = false,
             bool blockSetup = false,
             int setupFailureCount = 0,
-            Exception setupFailure = null)
+            Exception setupFailure = null,
+            string functionGroupName = null,
+            bool? isAlwaysReady = null)
         {
             Id = id;
             Transport = new(blockDisposal);
             _remainingSetupFailures = setupFailureCount;
             _setupFailure = setupFailure ?? new InvalidOperationException("Channel setup failed.");
+            _functionGroupName = functionGroupName;
+            _isAlwaysReady = isAlwaysReady;
             if (!blockStart)
             {
                 _startRelease.TrySetResult();
@@ -2138,14 +2147,23 @@ public sealed partial class WorkerChannelRegistryTests
                     return;
                 }
 
-                await Transport.SendResponseAsync(new StreamingMessage
+                WorkerInitResponse response = new()
                 {
-                    WorkerInitResponse = new WorkerInitResponse
-                    {
-                        Result = InitResult,
-                        HostConfiguration = HostConfiguration,
-                    },
-                });
+                    Result = InitResult,
+                    HostConfiguration = HostConfiguration,
+                };
+                if (_functionGroupName is not null)
+                {
+                    response.Capabilities[RpcClientWorkerChannel.FunctionGroupNameCapability] = _functionGroupName;
+                }
+
+                if (_isAlwaysReady is not null)
+                {
+                    response.Capabilities[RpcClientWorkerChannel.IsAlwaysReadyCapability] =
+                        _isAlwaysReady.Value ? bool.TrueString : bool.FalseString;
+                }
+
+                await Transport.SendResponseAsync(new StreamingMessage { WorkerInitResponse = response });
             }
             catch (ChannelClosedException)
             {

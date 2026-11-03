@@ -31,6 +31,7 @@ internal sealed partial class FunctionRpcRelay
         TokenServiceProxyService? tokenServiceProxy)
     {
         private const string FunctionGroupNameCapability = "FunctionGroupName";
+        private const string IsAlwaysReadyCapability = "IsAlwaysReady";
         private readonly Lock _stateLock = new();
         private readonly Channel<StreamingMessage> _toRuntime = CreateChannel(singleWriter: false);
         private readonly Channel<StreamingMessage> _toWorker = CreateChannel();
@@ -337,7 +338,7 @@ internal sealed partial class FunctionRpcRelay
             if (capabilities is null)
             {
                 Uri? destination = capabilityFinalizer.FinalizeCapabilities(finalized.WorkerInitResponse.Capabilities);
-                ApplyFunctionGroupCapability(finalized.WorkerInitResponse.Capabilities);
+                ApplyWorkerClassificationCapabilities(finalized.WorkerInitResponse.Capabilities);
                 capabilities = finalized.WorkerInitResponse.Capabilities.ToFrozenDictionary(StringComparer.Ordinal);
                 lock (_stateLock)
                 {
@@ -360,28 +361,26 @@ internal sealed partial class FunctionRpcRelay
             return finalized;
         }
 
-        /// <summary>
-        /// Advertises the function group assigned to this session's worker, replacing any worker-supplied value.
-        /// </summary>
-        /// <remarks>
-        /// Only WorkerProxy sets this capability, so any worker-supplied value is always discarded.
-        /// The platform assigns the worker before the runtime initializes it. Without a live assignment for this session,
-        /// the capability is omitted so the runtime never receives an unassigned or stale group.
-        /// </remarks>
-        private void ApplyFunctionGroupCapability(IDictionary<string, string> capabilities)
+        private void ApplyWorkerClassificationCapabilities(IDictionary<string, string> capabilities)
         {
-            // Only WorkerProxy sets this capability; discard any worker-supplied value.
             capabilities.Remove(FunctionGroupNameCapability);
+            capabilities.Remove(IsAlwaysReadyCapability);
 
             WorkerPodState state = stateManager.State;
-            if (state is { AssignmentState: WorkerAssignmentState.Ready, FunctionGroupName: { } functionGroupName }
+            if (state is
+                {
+                    AssignmentState: WorkerAssignmentState.Ready,
+                    FunctionGroupName: { } functionGroupName,
+                    IsAlwaysReady: { } isAlwaysReady,
+                }
                 && state.SessionId == id)
             {
                 capabilities[FunctionGroupNameCapability] = functionGroupName;
+                capabilities[IsAlwaysReadyCapability] = isAlwaysReady ? bool.TrueString : bool.FalseString;
                 return;
             }
 
-            Log.FunctionGroupNotAdvertised(logger, id, state.AssignmentState);
+            Log.WorkerClassificationNotAdvertised(logger, id, state.AssignmentState);
         }
 
         private async Task WriteOutboundAsync(FunctionRpcRelaySide side, ChannelReader<StreamingMessage> source,
@@ -604,8 +603,10 @@ internal sealed partial class FunctionRpcRelay
 
         [LoggerMessage(3, LogLevel.Warning,
             "FunctionRpc relay session {SessionId} received a WorkerInitResponse, but the session has no active worker " +
-            "assignment (assignment state: {AssignmentState}). The FunctionGroupName capability was omitted, " +
-            "so the Host will treat the worker's function group as unknown.")]
-        public static partial void FunctionGroupNotAdvertised(ILogger logger, long sessionId, WorkerAssignmentState assignmentState);
+            "assignment (assignment state: {AssignmentState}). Worker classification capabilities were omitted.")]
+        public static partial void WorkerClassificationNotAdvertised(
+            ILogger logger,
+            long sessionId,
+            WorkerAssignmentState assignmentState);
     }
 }

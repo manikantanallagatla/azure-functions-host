@@ -2,11 +2,15 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
 using Microsoft.Azure.WebJobs.Script;
 using Microsoft.Azure.WebJobs.Script.AppCapabilities;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.Grpc;
@@ -29,9 +33,17 @@ namespace Azure.Functions.Rpc.Client;
 /// </remarks>
 internal sealed class RpcClientWorkerChannel : WorkerChannel
 {
+    internal const string FunctionGroupNameCapability = "FunctionGroupName";
+    internal const string IsAlwaysReadyCapability = "IsAlwaysReady";
+
+    private readonly HashSet<ScriptInvocationContext> _acceptedInvocations = [];
     private readonly TaskCompletionSource<Exception> _functionLoadFailure = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Lock _invocationAdmissionLock = new();
     private readonly Lock _lifecycleLock = new();
     private readonly TaskCompletionSource _startCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _draining;
+    private string _functionGroupName;
+    private bool? _isAlwaysReady;
     private LifecycleState _lifecycleState;
 
     public RpcClientWorkerChannel(
@@ -86,7 +98,84 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
     internal bool IsTerminated => Completion.IsCompleted || FunctionLoadFailure.IsCompleted;
 
     // Terminal signals can precede registry cleanup and the base channel's disposal state.
-    internal bool IsReadyForInvocations => !IsTerminated && IsChannelReadyForInvocations();
+    internal bool IsReadyForInvocations
+    {
+        get
+        {
+            lock (_invocationAdmissionLock)
+            {
+                return IsUsableForInvocationsLocked();
+            }
+        }
+    }
+
+    internal bool TryDispatchInvocation(ScriptInvocationContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        lock (_invocationAdmissionLock)
+        {
+            if (!IsUsableForInvocationsLocked())
+            {
+                return false;
+            }
+
+            string functionId = context.FunctionMetadata.GetFunctionId();
+            if (!FunctionInputBuffers.TryGetValue(functionId, out BufferBlock<ScriptInvocationContext> inputBuffer))
+            {
+                throw new InvalidOperationException(
+                    $"Function '{context.FunctionMetadata.Name}' is not loaded by worker '{Id}'.");
+            }
+
+            _acceptedInvocations.Add(context);
+
+            if (!inputBuffer.Post(context))
+            {
+                _acceptedInvocations.Remove(context);
+                return false;
+            }
+        }
+
+        _ = context.ResultSource.Task.ContinueWith(
+            static (_, state) =>
+            {
+                (RpcClientWorkerChannel channel, ScriptInvocationContext invocation) =
+                    ((RpcClientWorkerChannel, ScriptInvocationContext))state;
+                channel.ReleaseAcceptedInvocation(invocation);
+            },
+            (this, context),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        return true;
+    }
+
+    internal bool IsScaleInCandidate(string functionGroup, bool isAlwaysReady)
+    {
+        lock (_invocationAdmissionLock)
+        {
+            return IsScaleInEligibleLocked(functionGroup, isAlwaysReady);
+        }
+    }
+
+    internal Task TryBeginScaleIn(string functionGroup, bool isAlwaysReady)
+    {
+        lock (_invocationAdmissionLock)
+        {
+            if (!IsScaleInEligibleLocked(functionGroup, isAlwaysReady))
+            {
+                return null;
+            }
+
+            _draining = true;
+            return Task.WhenAll(_acceptedInvocations.Select(static invocation => invocation.ResultSource.Task)).ContinueWith(
+                static _ => { },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+    }
 
     /// <summary>
     /// Starts inbound protocol processing and waits for the worker initialization handshake.
@@ -153,8 +242,10 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
 
         if (disposing)
         {
+            ObjectDisposedException exception = new(GetType().FullName);
             // Metadata callers did not request cancellation; fail so host startup can retry.
-            FailPendingMetadataRequest(new ObjectDisposedException(GetType().FullName));
+            FailPendingMetadataRequest(exception);
+            FailAcceptedInvocations(exception);
         }
 
         base.Dispose(disposing);
@@ -168,6 +259,12 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
             {
                 throw new InvalidOperationException("The worker reported unsuccessful initialization.");
             }
+
+            _functionGroupName = GetWorkerCapabilityState(FunctionGroupNameCapability);
+            string isAlwaysReady = GetWorkerCapabilityState(IsAlwaysReadyCapability);
+            _isAlwaysReady = bool.TryParse(isAlwaysReady, out bool parsedIsAlwaysReady)
+                ? parsedIsAlwaysReady
+                : null;
 
             _startCompletion.TrySetResult();
         }
@@ -190,4 +287,38 @@ internal sealed class RpcClientWorkerChannel : WorkerChannel
 
         return startStreamTimeout;
     }
+
+    private void FailAcceptedInvocations(Exception exception)
+    {
+        ScriptInvocationContext[] invocations;
+        lock (_invocationAdmissionLock)
+        {
+            _draining = true;
+            invocations = [.. _acceptedInvocations];
+            _acceptedInvocations.Clear();
+        }
+
+        foreach (ScriptInvocationContext invocation in invocations)
+        {
+            invocation.ResultSource.TrySetException(exception);
+        }
+    }
+
+    private void ReleaseAcceptedInvocation(ScriptInvocationContext invocation)
+    {
+        lock (_invocationAdmissionLock)
+        {
+            _acceptedInvocations.Remove(invocation);
+        }
+    }
+
+    private bool IsScaleInEligibleLocked(string functionGroup, bool isAlwaysReady)
+        => IsUsableForInvocationsLocked() &&
+            string.Equals(_functionGroupName, functionGroup, StringComparison.Ordinal) &&
+            _isAlwaysReady == isAlwaysReady;
+
+    private bool IsUsableForInvocationsLocked()
+        => !_draining &&
+            !IsTerminated &&
+            IsChannelReadyForInvocations();
 }

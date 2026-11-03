@@ -132,7 +132,12 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
             }
 
             linkCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            slot = new() { Endpoint = grpcEndpoint, RuntimeIdentity = runtimeIdentity, LinkTask = linkCompletion.Task };
+            slot = new()
+            {
+                Endpoint = grpcEndpoint,
+                RuntimeIdentity = runtimeIdentity,
+                LinkTask = linkCompletion.Task,
+            };
             _slots.Add(workerId, slot);
             _linkAttempts.Add(workerId, slot);
         }
@@ -155,6 +160,87 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
     private static async Task<WorkerLinkResult> CompleteLinkAsync(Task<WorkerChannel> link, bool isNewLink)
         => new(await link.ConfigureAwait(false), isNewLink);
+
+    public int ScaleInWorkers(
+        string functionGroup,
+        bool isAlwaysReady,
+        int desiredWorkerCount)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(functionGroup);
+        ArgumentOutOfRangeException.ThrowIfNegative(desiredWorkerCount);
+
+        List<(string WorkerId, Task DrainTask)> selections = [];
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            List<(string WorkerId, RpcClientWorkerChannel Channel)> candidates = [];
+            foreach ((string workerId, WorkerSlot slot) in _slots)
+            {
+                if (_activeSetupContext is null ||
+                    !ReferenceEquals(slot.AttemptedSetupContext, _activeSetupContext) ||
+                    slot.SetupException is not null ||
+                    slot.Channel is not { } channel)
+                {
+                    continue;
+                }
+
+                candidates.Add(new(workerId, channel));
+            }
+
+            candidates.RemoveAll(candidate => !candidate.Channel.IsScaleInCandidate(functionGroup, isAlwaysReady));
+            int matchingWorkerCount = candidates.Count;
+
+            foreach ((string workerId, RpcClientWorkerChannel channel) in candidates)
+            {
+                if (matchingWorkerCount <= desiredWorkerCount)
+                {
+                    break;
+                }
+
+                if (channel.TryBeginScaleIn(functionGroup, isAlwaysReady) is { } drainTask)
+                {
+                    selections.Add(new(workerId, drainTask));
+                }
+
+                matchingWorkerCount--;
+            }
+
+            if (selections.Count > 0)
+            {
+                SignalReadyChannelsLocked();
+            }
+        }
+
+        foreach ((string workerId, Task drainTask) in selections)
+        {
+            _ = DrainAndUnlinkAsync(workerId, drainTask);
+        }
+
+        return selections.Count;
+    }
+
+    private async Task DrainAndUnlinkAsync(string workerId, Task drainTask)
+    {
+        try
+        {
+            await drainTask.WaitAsync(_shutdownSource.Token);
+            if (await UnlinkAsync(workerId, _shutdownSource.Token))
+            {
+                Log.ScaleInDrainCompleted(_logger, workerId);
+            }
+            else
+            {
+                Log.ScaleInDrainAlreadyDetached(_logger, workerId);
+            }
+        }
+        catch (OperationCanceledException) when (_shutdownSource.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            Log.ScaleInDrainFailed(_logger, exception, workerId);
+        }
+    }
 
     private async Task LinkAndCompleteAsync(string workerId, Uri grpcEndpoint, WorkerSlot slot, TaskCompletionSource<WorkerChannel> linkCompletion,
         CancellationToken cancellationToken)
@@ -937,5 +1023,15 @@ internal sealed partial class WorkerChannelRegistry : IWorkerChannelRegistry, IH
 
         [LoggerMessage(5, LogLevel.Warning, "Failed to configure client-backed worker {WorkerId} for the active ScriptHost.")]
         public static partial void ChannelSetupFailed(ILogger logger, Exception exception, string workerId);
+
+        [LoggerMessage(6, LogLevel.Information, "Worker {WorkerId} completed scale-in drain and closed its Runtime link.")]
+        public static partial void ScaleInDrainCompleted(ILogger logger, string workerId);
+
+        [LoggerMessage(7, LogLevel.Error, "Worker {WorkerId} failed while completing scale-in drain.")]
+        public static partial void ScaleInDrainFailed(ILogger logger, Exception exception, string workerId);
+
+        [LoggerMessage(8, LogLevel.Information,
+            "Worker {WorkerId} completed scale-in drain, but its Runtime link was already detached or shutdown prevented a new unlink.")]
+        public static partial void ScaleInDrainAlreadyDetached(ILogger logger, string workerId);
     }
 }
