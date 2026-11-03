@@ -11,5 +11,6 @@ internal enum WorkerAssignmentResult
     Created,
     AlreadyAssigned,
     AssignmentConflict,
+    WorkerNotReady,
     WorkerTerminated
 }

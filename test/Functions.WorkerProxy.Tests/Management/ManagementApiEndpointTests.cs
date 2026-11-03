@@ -463,8 +463,10 @@ public class ManagementApiEndpointTests
         timer.Verify(instance => instance.Dispose(), Times.AtLeastOnce);
     }
 
-    [Fact]
-    public async Task InfraState_UnchangedCheckpoint_ReturnsNoContentAtDeadline()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InfraState_UnchangedCheckpoint_ReturnsNoContentAtDeadline(bool removalRequested)
     {
         Mock<TimeProvider> clock = new();
         Mock<ITimer> timer = new();
@@ -476,8 +478,10 @@ public class ManagementApiEndpointTests
                 It.IsAny<object?>(),
                 It.IsAny<TimeSpan>(),
                 It.IsAny<TimeSpan>()))
-            .Returns((TimerCallback callback, object? state, TimeSpan _, TimeSpan _) =>
+            .Returns((TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
             {
+                Assert.Equal(TimeSpan.FromSeconds(60), dueTime);
+                Assert.Equal(Timeout.InfiniteTimeSpan, period);
                 expire.TrySetResult(() => callback(state));
                 return timer.Object;
             });
@@ -485,10 +489,27 @@ public class ManagementApiEndpointTests
             services.Replace(ServiceDescriptor.Singleton<TimeProvider>(clock.Object)));
         using HttpClient client = factory.CreateWorkerProxyClient();
         using CancellationTokenSource timeout = new(TestTimeout);
+        WorkerPodStateManager manager = factory.Services.GetRequiredService<WorkerPodStateManager>();
+        SplitWorkerLink? establishedLink = null;
+        if (removalRequested)
+        {
+            Assert.True(manager.OnRuntimeAttached(1, new("runtime-ns", "runtime", new("test-app", 42, "stamp"))));
+            Assert.True(manager.OnWorkerAttached(1));
+            Assert.True(manager.OnWorkerStartStream(1, "worker"));
+            using StringContent assignment = JsonBody(ValidAssignment);
+            using HttpResponseMessage assigned = await client.PutAsync(AssignPath, assignment, timeout.Token);
+            Assert.Equal(HttpStatusCode.Created, assigned.StatusCode);
+            Assert.True(manager.OnRuntimeInitialized(1));
+            establishedLink = SplitWorkerOriginState.FromState(manager.State).Link;
+            Assert.True(manager.RequestRemoval());
+        }
+
+        WorkerPodState snapshot = manager.State;
         using HttpResponseMessage current = await client.PostAsync(InfraStatePath, content: null, timeout.Token);
         Assert.Equal(HttpStatusCode.OK, current.StatusCode);
-        string body = await current.Content.ReadAsStringAsync(timeout.Token);
-        using StringContent content = JsonBody(body);
+        JsonObject checkpoint = Assert.IsType<JsonObject>(JsonNode.Parse(await current.Content.ReadAsStringAsync(timeout.Token)));
+        Assert.True(checkpoint.Remove("functionGroup"));
+        using StringContent content = JsonBody(checkpoint.ToJsonString());
 
         Task<HttpResponseMessage> poll = client.PostAsync(InfraStatePath, content, timeout.Token);
         Action fireTimer = await expire.Task.WaitAsync(timeout.Token);
@@ -499,7 +520,13 @@ public class ManagementApiEndpointTests
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
         AssertNoStore(response);
         Assert.Empty(await response.Content.ReadAsByteArrayAsync(timeout.Token));
-        Assert.Equal(0, factory.Services.GetRequiredService<WorkerPodStateManager>().PendingWaiterCount);
+        Assert.Equal(0, manager.PendingWaiterCount);
+        Assert.Same(snapshot, manager.State);
+        if (removalRequested)
+        {
+            Assert.Equal(establishedLink, SplitWorkerOriginState.FromState(manager.State).Link);
+        }
+
         await disposed.Task.WaitAsync(timeout.Token);
         timer.Verify(instance => instance.Dispose(), Times.AtLeastOnce);
     }

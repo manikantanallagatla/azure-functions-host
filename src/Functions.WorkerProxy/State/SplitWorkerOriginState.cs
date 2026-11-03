@@ -25,9 +25,10 @@ internal sealed record SplitWorkerOriginState(
 
     public static SplitWorkerOriginState FromState(WorkerPodState state)
     {
-        SplitWorkerStatus status = state.IsRuntimeInitialized
-            ? SplitWorkerStatus.Running
-            : SplitWorkerStatus.Starting;
+        SplitWorkerStatus status = state.RemovalRequested ? SplitWorkerStatus.RemovalRequested
+            : state.IsRuntimeInitialized ? SplitWorkerStatus.Running : SplitWorkerStatus.Starting;
+        // Removal withdraws live readiness without erasing a previously established Link.
+        bool retainLink = state.RemovalRequested && state.RuntimeInitialized && state.RuntimeIdentity is not null;
         return new(
             ContainerType,
             new(
@@ -42,7 +43,7 @@ internal sealed record SplitWorkerOriginState(
             state.StartupTime,
             checked((int)state.Revision),
             status,
-            state.IsRuntimeInitialized ? new(SplitWorkerLinkState.Linked, state.RuntimeIdentity) : Unlinked,
-            state.AssignmentState == WorkerAssignmentState.Failed);
+            state.IsRuntimeInitialized || retainLink ? new(SplitWorkerLinkState.Linked, state.RuntimeIdentity) : Unlinked,
+            state.RemovalRequested || state.AssignmentState == WorkerAssignmentState.Failed);
     }
 }

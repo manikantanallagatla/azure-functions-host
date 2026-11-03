@@ -1,3 +1,22 @@
+# Runtime link-loss cleanup
+
+WorkerProxy requests removal when an admitted Runtime-facing FunctionRpc stream ends unexpectedly
+through EOF, cancellation, read failure, or write failure, including before Worker initialization.
+The existing relay completion path publishes one sticky removal decision; no monitor or startup timeout is added.
+Duplicate and rejected Runtime streams do not select removal. Worker-side termination retains its
+existing behavior, and application-owned shutdown is excluded.
+
+Removal clears live worker and assignment state, withdraws readiness, rejects new Runtime and Worker
+streams, and returns HTTP 503 for new HTTP forwarding requests, including those completing readiness waits.
+Already-forwarding requests are not canceled. A previously established Link and its Runtime identity
+are retained in the removal checkpoint; an uninitialized Worker remains Unlinked.
+Assignment-before-StartStream and assigned-session WorkerInit linkage continue to use the parent implementation.
+
+`POST /admin/infra/instanceState` publishes RemovalRequested and wakes pending polls on the new revision.
+Posting the identical checkpoint still waits up to 60 seconds and returns HTTP 204 if unchanged.
+`/admin/instance/ready` remains available for management health. Legion owns physical pod deletion.
+Authenticate the Runtime-facing endpoint before rollout; authentication is outside this change.
+
 # Token Service proxy configuration
 
 The compute-separated `Functions.Host` and `Functions.WorkerProxy` can forward managed-identity HTTP requests over their existing Host-initiated gRPC stream. The Token Service runs only in the Host environment; no worker-pod Token Service or additional cross-pod Token Service listener is needed. The feature is **disabled by default** and must be enabled on both products. These settings supplement existing worker registration, listener, and Host-link configuration.

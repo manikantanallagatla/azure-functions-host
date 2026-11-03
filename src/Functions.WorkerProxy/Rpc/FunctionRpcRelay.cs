@@ -132,10 +132,10 @@ internal sealed partial class FunctionRpcRelay(
 
         lock (_syncLock)
         {
-            if (_stopping)
+            if (_stopping || _stateManager.State.RemovalRequested)
             {
                 throw new FunctionRpcRelayAttachmentException(side, FunctionRpcRelayAttachmentFailure.Shutdown,
-                    "The FunctionRpc relay is shutting down.");
+                    "The FunctionRpc relay is shutting down or the worker pod has requested removal.");
             }
 
             if (_currentSession?.IsTerminalAndReleased == true)
@@ -161,6 +161,8 @@ internal sealed partial class FunctionRpcRelay(
                         $"A {side} FunctionRpc stream is already attached."),
                     FunctionRpcRelayAttachResult.Rejected => (FunctionRpcRelayAttachmentFailure.PodStateRejected,
                         $"A {side} FunctionRpc stream is not accepted for the current WorkerProxy state."),
+                    FunctionRpcRelayAttachResult.Terminated when _stateManager.State.RemovalRequested =>
+                        (FunctionRpcRelayAttachmentFailure.Shutdown, "The worker pod has requested removal."),
                     FunctionRpcRelayAttachResult.Terminated => (FunctionRpcRelayAttachmentFailure.PreviousSessionTearingDown,
                         "The previous FunctionRpc relay session is still tearing down."),
                     _ => throw new InvalidOperationException($"Unexpected attach result '{attachResult}'.")
@@ -187,8 +189,9 @@ internal sealed partial class FunctionRpcRelay(
         {
             if (!_stopping)
             {
-                _stopping = true;
                 session = _currentSession;
+                session?.MarkShutdownRequested();
+                _stopping = true;
                 initiateStop = true;
             }
         }

@@ -21,6 +21,8 @@ internal sealed record WorkerPodState(
     bool? IsAlwaysReady,
     DateTimeOffset StartupTime)
 {
+    public bool RemovalRequested { get; init; }
+
     public long ConfigLastModifiedTime { get; init; }
 
     public long ContentLastModifiedTime { get; init; }
@@ -33,7 +35,7 @@ internal sealed record WorkerPodState(
         AssignmentState == WorkerAssignmentState.Ready && RuntimeInitialized && RuntimeIdentity is not null;
 
     // WorkerId is recorded only after validated StartStream. Retaining it after termination does not imply readiness.
-    public bool IsWorkerReady => IsWorkerAttached && WorkerId is not null;
+    public bool IsWorkerReady => !RemovalRequested && IsWorkerAttached && WorkerId is not null;
 
     // This is worker-pod eligibility, not proof of runtime initialization, function loading, or HTTP serving readiness.
     public WorkerPodStatus PodStatus => AssignmentState == WorkerAssignmentState.Ready && IsWorkerReady

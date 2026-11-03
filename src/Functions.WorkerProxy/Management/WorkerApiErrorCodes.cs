@@ -8,6 +8,8 @@ namespace Azure.Functions.WorkerProxy.Management;
 /// </summary>
 internal static class WorkerApiErrorCodes
 {
+    public const string WorkerNotReady = nameof(WorkerNotReady);
+
     // Clients branch on these exact, case-sensitive wire values. Do not change or repurpose them.
     // Keep explicit literals rather than nameof so symbol renames cannot change the contract.
     public const string Required = "Required";

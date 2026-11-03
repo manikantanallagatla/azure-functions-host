@@ -133,7 +133,8 @@ internal sealed class WorkerPodStateManager
         lock (_stateLock)
         {
             // Pre-assignment transport sessions may be replaced; an assigned pod's failure is terminal.
-            if (sessionId <= _lastSessionId || _state.AssignmentState == WorkerAssignmentState.Failed)
+            if (sessionId <= _lastSessionId || _state.AssignmentState == WorkerAssignmentState.Failed ||
+                _state.RemovalRequested)
             {
                 return false;
             }
@@ -169,7 +170,7 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
-            if (_state.SessionId != sessionId || !_state.IsWorkerAttached)
+            if (_state.SessionId != sessionId || !_state.IsWorkerAttached || _state.RemovalRequested)
             {
                 return false;
             }
@@ -205,7 +206,8 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
-            if (sessionId < _lastSessionId || _state.AssignmentState == WorkerAssignmentState.Failed)
+            if (_state.RemovalRequested || sessionId < _lastSessionId ||
+                _state.AssignmentState == WorkerAssignmentState.Failed)
             {
                 return false;
             }
@@ -263,7 +265,7 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
-            if (sessionId < _lastSessionId)
+            if (_state.RemovalRequested || sessionId < _lastSessionId)
             {
                 return false;
             }
@@ -307,6 +309,39 @@ internal sealed class WorkerPodStateManager
     }
 
     /// <summary>
+    /// Publishes sticky removal and clears live worker and assignment identity while retaining established Link history.
+    /// </summary>
+    public bool RequestRemoval()
+    {
+        lock (_stateLock)
+        {
+            if (_state.RemovalRequested)
+            {
+                return false;
+            }
+
+            _assignment = null;
+            _assignmentClaimed = 0;
+            _lastSessionId = 0;
+            UpdateStateAndNotifyWaitersLocked(_state with
+            {
+                Revision = checked(_state.Revision + 1),
+                SessionId = null,
+                IsWorkerAttached = false,
+                WorkerId = null,
+                AssignmentState = WorkerAssignmentState.Unassigned,
+                StartupMode = null,
+                FunctionAppName = null,
+                FunctionGroupName = null,
+                IsAlwaysReady = null,
+                RuntimeInitialized = _state.IsRuntimeInitialized,
+                RemovalRequested = true
+            });
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Records or replays assignment atomically with worker lifecycle and terminal state.
     /// </summary>
     public WorkerAssignmentResult Assign(WorkerAssignment assignment)
@@ -315,6 +350,11 @@ internal sealed class WorkerPodStateManager
 
         lock (_stateLock)
         {
+            if (_state.RemovalRequested)
+            {
+                return WorkerAssignmentResult.WorkerNotReady;
+            }
+
             // Replay/conflict takes precedence over current readiness, including after the assigned stream terminates.
             if (_assignment is not null)
             {
