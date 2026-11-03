@@ -50,6 +50,7 @@ internal static class WorkerProxyApplication
         builder.Services.ConfigureOptions<WorkerProxyOptionsSetup>();
         builder.Services.AddSingleton<IValidateOptions<WorkerProxyOptions>, WorkerProxyOptionsValidator>();
         builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
+        builder.Services.AddSingleton(static _ => WorkerProxyStartupTime.Capture(TimeProvider.System));
         builder.Services.AddSingleton<IValidateOptions<TokenServiceProxyWorkerOptions>, TokenServiceProxyOptionsValidator<TokenServiceProxyWorkerOptions>>();
         builder.Services.AddSingleton<IValidateOptions<TokenServiceProxyWorkerOptions>, TokenServiceProxyWorkerOptionsValidator>();
         builder.Services.AddOptions<TokenServiceProxyWorkerOptions>()
@@ -59,6 +60,7 @@ internal static class WorkerProxyApplication
         builder.Services.AddSingleton<TokenServiceProxyService>();
         builder.Services.AddSingleton<TokenServiceProxyMiddleware>();
         builder.Services.AddSingleton<WorkerPodStateManager>();
+        builder.Services.AddHostedService<NeverLinkedTimeoutService>();
         builder.Services.ConfigureHttpJsonOptions(options =>
             options.SerializerOptions.TypeInfoResolverChain.Insert(0, WorkerProxyJsonContext.Default));
         builder.Services.AddSingleton<WorkerProxyEndpointConfiguration>();

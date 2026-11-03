@@ -16,6 +16,7 @@ public class WorkerProxyOptionsTests
     {
         WorkerProxyOptions options = GetOptions();
 
+        Assert.Equal(TimeSpan.FromMinutes(5), options.NeverLinkedTimeout);
         Assert.Equal(80, options.ManagementPort);
         Assert.Equal(50053, options.RuntimeGrpcPort);
         Assert.Equal(50054, options.WorkerGrpcPort);
@@ -29,6 +30,7 @@ public class WorkerProxyOptionsTests
     {
         WorkerProxyOptions options = GetOptions(
             "--WEBSITE_POD_NAME", "configured-worker-pod",
+            "--WorkerProxy:NeverLinkedTimeout", "00:02:00",
             "--WorkerProxy:ManagementPort", "41000",
             "--WorkerProxy:RuntimeGrpcPort", "41001",
             "--WorkerProxy:WorkerGrpcPort", "41002",
@@ -37,6 +39,7 @@ public class WorkerProxyOptionsTests
             "--WorkerProxy:HttpProxyEndpoint", "https://worker-pod.example:48801");
 
         Assert.Equal("configured-worker-pod", options.PodName);
+        Assert.Equal(TimeSpan.FromMinutes(2), options.NeverLinkedTimeout);
         Assert.Equal(41000, options.ManagementPort);
         Assert.Equal(41001, options.RuntimeGrpcPort);
         Assert.Equal(41002, options.WorkerGrpcPort);
@@ -86,6 +89,7 @@ public class WorkerProxyOptionsTests
     }
 
     [Theory]
+    [InlineData(nameof(WorkerProxyOptions.NeverLinkedTimeout), "00:00:00")]
     [InlineData(nameof(WorkerProxyOptions.ManagementPort), "-1")]
     [InlineData(nameof(WorkerProxyOptions.RuntimeGrpcPort), "65536")]
     [InlineData(nameof(WorkerProxyOptions.HttpPort), "-1")]
