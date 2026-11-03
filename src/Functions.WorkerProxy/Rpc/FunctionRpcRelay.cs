@@ -43,6 +43,7 @@ internal sealed partial class FunctionRpcRelay(
     {
         Attached,
         Duplicate,
+        Rejected,
         Terminated
     }
 
@@ -115,12 +116,14 @@ internal sealed partial class FunctionRpcRelay(
     /// <param name="requestStream">The messages produced by the attached peer.</param>
     /// <param name="responseStream">The messages relayed from the opposite peer.</param>
     /// <param name="cancellationToken">The gRPC call cancellation token.</param>
+    /// <param name="runtimeIdentity">Optional identity from the Runtime-facing stream metadata.</param>
     /// <returns>A task that returns the first terminal state after the session terminates and this attachment releases.</returns>
     /// <exception cref="FunctionRpcRelayAttachmentException">
     /// The side is already attached, the previous session is still tearing down, or shutdown has started.
     /// </exception>
     public Task<FunctionRpcRelayTerminalState> AttachAsync(FunctionRpcRelaySide side, IAsyncStreamReader<StreamingMessage> requestStream,
-        IServerStreamWriter<StreamingMessage> responseStream, CancellationToken cancellationToken)
+        IServerStreamWriter<StreamingMessage> responseStream, CancellationToken cancellationToken,
+        SplitPodIdentity? runtimeIdentity = null)
     {
         ArgumentNullException.ThrowIfNull(requestStream);
         ArgumentNullException.ThrowIfNull(responseStream);
@@ -140,16 +143,24 @@ internal sealed partial class FunctionRpcRelay(
                 ClearCurrentSessionLocked();
             }
 
+            bool createdSession = _currentSession is null;
             session = _currentSession ??= new FunctionRpcRelaySession(
                 Interlocked.Increment(ref _nextSessionId), logger, _capabilityFinalizer, _stateManager, tokenServiceProxy);
 
-            FunctionRpcRelayAttachResult attachResult = session.TryAttach(side);
+            FunctionRpcRelayAttachResult attachResult = session.TryAttach(side, runtimeIdentity);
             if (attachResult != FunctionRpcRelayAttachResult.Attached)
             {
+                if (createdSession && attachResult == FunctionRpcRelayAttachResult.Rejected)
+                {
+                    _currentSession = null;
+                }
+
                 (FunctionRpcRelayAttachmentFailure failure, string message) = attachResult switch
                 {
                     FunctionRpcRelayAttachResult.Duplicate => (FunctionRpcRelayAttachmentFailure.Duplicate,
                         $"A {side} FunctionRpc stream is already attached."),
+                    FunctionRpcRelayAttachResult.Rejected => (FunctionRpcRelayAttachmentFailure.PodStateRejected,
+                        $"A {side} FunctionRpc stream is not accepted for the current WorkerProxy state."),
                     FunctionRpcRelayAttachResult.Terminated => (FunctionRpcRelayAttachmentFailure.PreviousSessionTearingDown,
                         "The previous FunctionRpc relay session is still tearing down."),
                     _ => throw new InvalidOperationException($"Unexpected attach result '{attachResult}'.")

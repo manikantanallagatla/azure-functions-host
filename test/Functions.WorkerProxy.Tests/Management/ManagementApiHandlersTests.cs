@@ -324,7 +324,7 @@ public class ManagementApiHandlersTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void AssignWorker_NotReadyDoesNotReserveIdentity(bool attached)
+    public void AssignWorker_BeforeStartStreamReservesIdentityAndBecomesReady(bool attached)
     {
         WorkerPodStateManager manager = CreateManager();
         if (attached)
@@ -332,9 +332,13 @@ public class ManagementApiHandlersTests
             manager.OnWorkerAttached(1);
         }
 
-        WorkerPodState before = manager.State;
-        AssertError(ManagementApiHandlers.AssignWorker(CreateRequest(), manager), 503, "WorkerNotReady");
-        Assert.Same(before, manager.State);
+        Assert.IsType<Created>(ManagementApiHandlers.AssignWorker(CreateRequest(), manager));
+        Assert.Equal(WorkerAssignmentState.Assigned, manager.State.AssignmentState);
+        Assert.Equal("app", manager.State.FunctionAppName);
+        AssertError(
+            ManagementApiHandlers.AssignWorker(CreateRequest(functionAppName: "other-app"), manager),
+            409,
+            "AssignmentConflict");
 
         if (!attached)
         {
@@ -342,8 +346,8 @@ public class ManagementApiHandlersTests
         }
 
         manager.OnWorkerStartStream(1, "worker");
-        Assert.IsType<Created>(ManagementApiHandlers.AssignWorker(CreateRequest(functionAppName: "other-app"), manager));
-        Assert.Equal("other-app", manager.State.FunctionAppName);
+        Assert.Equal(WorkerAssignmentState.Ready, manager.State.AssignmentState);
+        Assert.IsType<NoContent>(ManagementApiHandlers.AssignWorker(CreateRequest(), manager));
     }
 
     [Fact]

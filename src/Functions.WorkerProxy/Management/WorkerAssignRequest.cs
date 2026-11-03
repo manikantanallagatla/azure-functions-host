@@ -9,8 +9,7 @@ namespace Azure.Functions.WorkerProxy.Management;
 /// Describes assignment identity and the caller-selected startup mode.
 /// </summary>
 /// <remarks>
-/// All fields are required. The directory may be empty for Preconfigured but must be nonblank
-/// for SpecializationRequired. Configuration is currently retained for retry comparison only.
+/// The directory may be empty for Preconfigured but must be nonblank for SpecializationRequired.
 /// </remarks>
 internal sealed class WorkerAssignRequest
 {

@@ -46,6 +46,7 @@ internal sealed partial class FunctionRpcRelay
         private Uri? _workerHttpDestination;
         private bool _runtimeAttached;
         private bool _workerAttached;
+        private string? _initializationRequestId;
 
         /// <summary>
         /// Gets the terminal state recorded for this session, or <see langword="null"/> if the session has not terminated.
@@ -89,8 +90,9 @@ internal sealed partial class FunctionRpcRelay
         /// Atomically reserves ownership of one side for an attaching stream.
         /// </summary>
         /// <param name="side">The side to reserve.</param>
+        /// <param name="runtimeIdentity">Optional identity from the Runtime-facing stream metadata.</param>
         /// <returns>The result of the reservation attempt.</returns>
-        public FunctionRpcRelayAttachResult TryAttach(FunctionRpcRelaySide side)
+        public FunctionRpcRelayAttachResult TryAttach(FunctionRpcRelaySide side, SplitPodIdentity? runtimeIdentity = null)
         {
             lock (_stateLock)
             {
@@ -104,13 +106,17 @@ internal sealed partial class FunctionRpcRelay
                     return FunctionRpcRelayAttachResult.Duplicate;
                 }
 
-                SetAttachedLocked(side, value: true);
-                if (side == FunctionRpcRelaySide.Worker)
+                if (side == FunctionRpcRelaySide.Runtime && !stateManager.OnRuntimeAttached(id, runtimeIdentity))
                 {
-                    // Observe admission without changing relay replacement policy; a failed assignment stays terminal.
-                    stateManager.OnWorkerAttached(id);
+                    return FunctionRpcRelayAttachResult.Rejected;
                 }
 
+                if (side == FunctionRpcRelaySide.Worker && !stateManager.OnWorkerAttached(id))
+                {
+                    return FunctionRpcRelayAttachResult.Rejected;
+                }
+
+                SetAttachedLocked(side, value: true);
                 return FunctionRpcRelayAttachResult.Attached;
             }
         }
@@ -268,6 +274,14 @@ internal sealed partial class FunctionRpcRelay
         {
             if (side != FunctionRpcRelaySide.Worker)
             {
+                if (message.WorkerInitRequest is not null)
+                {
+                    lock (_stateLock)
+                    {
+                        _initializationRequestId = message.RequestId ?? string.Empty;
+                    }
+                }
+
                 return message;
             }
 
@@ -377,6 +391,7 @@ internal sealed partial class FunctionRpcRelay
                     if (side is FunctionRpcRelaySide.Runtime)
                     {
                         _runtimeWrites.Written(message);
+                        PublishRuntimeInitialization(message);
                     }
                 }
             }
@@ -391,6 +406,23 @@ internal sealed partial class FunctionRpcRelay
                     }
 
                     _runtimeWrites.Complete(new IOException("The HTTP proxy transport closed."));
+                }
+            }
+        }
+
+        private void PublishRuntimeInitialization(StreamingMessage message)
+        {
+            if (message.WorkerInitResponse is not { Result.Status: StatusResult.Types.Status.Success })
+            {
+                return;
+            }
+
+            lock (_stateLock)
+            {
+                if (_terminalState is null && _initializationRequestId is not null &&
+                    string.Equals(_initializationRequestId, message.RequestId ?? string.Empty, StringComparison.Ordinal))
+                {
+                    stateManager.OnRuntimeInitialized(id);
                 }
             }
         }
